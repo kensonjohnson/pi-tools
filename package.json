@@ -1,0 +1,32 @@
+{
+  "name": "pi-tools",
+  "version": "1.0.0",
+  "description": "Personal pi extensions and skills",
+  "keywords": [
+    "pi-package"
+  ],
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "jsdom": "^29.1.0",
+    "puppeteer-core": "^24.42.0",
+    "turndown": "^7.2.4",
+    "turndown-plugin-gfm": "^1.0.2"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "@sinclair/typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "devDependencies": {
+    "@types/jsdom": "^28.0.1",
+    "@types/turndown": "^5.0.6"
+  }
+}
