@@ -87,9 +87,17 @@ export default function (pi: ExtensionAPI) {
 		label: "Browser Start",
 		description:
 			"Launch Brave Browser with remote debugging on :9222. If Brave is already running on :9222, reports that instead of spawning a new instance.",
-		parameters: Type.Object({}),
-		renderCall(_args, theme) {
-			return new Text(theme.fg("toolTitle", theme.bold("browser_start")), 0, 0);
+		parameters: Type.Object({
+			profile: Type.Optional(
+				Type.Boolean({
+					description: "Copy your default Brave profile (cookies, logins, extensions) into the isolated scraping profile. Defaults to false.",
+				}),
+			),
+		}),
+		renderCall(args, theme) {
+			let text = theme.fg("toolTitle", theme.bold("browser_start"));
+			if (args.profile) text += theme.fg("dim", " [with profile]");
+			return new Text(text, 0, 0);
 		},
 		renderResult(result, _options, theme) {
 			const text = result.details?.alreadyRunning
@@ -97,7 +105,7 @@ export default function (pi: ExtensionAPI) {
 				: theme.fg("success", "Brave started");
 			return new Text(text, 0, 0);
 		},
-		async execute() {
+		async execute(_toolCallId, params) {
 			if (await isBraveRunning()) {
 				return {
 					content: [
@@ -125,6 +133,26 @@ export default function (pi: ExtensionAPI) {
 				);
 			} catch {
 				// ignore
+			}
+
+			if (params.profile) {
+				try {
+					execSync(
+						`rsync -a --delete \
+							--exclude='SingletonLock' \
+							--exclude='SingletonSocket' \
+							--exclude='SingletonCookie' \
+							--exclude='*/Sessions/*' \
+							--exclude='*/Current Session' \
+							--exclude='*/Current Tabs' \
+							--exclude='*/Last Session' \
+							--exclude='*/Last Tabs' \
+							"${process.env.HOME}/Library/Application Support/BraveSoftware/Brave-Browser/" "${SCRAPING_DIR}/"`,
+						{ stdio: "pipe" },
+					);
+				} catch {
+					throw new Error("Failed to sync Brave profile. Ensure Brave has been launched at least once.");
+				}
 			}
 
 			// Spawn Brave

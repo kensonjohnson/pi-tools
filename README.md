@@ -39,7 +39,7 @@ Connects to Brave Browser on `localhost:9222`.
 
 | Tool | Description |
 |------|-------------|
-| `browser_start` | Launch Brave with remote debugging on `:9222` |
+| `browser_start` | Launch Brave with remote debugging on `:9222`. Pass `profile: true` to copy your default Brave profile (cookies, logins, extensions). |
 | `browser_stop` | Kill the spawned Brave process |
 | `browser_navigate` | Navigate to a URL (new tab or current tab) |
 | `browser_eval` | Execute JavaScript in the active tab |
