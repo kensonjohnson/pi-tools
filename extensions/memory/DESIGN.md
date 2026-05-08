@@ -76,6 +76,14 @@ function serializeMemory(obj: MemoryLine): string {
 
 ## Architecture
 
+### Implementation Notes
+
+- **Source of truth stays NDJSON** in `.pi/memory/*.ndjson`.
+- **`.pi/memory/vector.db` is a derived local index**, not the canonical memory store.
+- Update and delete use **whole-file rewrite** for the affected category file.
+- When no category filter is provided, `memory_recall` may return **both stored memories and indexed repo file hits**.
+- `memory_list` is implemented as a small helper tool even though it is not part of the minimum design surface.
+
 ### Loading Strategy
 
 Pi starts a fresh session with **<1K tokens**.
