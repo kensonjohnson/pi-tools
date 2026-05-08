@@ -71,6 +71,85 @@ async function getActivePage(
 	return page;
 }
 
+/** Internal interceptor body used both by evaluateOnNewDocument and direct injection. */
+const interceptorBody = `(() => {
+	const w = window;
+	if (w.__pi_console_patched) return;
+
+	const LEVELS = ["log", "warn", "error", "info", "debug", "trace"];
+	w.__pi_logs = w.__pi_logs || [];
+
+	const push = (level, message) => {
+		w.__pi_logs.push({ level, time: Date.now(), message });
+	};
+
+	// Patch console.*
+	for (const level of LEVELS) {
+		const orig = console[level];
+		if (!orig) continue;
+		console[level] = function (...args) {
+			push(level, args.map(a => {
+				if (a === null || a === undefined) return String(a);
+				if (typeof a === "object") {
+					try { return JSON.stringify(a); } catch { return String(a); }
+				}
+				return String(a);
+			}).join(" "));
+			return orig.apply(console, args);
+		};
+	}
+
+	// Capture runtime errors
+	w.addEventListener("error", e => {
+		push("error", e.message + " (" + e.filename + ":" + e.lineno + ":" + e.colno + ")");
+	});
+	w.addEventListener("unhandledrejection", e => {
+		const reason = e.reason instanceof Error ? (e.reason.stack || e.reason.message) : String(e.reason);
+		push("error", "Unhandled promise rejection: " + reason);
+	});
+
+	// Capture fetch errors
+	const origFetch = w.fetch;
+	w.fetch = async function (...args) {
+		try {
+			const resp = await origFetch.apply(this, args);
+			if (!resp.ok) {
+				push("error", "GET " + args[0] + " " + resp.status + " " + resp.statusText);
+			}
+			return resp;
+		} catch (err) {
+			push("error", "fetch failed: " + args[0] + " — " + (err && err.message ? err.message : String(err)));
+			throw err;
+		}
+	};
+
+	// Capture XHR errors
+	const origOpen = XMLHttpRequest.prototype.open;
+	const origSend = XMLHttpRequest.prototype.send;
+	XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+		this._pi_method = method;
+		this._pi_url = url;
+		return origOpen.apply(this, [method, url, ...rest]);
+	};
+	XMLHttpRequest.prototype.send = function (...body) {
+		const xhr = this;
+		const onReady = () => {
+			if (xhr.readyState === 4 && xhr.status >= 400) {
+				push("error", xhr._pi_method + " " + xhr._pi_url + " " + xhr.status + " " + xhr.statusText);
+			}
+		};
+		xhr.addEventListener("loadend", onReady);
+		return origSend.apply(this, body);
+	};
+
+	w.__pi_console_patched = true;
+})();`;
+
+/** Patch console.* (and network error handlers) on the page so logs survive CDP disconnects. */
+async function installConsoleInterceptor(page: Awaited<ReturnType<typeof getActivePage>>) {
+	await page.evaluate(interceptorBody);
+}
+
 // ------------------------------------------------------------------------------
 // Extension
 // ------------------------------------------------------------------------------
@@ -319,15 +398,23 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params) {
 			const browser = await connectToBrave();
 			try {
+				// Use the shared interceptor string so evaluateOnNewDocument and direct injection stay in sync.
 				if (params.newTab) {
 					const page = await browser.newPage();
+					await page.evaluateOnNewDocument(interceptorBody);
 					await page.goto(params.url, { waitUntil: "domcontentloaded" });
+					// Also catch anything on the about:blank before navigation
+					await installConsoleInterceptor(page);
 				} else {
 					const page = await getActivePage(browser);
-					await page.goto(params.url, { waitUntil: "domcontentloaded" });
+					await page.evaluateOnNewDocument(interceptorBody);
 					if (params.reload) {
 						await page.reload({ waitUntil: "domcontentloaded" });
+					} else {
+						await page.goto(params.url, { waitUntil: "domcontentloaded" });
 					}
+					// evaluateOnNewDocument only runs on NEW documents; also patch current just in case
+					await installConsoleInterceptor(page);
 				}
 				return {
 					content: [
@@ -376,6 +463,7 @@ export default function (pi: ExtensionAPI) {
 			const browser = await connectToBrave();
 			try {
 				const page = await getActivePage(browser);
+				await installConsoleInterceptor(page);
 				const result = await page.evaluate((c: string) => {
 					const AsyncFunction = (async () => {}).constructor;
 					return new AsyncFunction(`return (${c})`)();
@@ -735,6 +823,137 @@ export default function (pi: ExtensionAPI) {
 				return {
 					content: [{ type: "text", text: formatted }],
 					details: { selections: entries },
+				};
+			} finally {
+				await browser.disconnect();
+			}
+		},
+	});
+
+	// ---------------------------------------------------------------------------
+	// browser_logs
+	// ---------------------------------------------------------------------------
+	pi.registerTool({
+		name: "browser_logs",
+		label: "Browser Logs",
+		description:
+			"Retrieve console logs from the active browser tab. Optionally filter by level and clear the buffer. Logs are accumulated since the page loaded or since the last clear. Call this after browser_navigate or browser_eval to inspect any console output.",
+		parameters: Type.Object({
+			level: Type.Optional(
+				Type.String({
+					description:
+						'Filter logs by level: "all", "log", "warn", "error", "info", "debug", "trace". Defaults to "all".',
+				}),
+			),
+			clear: Type.Optional(
+				Type.Boolean({
+					description:
+						"Clear the log buffer after retrieving. Defaults to false.",
+				}),
+			),
+			max: Type.Optional(
+				Type.Number({
+					description:
+						"Maximum number of logs to return. Defaults to 100.",
+				}),
+			),
+		}),
+		renderCall(args, theme) {
+			let text = theme.fg("toolTitle", theme.bold("browser_logs"));
+			if (args.level) text += theme.fg("dim", ` [level:${args.level}]`);
+			if (args.clear) text += theme.fg("dim", " [clear]");
+			return new Text(text, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const count = result.details?.count ?? 0;
+			const text =
+				count === 0
+					? theme.fg("dim", "No logs")
+					: theme.fg("success", `${count} log(s) returned`);
+			return new Text(text, 0, 0);
+		},
+		async execute(_toolCallId, params) {
+			const browser = await connectToBrave();
+			try {
+				const page = await getActivePage(browser);
+
+				// Ensure interceptor exists (idempotent)
+				await installConsoleInterceptor(page);
+
+				const logs = await page.evaluate(
+					(opts: {
+						level?: string;
+						clear?: boolean;
+						max?: number;
+					}) => {
+						const w = window as any;
+						const entries: Array<{
+							level: string;
+							time: number;
+							message: string;
+						}> = (w.__pi_logs || []).slice();
+
+						// Snapshot total before any mutation
+						const totalBefore = entries.length;
+
+						let filtered = entries;
+						if (opts.level && opts.level !== "all") {
+							filtered = filtered.filter(
+								(e: any) => e.level === opts.level,
+							);
+						}
+
+						const max = opts.max ?? 100;
+						if (filtered.length > max) {
+							filtered = filtered.slice(-max);
+						}
+
+						const result = filtered.map(
+							(e: any) =>
+								`[${new Date(e.time).toISOString()}] ${e.level.toUpperCase().padEnd(5)}: ${e.message}`,
+						);
+
+						if (opts.clear) {
+							w.__pi_logs = [];
+						}
+
+						return {
+							logs: result,
+							count: filtered.length,
+							total: totalBefore,
+							patched: !!w.__pi_console_patched,
+							href: w.location?.href ?? "unknown",
+						};
+					},
+					{
+						level: params.level?.toLowerCase(),
+						clear: params.clear ?? false,
+						max: params.max ?? 100,
+					},
+				);
+
+				if (logs.logs.length === 0) {
+					const lines = [
+						`No logs returned.`,
+						`Page: ${logs.href}`,
+						`Interceptor patched: ${logs.patched}`,
+						`Total buffered: ${logs.total}`,
+						`Level filter: ${params.level ?? "all (none set)"}`,
+					];
+					if (!logs.patched) {
+						lines.push(
+							"Note: The console interceptor was just installed. Logs emitted BEFORE this point are lost. Future logs will be captured.",
+						);
+					}
+					return {
+						content: [{ type: "text", text: lines.join("\n") }],
+						details: logs,
+					};
+				}
+
+				return {
+					content: [{ type: "text", text: logs.logs.join("\n") }],
+					details: logs,
 				};
 			} finally {
 				await browser.disconnect();
