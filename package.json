@@ -6,9 +6,13 @@
     "pi-package"
   ],
   "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
     "@mozilla/readability": "^0.6.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "better-sqlite3": "^12.9.0",
     "jsdom": "^29.1.0",
     "puppeteer-core": "^24.42.0",
+    "sqlite-vec": "^0.1.9",
     "turndown": "^7.2.4",
     "turndown-plugin-gfm": "^1.0.2"
   },
