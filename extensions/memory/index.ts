@@ -28,22 +28,6 @@ async function getManager(cwd: string): Promise<MemoryManager> {
   return created;
 }
 
-async function updateStatus(ctx: ExtensionContext): Promise<void> {
-  if (!ctx.hasUI) {
-    return;
-  }
-
-  try {
-    const manager = await getManager(ctx.cwd);
-    const { counts } = await manager.list();
-    const total = Object.values(counts).reduce((sum, count) => sum + count, 0);
-    const semantic = manager.isSemanticAvailable() ? "vec" : "fts";
-    ctx.ui.setStatus("memory", `memory ${total} (${semantic})`);
-  } catch {
-    ctx.ui.setStatus("memory", "memory unavailable");
-  }
-}
-
 function formatRecall(result: Awaited<ReturnType<MemoryManager["recall"]>>): string {
   if (result.memories.length === 0 && result.files.length === 0) {
     return `No memory or file matches found.`;
@@ -86,7 +70,6 @@ function textResult(text: string, details?: unknown) {
 export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     await getManager(ctx.cwd);
-    await updateStatus(ctx);
   });
 
   pi.on("session_shutdown", async () => {
@@ -135,7 +118,6 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
       const result = await manager.remember(params.category, params.content);
-      await updateStatus(ctx);
       return textResult(
         result.created
           ? `Stored ${params.category} memory ${result.memory.id}.`
@@ -181,7 +163,6 @@ export default function (pi: ExtensionAPI) {
         limit: params.limit,
         forceFileSync: params.force_file_sync,
       });
-      await updateStatus(ctx);
       return textResult(formatRecall(result), {
         searchMode: result.searchMode,
         memoryCount: result.memories.length,
@@ -202,7 +183,6 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
       const updated = await manager.update(params.id, params.content);
-      await updateStatus(ctx);
       if (!updated) {
         return textResult(`No memory found with id ${params.id}.`, {
           updated: false,
@@ -227,7 +207,6 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
       const removed = await manager.forget(params.id);
-      await updateStatus(ctx);
       if (!removed) {
         return textResult(`No memory found with id ${params.id}.`, {
           removed: false,
@@ -256,7 +235,6 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
       const result = await manager.init(Boolean(params.force));
-      await updateStatus(ctx);
       return textResult(
         `Initialized memory: created ${result.createdMemories}, skipped ${result.skippedMemories}, indexed ${result.indexedFiles} files, skipped ${result.skippedFiles}, removed ${result.removedFiles}, chunks ${result.chunksIndexed}, semantic ${result.semanticEnabled ? "enabled" : "fallback-only"}.`,
         result,
@@ -279,7 +257,6 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
       const suggestions = await manager.learn(params.since);
-      await updateStatus(ctx);
       return textResult(
         suggestions.length > 0
           ? `Suggested memories:\n${suggestions.map((entry) => `- ${entry}`).join("\n")}`
@@ -304,7 +281,6 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
       const suggestions = await manager.consolidate(params.since);
-      await updateStatus(ctx);
       return textResult(suggestions.map((entry) => `- ${entry}`).join("\n"), {
         count: suggestions.length,
       });
@@ -328,7 +304,6 @@ export default function (pi: ExtensionAPI) {
       const filtered = isMemoryCategory(params.category)
         ? memories.filter((memory) => memory.category === params.category)
         : memories;
-      await updateStatus(ctx);
 
       const header = `Counts: knowledge=${counts.knowledge}, practices=${counts.practices}, decisions=${counts.decisions}`;
       if (filtered.length === 0) {
