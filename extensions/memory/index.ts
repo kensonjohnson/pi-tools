@@ -242,6 +242,50 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  const registerCodeIndexTool = (name: string, label: string) => {
+    pi.registerTool({
+      name,
+      label,
+      description:
+        "Index local repo files into the SQLite memory index.",
+      promptSnippet: "Index local code into project memory",
+      promptGuidelines: [
+        "Use this when you want repo files indexed before recall.",
+        "Pass a path to refresh one file or subdirectory; omit it to index the configured repo roots.",
+      ],
+      parameters: Type.Object({
+        force: Type.Optional(
+          Type.Boolean({
+            description: "Force a full re-index of the selected scope",
+          }),
+        ),
+        path: Type.Optional(
+          Type.String({
+            description: "Relative file or directory path to index",
+          }),
+        ),
+      }),
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        const manager = await getManager(ctx.cwd);
+        const result = await manager.syncLocalFiles(
+          params.path
+            ? { paths: [params.path], force: Boolean(params.force) }
+            : { roots: [ctx.cwd], force: Boolean(params.force) },
+        );
+        return textResult(
+          `Indexed ${result.indexedFiles} files, skipped ${result.skippedFiles}, removed ${result.removedFiles}, chunks ${result.chunksIndexed}, semantic ${manager.isSemanticAvailable() ? "enabled" : "fallback-only"}.`,
+          result,
+        );
+      },
+    });
+  };
+
+  registerCodeIndexTool("memory_index_code", "Memory Index Code");
+  registerCodeIndexTool(
+    "memory_index_local_files",
+    "Memory Index Local Files",
+  );
+
   pi.registerTool({
     name: "memory_learn",
     label: "Memory Learn",

@@ -13,6 +13,11 @@ import {
 } from "node:fs/promises";
 import { join, relative } from "node:path";
 import * as sqliteVec from "sqlite-vec";
+import { SQLiteFileChunkStore } from "./file-index-store.ts";
+import {
+  LocalFileIndexer,
+  type SyncLocalFilesOptions,
+} from "./local-file-indexer.ts";
 
 const execFileAsync = promisify(execFile);
 
@@ -106,6 +111,10 @@ interface MemoryManagerOptions {
   embeddingModel?: string;
   embeddingDimensions?: number;
   semanticEnabled?: boolean;
+  embeddingProviderFactory?: (
+    model: string,
+    dimensions: number,
+  ) => EmbeddingProvider;
 }
 
 interface EmbeddingProvider {
@@ -480,6 +489,8 @@ class PiMemoryIndex {
   private memoryDir: string;
   private options: Required<MemoryManagerOptions>;
   private db: Database.Database;
+  private fileStore: SQLiteFileChunkStore;
+  private localFileIndexer: LocalFileIndexer;
   private initialized = false;
   private semanticAvailable = false;
   private embeddingProvider: EmbeddingProvider | null = null;
@@ -498,6 +509,21 @@ class PiMemoryIndex {
     this.embeddingDimensions = options.embeddingDimensions;
     mkdirSync(memoryDir, { recursive: true });
     this.db = new Database(join(memoryDir, "vector.db"));
+    this.fileStore = new SQLiteFileChunkStore(this.db);
+    this.localFileIndexer = new LocalFileIndexer(this.fileStore, {
+      cwd,
+      chunkSizeLines: options.chunkSizeLines,
+      overlapLines: options.overlapLines,
+      maxFileSizeBytes: options.maxFileSizeBytes,
+      excludeDirs: options.excludeDirs,
+      embeddingProvider: null,
+      semanticEnabled: false,
+      indexVector: (itemId, vector) => this.indexVector(itemId, vector),
+      removeVector: (itemId) => this.removeVector(itemId),
+      onSemanticFailure: () => {
+        this.semanticAvailable = false;
+      },
+    });
   }
 
   async initialize(): Promise<void> {
@@ -566,10 +592,15 @@ class PiMemoryIndex {
           );
         `);
 
-        this.embeddingProvider = new TransformersEmbeddingProvider(
-          this.embeddingModel,
-          this.embeddingDimensions,
-        );
+        this.embeddingProvider = this.options.embeddingProviderFactory
+          ? this.options.embeddingProviderFactory(
+              this.embeddingModel,
+              this.embeddingDimensions,
+            )
+          : new TransformersEmbeddingProvider(
+              this.embeddingModel,
+              this.embeddingDimensions,
+            );
         this.semanticAvailable = true;
       } catch {
         this.semanticAvailable = false;
@@ -577,6 +608,8 @@ class PiMemoryIndex {
       }
     }
 
+    this.localFileIndexer.setSemanticEnabled(this.semanticAvailable);
+    this.localFileIndexer.setEmbeddingProvider(this.embeddingProvider);
     this.initialized = true;
   }
 
@@ -644,6 +677,7 @@ class PiMemoryIndex {
         this.indexVector(`memory:${memory.id}`, vector);
       } catch {
         this.semanticAvailable = false;
+        this.localFileIndexer.setSemanticEnabled(false);
       }
     }
   }
@@ -660,138 +694,23 @@ class PiMemoryIndex {
 
   async syncRepoFiles(force = false): Promise<FileIndexResult> {
     await this.initialize();
+    this.localFileIndexer.setSemanticEnabled(this.semanticAvailable);
+    this.localFileIndexer.setEmbeddingProvider(this.embeddingProvider);
+    return this.localFileIndexer.sync({ roots: [this.cwd], force });
+  }
 
-    const seen = new Set<string>();
-    let indexedFiles = 0;
-    let skippedFiles = 0;
-    let removedFiles = 0;
-    let chunksIndexed = 0;
-
-    const files = await this.walk(this.cwd);
-    for (const absolutePath of files) {
-      const stats = await stat(absolutePath);
-      if (!stats.isFile() || stats.size > this.options.maxFileSizeBytes) {
-        continue;
-      }
-
-      const buffer = await readFile(absolutePath);
-      if (looksBinary(buffer)) {
-        continue;
-      }
-
-      const content = buffer.toString("utf8");
-      if (!content.trim()) {
-        continue;
-      }
-
-      const relativePath = relative(this.cwd, absolutePath).replaceAll("\\", "/");
-      seen.add(relativePath);
-
-      const fileHash = createHash("sha256").update(content).digest("hex");
-      const existing = this.listFileChunks(relativePath);
-      if (
-        !force &&
-        existing.length > 0 &&
-        existing[0].fileHash === fileHash &&
-        existing[0].fileMtimeMs === stats.mtimeMs
-      ) {
-        skippedFiles++;
-        continue;
-      }
-
-      if (existing.length > 0) {
-        this.deleteIndexedFile(relativePath, existing);
-      }
-
-      const chunks = chunkText(
-        content,
-        this.options.chunkSizeLines,
-        this.options.overlapLines,
-      );
-      if (chunks.length === 0) {
-        skippedFiles++;
-        continue;
-      }
-
-      const rows: FileChunk[] = chunks.map((chunk) => ({
-        id: stableId([relativePath, String(chunk.chunkIndex)]),
-        rootPath: this.cwd,
-        path: relativePath,
-        chunkIndex: chunk.chunkIndex,
-        startLine: chunk.startLine,
-        endLine: chunk.endLine,
-        content: chunk.content,
-        fileHash,
-        fileMtimeMs: stats.mtimeMs,
-      }));
-
-      const now = new Date().toISOString();
-      const insertChunk = this.db.prepare(`
-        INSERT INTO indexed_file_chunks (
-          id, root_path, path, chunk_index, start_line, end_line, content,
-          file_hash, file_mtime_ms, indexed_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      const insertFts = this.db.prepare(
-        `INSERT INTO file_chunk_fts (id, path, content) VALUES (?, ?, ?)`,
-      );
-
-      const tx = this.db.transaction((entries: FileChunk[]) => {
-        for (const entry of entries) {
-          insertChunk.run(
-            entry.id,
-            entry.rootPath,
-            entry.path,
-            entry.chunkIndex,
-            entry.startLine,
-            entry.endLine,
-            entry.content,
-            entry.fileHash,
-            entry.fileMtimeMs,
-            now,
-          );
-          insertFts.run(entry.id, entry.path, entry.content);
-        }
-      });
-      tx(rows);
-
-      if (this.semanticAvailable && this.embeddingProvider) {
-        try {
-          const embeddings = await this.embeddingProvider.embedBatch(
-            rows.map((row) => row.content),
-          );
-          for (let i = 0; i < rows.length; i++) {
-            this.indexVector(`file:${rows[i].id}`, embeddings[i]);
-          }
-        } catch {
-          this.semanticAvailable = false;
-        }
-      }
-
-      indexedFiles++;
-      chunksIndexed += rows.length;
-    }
-
-    const tracked = this.db
-      .prepare(
-        `SELECT DISTINCT path FROM indexed_file_chunks WHERE root_path = ? ORDER BY path`,
-      )
-      .all(this.cwd) as Array<{ path: string }>;
-
-    for (const entry of tracked) {
-      if (!seen.has(entry.path)) {
-        this.deleteIndexedFile(entry.path, this.listFileChunks(entry.path));
-        removedFiles++;
-      }
-    }
-
-    return {
-      indexedFiles,
-      skippedFiles,
-      removedFiles,
-      chunksIndexed,
-    };
+  async syncLocalFiles(
+    options: SyncLocalFilesOptions = {},
+  ): Promise<FileIndexResult> {
+    await this.initialize();
+    this.localFileIndexer.setSemanticEnabled(this.semanticAvailable);
+    this.localFileIndexer.setEmbeddingProvider(this.embeddingProvider);
+    const result = await this.localFileIndexer.sync({
+      roots: options.roots ?? [this.cwd],
+      paths: options.paths,
+      force: options.force,
+    });
+    return result;
   }
 
   async search(
@@ -1408,7 +1327,7 @@ export class MemoryManager {
       }
     }
 
-    const sync = await this.syncFiles(force);
+    const sync = await this.syncLocalFiles({ roots: [this.cwd], force });
     return {
       createdMemories,
       skippedMemories,
@@ -1502,20 +1421,22 @@ export class MemoryManager {
     return this.index.isSemanticAvailable();
   }
 
+  async syncLocalFiles(
+    options: SyncLocalFilesOptions = {},
+  ): Promise<FileIndexResult> {
+    await this.initialize();
+    const result = await this.index.syncLocalFiles(options);
+    this.lastFileSync = Date.now();
+    return result;
+  }
+
   private async syncFilesIfNeeded(force: boolean): Promise<void> {
     const ageMs = Date.now() - this.lastFileSync;
     if (!force && this.lastFileSync !== 0 && ageMs < 5 * 60 * 1000) {
       return;
     }
 
-    await this.syncFiles(force);
-  }
-
-  private async syncFiles(force: boolean): Promise<FileIndexResult> {
-    await this.initialize();
-    const result = await this.index.syncRepoFiles(force);
-    this.lastFileSync = Date.now();
-    return result;
+    await this.syncLocalFiles({ roots: [this.cwd], force });
   }
 
   private async generateSeedMemories(): Promise<

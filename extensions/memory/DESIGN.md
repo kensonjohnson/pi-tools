@@ -17,6 +17,7 @@ See [RESEARCH.md](RESEARCH.md).
 - **Manual override** — Users can trigger actions manually when needed.
 - **Local speed** — Optimize for speed and usability on the local machine.
 - **Embedded vectors** — Vector DB runs locally, stored in a gitignored directory.
+- **SQLite-only** — No Postgres backend, provider factory, or multi-store abstraction.
 
 ## Why NDJSON
 
@@ -80,9 +81,11 @@ function serializeMemory(obj: MemoryLine): string {
 
 - **Source of truth stays NDJSON** in `.pi/memory/*.ndjson`.
 - **`.pi/memory/vector.db` is a derived local index**, not the canonical memory store.
+- **`memory_index_code` is the explicit pre-indexing entrypoint** for full repo scans or targeted file/directory refreshes.
+- **`memory_recall` still auto-syncs the repo index on demand**, using the same local SQLite store, so recall keeps its current refresh cadence.
 - Update and delete use **whole-file rewrite** for the affected category file.
 - When no category filter is provided, `memory_recall` may return **both stored memories and indexed repo file hits**.
-- `memory_list` is implemented as a small helper tool even though it is not part of the minimum design surface.
+- The implementation remains **SQLite-only**; no Postgres paths, provider selection, or generic store layer are introduced.
 
 ### Loading Strategy
 
@@ -110,7 +113,9 @@ Pi starts a fresh session with **<1K tokens**.
 | `memory_update` | Replace the content of an existing memory by ID. |
 | `memory_learn` | Review recent activity and suggest NEW memories. Returns preview only. |
 | `memory_consolidate` | Review stored memories and suggest cleanup. User-triggered, interactive. |
-| `memory_init` | Scan codebase to seed `knowledge.ndjson` and `practices.ndjson`. User-triggered, idempotent. |
+| `memory_index_code` | Index repo files into the local SQLite memory index. |
+| `memory_index_local_files` | Alias for `memory_index_code`. |
+| `memory_init` | Scan codebase to seed `knowledge.ndjson` and `practices.ndjson`, then index local repo files. User-triggered, idempotent. |
 
 ### Parameters
 
@@ -122,13 +127,16 @@ Pi starts a fresh session with **<1K tokens**.
 | `memory_update` | `id`, `content` | Confirmation |
 | `memory_learn` | `since?` | Preview |
 | `memory_consolidate` | `since?` | Interactive report |
+| `memory_index_code` | `force?`, `path?` | Summary |
+| `memory_index_local_files` | `force?`, `path?` | Summary |
 | `memory_init` | `force?` | Summary |
 
 ### `memory_recall` Behavior
 
-1. Search vector DB via sqlite-vec
-2. Fall back to FTS5 if vector DB unavailable
-3. Return results ordered by relevance
+1. If the repo file index is stale, refresh local files first
+2. Search vector DB via sqlite-vec
+3. Fall back to FTS5 if vector DB unavailable
+4. Return results ordered by relevance
 
 ## Vector Store
 
