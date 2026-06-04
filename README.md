@@ -3,7 +3,7 @@
 A [pi](https://github.com/badlogic/pi-mono) package.
 Adds web search using Brave Search API and browser tooling via Chrome DevTools Protocol.
 
-***I use Mac, feel free to fork and tweak for Window/Linux!***
+***I use Mac, feel free to fork and tweak for Windows/Linux!***
 
 ## Install
 
