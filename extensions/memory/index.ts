@@ -1,4 +1,4 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
   MEMORY_CATEGORIES,
@@ -18,44 +18,29 @@ async function getManager(cwd: string): Promise<MemoryManager> {
     return existing;
   }
 
-  const created = (async () => {
-    const manager = new MemoryManager(cwd);
-    await manager.initialize();
-    return manager;
-  })();
-
+  const created = Promise.resolve(new MemoryManager(cwd));
   managers.set(cwd, created);
   return created;
 }
 
+const NOT_ENABLED_MESSAGE =
+  "Memory tracking is not enabled for this project. Run `memory_init` to create the memory store and enable it.";
+
 function formatRecall(result: Awaited<ReturnType<MemoryManager["recall"]>>): string {
-  if (result.memories.length === 0 && result.files.length === 0) {
-    return `No memory or file matches found.`;
+  if (result.memories.length === 0) {
+    return `No memory matches found.`;
   }
 
   const sections: string[] = [`Search mode: ${result.searchMode}`];
 
-  if (result.memories.length > 0) {
-    sections.push(
-      `Memories:\n${result.memories
-        .map(
-          (memory) =>
-            `- [${memory.category}] ${memory.id.slice(0, 8)} ${memory.content}`,
-        )
-        .join("\n")}`,
-    );
-  }
-
-  if (result.files.length > 0) {
-    sections.push(
-      `Files:\n${result.files
-        .map(
-          (file) =>
-            `- ${file.path}:${file.startLine}-${file.endLine} ${file.content.replace(/\s+/g, " ").slice(0, 180)}`,
-        )
-        .join("\n")}`,
-    );
-  }
+  sections.push(
+    `Memories:\n${result.memories
+      .map(
+        (memory) =>
+          `- [${memory.category}] ${memory.id.slice(0, 8)} ${memory.content}`,
+      )
+      .join("\n")}`,
+  );
 
   return sections.join("\n\n");
 }
@@ -68,10 +53,6 @@ function textResult(text: string, details?: unknown) {
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.on("session_start", async (_event, ctx) => {
-    await getManager(ctx.cwd);
-  });
-
   pi.on("session_shutdown", async () => {
     for (const entry of managers.values()) {
       const manager = await entry;
@@ -82,6 +63,10 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (_event, ctx) => {
     const manager = await getManager(ctx.cwd);
+    if (!(await manager.isReady())) {
+      return;
+    }
+
     const promptContext = await manager.buildPromptContext();
     if (!promptContext) {
       return;
@@ -94,7 +79,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", async (event, ctx) => {
     const manager = await getManager(ctx.cwd);
-    await manager.logActivity("input", event.text);
+    if (await manager.isReady()) {
+      await manager.logActivity("input", event.text);
+    }
   });
 
   pi.registerTool({
@@ -117,6 +104,10 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
+      if (!(await manager.isReady())) {
+        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
+      }
+
       const result = await manager.remember(params.category, params.content);
       return textResult(
         result.created
@@ -131,11 +122,10 @@ export default function (pi: ExtensionAPI) {
     name: "memory_recall",
     label: "Memory Recall",
     description:
-      "Retrieve relevant project memories and indexed repo file chunks using local semantic search with fallbacks.",
-    promptSnippet: "Recall project memory and indexed repo context",
+      "Retrieve relevant project memories using local semantic search with fallbacks.",
+    promptSnippet: "Recall project memory",
     promptGuidelines: [
       "Use category when the user is clearly asking about knowledge, practices, or decisions only.",
-      "When category is omitted, this searches both stored memories and indexed repo files.",
     ],
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
@@ -149,24 +139,21 @@ export default function (pi: ExtensionAPI) {
           maximum: 20,
         }),
       ),
-      force_file_sync: Type.Optional(
-        Type.Boolean({
-          description: "Re-scan repo files before searching",
-        }),
-      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
+      if (!(await manager.isReady())) {
+        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
+      }
+
       const result = await manager.recall({
         query: params.query,
         category: params.category,
         limit: params.limit,
-        forceFileSync: params.force_file_sync,
       });
       return textResult(formatRecall(result), {
         searchMode: result.searchMode,
         memoryCount: result.memories.length,
-        fileCount: result.files.length,
       });
     },
   });
@@ -182,6 +169,10 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
+      if (!(await manager.isReady())) {
+        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
+      }
+
       const updated = await manager.update(params.id, params.content);
       if (!updated) {
         return textResult(`No memory found with id ${params.id}.`, {
@@ -206,6 +197,10 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
+      if (!(await manager.isReady())) {
+        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
+      }
+
       const removed = await manager.forget(params.id);
       if (!removed) {
         return textResult(`No memory found with id ${params.id}.`, {
@@ -224,19 +219,13 @@ export default function (pi: ExtensionAPI) {
     name: "memory_init",
     label: "Memory Init",
     description:
-      "Bootstrap .pi/memory NDJSON files, seed initial knowledge/practices, and index repo files.",
-    parameters: Type.Object({
-      force: Type.Optional(
-        Type.Boolean({
-          description: "Force a full repo file re-index",
-        }),
-      ),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      "Bootstrap .pi/memory NDJSON files, seed initial knowledge/practices, and build the local search index.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
-      const result = await manager.init(Boolean(params.force));
+      const result = await manager.init();
       return textResult(
-        `Initialized memory: created ${result.createdMemories}, skipped ${result.skippedMemories}, indexed ${result.indexedFiles} files, skipped ${result.skippedFiles}, removed ${result.removedFiles}, chunks ${result.chunksIndexed}, semantic ${result.semanticEnabled ? "enabled" : "fallback-only"}.`,
+        `Initialized memory: created ${result.createdMemories}, skipped ${result.skippedMemories}, semantic ${result.semanticEnabled ? "enabled" : "fallback-only"}.`,
         result,
       );
     },
@@ -256,6 +245,10 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
+      if (!(await manager.isReady())) {
+        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
+      }
+
       const suggestions = await manager.learn(params.since);
       return textResult(
         suggestions.length > 0
@@ -280,6 +273,10 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
+      if (!(await manager.isReady())) {
+        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
+      }
+
       const suggestions = await manager.consolidate(params.since);
       return textResult(suggestions.map((entry) => `- ${entry}`).join("\n"), {
         count: suggestions.length,
@@ -300,6 +297,10 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
+      if (!(await manager.isReady())) {
+        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
+      }
+
       const { memories, counts } = await manager.list();
       const filtered = isMemoryCategory(params.category)
         ? memories.filter((memory) => memory.category === params.category)
