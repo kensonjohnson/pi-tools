@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { randomUUID } from "node:crypto";
+import { v7 as uuidv7 } from "uuid";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
@@ -295,7 +295,7 @@ export class NdjsonMemoryStore {
 
     const memory: StoredMemoryLine = {
       category,
-      id: randomUUID(),
+      id: uuidv7(),
       content: normalized,
       created: new Date().toISOString(),
     };
@@ -1008,18 +1008,21 @@ export class MemoryManager {
     return { memories, counts };
   }
 
-  async init(): Promise<InitResult> {
+  async init(seed = false): Promise<InitResult> {
     await this.initialize();
-    const seeds = await this.generateSeedMemories();
 
     let createdMemories = 0;
     let skippedMemories = 0;
-    for (const seed of seeds) {
-      const result = await this.remember(seed.category, seed.content);
-      if (result.created) {
-        createdMemories++;
-      } else {
-        skippedMemories++;
+
+    if (seed) {
+      const seeds = await this.generateSeedMemories();
+      for (const s of seeds) {
+        const result = await this.remember(s.category, s.content);
+        if (result.created) {
+          createdMemories++;
+        } else {
+          skippedMemories++;
+        }
       }
     }
 
