@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
   MEMORY_CATEGORIES,
@@ -52,6 +52,28 @@ function textResult(text: string, details?: unknown) {
   };
 }
 
+const injectedSessions = new Set<string>();
+
+async function injectMemoryMessage(ctx: ExtensionContext) {
+  const manager = await getManager(ctx.cwd);
+  if (!(await manager.isReady())) {
+    return;
+  }
+
+  const promptContext = await manager.buildPromptContext();
+  if (!promptContext) {
+    return;
+  }
+
+  return {
+    message: {
+      customType: "project_memory",
+      content: `Project memory:\n${promptContext}`,
+      display: false,
+    },
+  };
+}
+
 export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     for (const entry of managers.values()) {
@@ -62,26 +84,22 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
-    const manager = await getManager(ctx.cwd);
-    if (!(await manager.isReady())) {
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (injectedSessions.has(sessionId)) {
       return;
     }
 
-    const promptContext = await manager.buildPromptContext();
-    if (!promptContext) {
-      return;
+    const result = await injectMemoryMessage(ctx);
+    if (result) {
+      injectedSessions.add(sessionId);
     }
-
-    return {
-      systemPrompt: `${ctx.getSystemPrompt()}\n\nProject memory:\n${promptContext}`,
-    };
+    return result;
   });
 
-  pi.on("input", async (event, ctx) => {
-    const manager = await getManager(ctx.cwd);
-    if (await manager.isReady()) {
-      await manager.logActivity("input", event.text);
-    }
+  pi.on("session_compact", async () => {
+    // After compaction, the injected message may have been summarized away.
+    // Clear tracking so the next before_agent_start re-injects.
+    injectedSessions.clear();
   });
 
   pi.registerTool({

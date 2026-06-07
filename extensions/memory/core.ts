@@ -384,7 +384,7 @@ export class NdjsonMemoryStore {
 
       const lines = items
         .slice(0, 20)
-        .map((entry) => `- ${entry.id.slice(0, 8)}: ${truncate(entry.content, 120)}`);
+        .map((entry) => `- ${truncate(entry.content, 120)}`);
       sections.push(`${title} index:\n${lines.join("\n")}`);
     };
 
