@@ -7,6 +7,7 @@ import {
   mkdir,
   readFile,
   readdir,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
@@ -1008,7 +1009,17 @@ export class MemoryManager {
     return { memories, counts };
   }
 
-  async init(seed = false): Promise<InitResult> {
+  async init(force = false, seed = false): Promise<InitResult> {
+    if (force) {
+      await this.index.close();
+      const dbPath = join(this.store.memoryDir, "vector.db");
+      try {
+        await unlink(dbPath);
+      } catch {}
+      this.index = new PiMemoryIndex(this.store.memoryDir, this.options);
+      this.initialized = false;
+    }
+
     await this.initialize();
 
     let createdMemories = 0;

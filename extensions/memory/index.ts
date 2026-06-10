@@ -237,22 +237,28 @@ export default function (pi: ExtensionAPI) {
     name: "memory_init",
     label: "Memory Init",
     description:
-      "Bootstrap .pi/memory NDJSON files and build the local search index. Optionally seed initial knowledge/practices from the project.",
+      "Bootstrap .pi/memory NDJSON files and build the local search index. Optionally seed initial knowledge/practices, or force-rebuild the index from the NDJSON source of truth.",
     parameters: Type.Object({
       seed: Type.Optional(
         Type.Boolean({
           description: "Scan the project and auto-seed initial knowledge and practices",
         }),
       ),
+      force: Type.Optional(
+        Type.Boolean({
+          description: "Rebuild the vector and FTS search index from scratch",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
-      const result = await manager.init(Boolean(params.seed));
+      const result = await manager.init(Boolean(params.force), Boolean(params.seed));
       const seedText = params.seed
         ? ` created ${result.createdMemories}, skipped ${result.skippedMemories},`
         : "";
+      const forceText = params.force ? " (rebuilt index)" : "";
       return textResult(
-        `Initialized memory.${seedText} semantic ${result.semanticEnabled ? "enabled" : "fallback-only"}.`,
+        `Initialized memory${forceText}.${seedText} semantic ${result.semanticEnabled ? "enabled" : "fallback-only"}.`,
         result,
       );
     },
