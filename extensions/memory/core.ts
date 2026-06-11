@@ -1,7 +1,6 @@
 import Database from "better-sqlite3";
-import { createHash, randomUUID } from "node:crypto";
+import { v7 as uuidv7 } from "uuid";
 import { execFile } from "node:child_process";
-import { mkdirSync } from "node:fs";
 import { promisify } from "node:util";
 import {
   access,
@@ -9,9 +8,11 @@ import {
   readFile,
   readdir,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import * as sqliteVec from "sqlite-vec";
 
 const execFileAsync = promisify(execFile);
@@ -35,16 +36,6 @@ export interface StoredMemoryLine extends MemoryLine {
   category: MemoryCategory;
 }
 
-export interface FileHit {
-  id: string;
-  path: string;
-  startLine: number;
-  endLine: number;
-  content: string;
-  score: number;
-  source: "semantic" | "fts" | "grep";
-}
-
 export interface MemoryHit extends StoredMemoryLine {
   score: number;
   source: "semantic" | "fts" | "grep";
@@ -52,30 +43,13 @@ export interface MemoryHit extends StoredMemoryLine {
 
 export interface RecallResult {
   memories: MemoryHit[];
-  files: FileHit[];
   searchMode: "semantic" | "fts" | "grep";
 }
 
 export interface InitResult {
   createdMemories: number;
   skippedMemories: number;
-  indexedFiles: number;
-  skippedFiles: number;
-  removedFiles: number;
-  chunksIndexed: number;
   semanticEnabled: boolean;
-}
-
-interface FileChunk {
-  id: string;
-  rootPath: string;
-  path: string;
-  chunkIndex: number;
-  startLine: number;
-  endLine: number;
-  content: string;
-  fileHash: string;
-  fileMtimeMs: number;
 }
 
 interface SearchRow {
@@ -84,25 +58,8 @@ interface SearchRow {
   source: "semantic" | "fts" | "grep";
 }
 
-interface FileIndexResult {
-  indexedFiles: number;
-  skippedFiles: number;
-  removedFiles: number;
-  chunksIndexed: number;
-}
-
-interface ActivityEntry {
-  kind: string;
-  content: string;
-  createdAt: string;
-}
-
 interface MemoryManagerOptions {
   memoryDirName?: string;
-  chunkSizeLines?: number;
-  overlapLines?: number;
-  maxFileSizeBytes?: number;
-  excludeDirs?: string[];
   embeddingModel?: string;
   embeddingDimensions?: number;
   semanticEnabled?: boolean;
@@ -116,10 +73,6 @@ interface EmbeddingProvider {
 
 const DEFAULT_OPTIONS: Required<MemoryManagerOptions> = {
   memoryDirName: ".pi/memory",
-  chunkSizeLines: 40,
-  overlapLines: 5,
-  maxFileSizeBytes: 512 * 1024,
-  excludeDirs: [".git", "node_modules", ".pi", "dist", "build", "coverage"],
   embeddingModel: "sentence-transformers/all-MiniLM-L6-v2",
   embeddingDimensions: 384,
   semanticEnabled: true,
@@ -276,17 +229,11 @@ function ftsQuery(query: string): string {
   return tokens.map((token) => `${token}*`).join(" OR ");
 }
 
-function stableId(parts: string[]): string {
-  return createHash("sha1").update(parts.join("::")).digest("hex");
-}
-
 export class NdjsonMemoryStore {
-  private cwd: string;
   private memoryDirName: string;
   readonly memoryDir: string;
 
   constructor(cwd: string, memoryDirName: string) {
-    this.cwd = cwd;
     this.memoryDirName = memoryDirName;
     this.memoryDir = join(cwd, memoryDirName);
   }
@@ -331,11 +278,6 @@ export class NdjsonMemoryStore {
     return all.flat().sort((a, b) => a.created.localeCompare(b.created));
   }
 
-  async getById(id: string): Promise<StoredMemoryLine | null> {
-    const memories = await this.list();
-    return memories.find((memory) => memory.id === id) || null;
-  }
-
   async remember(
     category: MemoryCategory,
     content: string,
@@ -350,7 +292,7 @@ export class NdjsonMemoryStore {
 
     const memory: StoredMemoryLine = {
       category,
-      id: randomUUID(),
+      id: uuidv7(),
       content: normalized,
       created: new Date().toISOString(),
     };
@@ -439,7 +381,7 @@ export class NdjsonMemoryStore {
 
       const lines = items
         .slice(0, 20)
-        .map((entry) => `- ${entry.id.slice(0, 8)}: ${truncate(entry.content, 120)}`);
+        .map((entry) => `- ${truncate(entry.content, 120)}`);
       sections.push(`${title} index:\n${lines.join("\n")}`);
     };
 
@@ -476,10 +418,9 @@ export class NdjsonMemoryStore {
 }
 
 class PiMemoryIndex {
-  private cwd: string;
   private memoryDir: string;
   private options: Required<MemoryManagerOptions>;
-  private db: Database.Database;
+  private db: Database.Database | null = null;
   private initialized = false;
   private semanticAvailable = false;
   private embeddingProvider: EmbeddingProvider | null = null;
@@ -487,17 +428,20 @@ class PiMemoryIndex {
   private readonly embeddingDimensions: number;
 
   constructor(
-    cwd: string,
     memoryDir: string,
     options: Required<MemoryManagerOptions>,
   ) {
-    this.cwd = cwd;
     this.memoryDir = memoryDir;
     this.options = options;
     this.embeddingModel = options.embeddingModel;
     this.embeddingDimensions = options.embeddingDimensions;
-    mkdirSync(memoryDir, { recursive: true });
-    this.db = new Database(join(memoryDir, "vector.db"));
+  }
+
+  private get dbReady(): Database.Database {
+    if (!this.db) {
+      throw new Error("PiMemoryIndex not initialized");
+    }
+    return this.db;
   }
 
   async initialize(): Promise<void> {
@@ -505,7 +449,10 @@ class PiMemoryIndex {
       return;
     }
 
-    this.db.exec(`
+    await mkdir(this.memoryDir, { recursive: true });
+    this.db = new Database(join(this.memoryDir, "vector.db"));
+
+    this.dbReady.exec(`
       CREATE TABLE IF NOT EXISTS indexed_memories (
         id TEXT PRIMARY KEY,
         category TEXT NOT NULL,
@@ -521,41 +468,12 @@ class PiMemoryIndex {
         content
       );
 
-      CREATE TABLE IF NOT EXISTS indexed_file_chunks (
-        id TEXT PRIMARY KEY,
-        root_path TEXT NOT NULL,
-        path TEXT NOT NULL,
-        chunk_index INTEGER NOT NULL,
-        start_line INTEGER NOT NULL,
-        end_line INTEGER NOT NULL,
-        content TEXT NOT NULL,
-        file_hash TEXT NOT NULL,
-        file_mtime_ms REAL NOT NULL,
-        indexed_at TEXT NOT NULL,
-        UNIQUE(root_path, path, chunk_index)
-      );
-
-      CREATE INDEX IF NOT EXISTS idx_file_chunks_path
-      ON indexed_file_chunks(root_path, path);
-
-      CREATE VIRTUAL TABLE IF NOT EXISTS file_chunk_fts USING fts5(
-        id UNINDEXED,
-        path UNINDEXED,
-        content
-      );
-
-      CREATE TABLE IF NOT EXISTS activity_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind TEXT NOT NULL,
-        content TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
     `);
 
     if (this.options.semanticEnabled) {
       try {
-        sqliteVec.load(this.db);
-        this.db.exec(`
+        sqliteVec.load(this.dbReady);
+        this.dbReady.exec(`
           CREATE TABLE IF NOT EXISTS vector_item_map (
             vector_rowid INTEGER PRIMARY KEY AUTOINCREMENT,
             item_id TEXT NOT NULL UNIQUE
@@ -581,7 +499,9 @@ class PiMemoryIndex {
   }
 
   async close(): Promise<void> {
-    this.db.close();
+    this.db?.close();
+    this.db = null;
+    this.initialized = false;
   }
 
   isSemanticAvailable(): boolean {
@@ -592,7 +512,7 @@ class PiMemoryIndex {
     await this.initialize();
 
     const wantedIds = new Set(memories.map((memory) => memory.id));
-    const existingRows = this.db
+    const existingRows = this.dbReady
       .prepare(`SELECT id FROM indexed_memories`)
       .all() as Array<{ id: string }>;
 
@@ -611,7 +531,7 @@ class PiMemoryIndex {
     await this.initialize();
 
     const now = new Date().toISOString();
-    this.db
+    this.dbReady
       .prepare(`
         INSERT INTO indexed_memories (id, category, content, created_at, updated_at, indexed_at)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -631,8 +551,8 @@ class PiMemoryIndex {
         now,
       );
 
-    this.db.prepare(`DELETE FROM memory_fts WHERE id = ?`).run(memory.id);
-    this.db
+    this.dbReady.prepare(`DELETE FROM memory_fts WHERE id = ?`).run(memory.id);
+    this.dbReady
       .prepare(
         `INSERT INTO memory_fts (id, category, content) VALUES (?, ?, ?)`,
       )
@@ -651,147 +571,11 @@ class PiMemoryIndex {
   async removeMemory(id: string): Promise<void> {
     await this.initialize();
 
-    this.db.prepare(`DELETE FROM indexed_memories WHERE id = ?`).run(id);
-    this.db.prepare(`DELETE FROM memory_fts WHERE id = ?`).run(id);
+    this.dbReady.prepare(`DELETE FROM indexed_memories WHERE id = ?`).run(id);
+    this.dbReady.prepare(`DELETE FROM memory_fts WHERE id = ?`).run(id);
     if (this.semanticAvailable) {
       this.removeVector(`memory:${id}`);
     }
-  }
-
-  async syncRepoFiles(force = false): Promise<FileIndexResult> {
-    await this.initialize();
-
-    const seen = new Set<string>();
-    let indexedFiles = 0;
-    let skippedFiles = 0;
-    let removedFiles = 0;
-    let chunksIndexed = 0;
-
-    const files = await this.walk(this.cwd);
-    for (const absolutePath of files) {
-      const stats = await stat(absolutePath);
-      if (!stats.isFile() || stats.size > this.options.maxFileSizeBytes) {
-        continue;
-      }
-
-      const buffer = await readFile(absolutePath);
-      if (looksBinary(buffer)) {
-        continue;
-      }
-
-      const content = buffer.toString("utf8");
-      if (!content.trim()) {
-        continue;
-      }
-
-      const relativePath = relative(this.cwd, absolutePath).replaceAll("\\", "/");
-      seen.add(relativePath);
-
-      const fileHash = createHash("sha256").update(content).digest("hex");
-      const existing = this.listFileChunks(relativePath);
-      if (
-        !force &&
-        existing.length > 0 &&
-        existing[0].fileHash === fileHash &&
-        existing[0].fileMtimeMs === stats.mtimeMs
-      ) {
-        skippedFiles++;
-        continue;
-      }
-
-      if (existing.length > 0) {
-        this.deleteIndexedFile(relativePath, existing);
-      }
-
-      const chunks = chunkText(
-        content,
-        this.options.chunkSizeLines,
-        this.options.overlapLines,
-      );
-      if (chunks.length === 0) {
-        skippedFiles++;
-        continue;
-      }
-
-      const rows: FileChunk[] = chunks.map((chunk) => ({
-        id: stableId([relativePath, String(chunk.chunkIndex)]),
-        rootPath: this.cwd,
-        path: relativePath,
-        chunkIndex: chunk.chunkIndex,
-        startLine: chunk.startLine,
-        endLine: chunk.endLine,
-        content: chunk.content,
-        fileHash,
-        fileMtimeMs: stats.mtimeMs,
-      }));
-
-      const now = new Date().toISOString();
-      const insertChunk = this.db.prepare(`
-        INSERT INTO indexed_file_chunks (
-          id, root_path, path, chunk_index, start_line, end_line, content,
-          file_hash, file_mtime_ms, indexed_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `);
-      const insertFts = this.db.prepare(
-        `INSERT INTO file_chunk_fts (id, path, content) VALUES (?, ?, ?)`,
-      );
-
-      const tx = this.db.transaction((entries: FileChunk[]) => {
-        for (const entry of entries) {
-          insertChunk.run(
-            entry.id,
-            entry.rootPath,
-            entry.path,
-            entry.chunkIndex,
-            entry.startLine,
-            entry.endLine,
-            entry.content,
-            entry.fileHash,
-            entry.fileMtimeMs,
-            now,
-          );
-          insertFts.run(entry.id, entry.path, entry.content);
-        }
-      });
-      tx(rows);
-
-      if (this.semanticAvailable && this.embeddingProvider) {
-        try {
-          const embeddings = await this.embeddingProvider.embedBatch(
-            rows.map((row) => row.content),
-          );
-          for (let i = 0; i < rows.length; i++) {
-            this.indexVector(`file:${rows[i].id}`, embeddings[i]);
-          }
-        } catch {
-          this.semanticAvailable = false;
-        }
-      }
-
-      indexedFiles++;
-      chunksIndexed += rows.length;
-    }
-
-    const tracked = this.db
-      .prepare(
-        `SELECT DISTINCT path FROM indexed_file_chunks WHERE root_path = ? ORDER BY path`,
-      )
-      .all(this.cwd) as Array<{ path: string }>;
-
-    for (const entry of tracked) {
-      if (!seen.has(entry.path)) {
-        this.deleteIndexedFile(entry.path, this.listFileChunks(entry.path));
-        removedFiles++;
-      }
-    }
-
-    return {
-      indexedFiles,
-      skippedFiles,
-      removedFiles,
-      chunksIndexed,
-    };
   }
 
   async search(
@@ -809,9 +593,6 @@ class PiMemoryIndex {
         const embedding = await this.embeddingProvider.embed(query);
         const rows = this.searchVectors(embedding, limit * 3);
         for (const row of rows) {
-          if (category && row.itemId.startsWith("file:")) {
-            continue;
-          }
           ranked.set(row.itemId, row);
         }
         if (rows.length > 0) {
@@ -849,117 +630,41 @@ class PiMemoryIndex {
       .slice(0, limit);
 
     const memories: MemoryHit[] = [];
-    const files: FileHit[] = [];
 
     for (const row of sorted) {
-      if (row.itemId.startsWith("memory:")) {
-        const id = row.itemId.slice("memory:".length);
-        const record = this.db
-          .prepare(
-            `SELECT id, category, content, created_at, updated_at FROM indexed_memories WHERE id = ?`,
-          )
-          .get(id) as
-          | {
-              id: string;
-              category: MemoryCategory;
-              content: string;
-              created_at: string;
-              updated_at: string | null;
-            }
-          | undefined;
-        if (!record) {
-          continue;
-        }
-        memories.push({
-          id: record.id,
-          category: record.category,
-          content: record.content,
-          created: record.created_at,
-          updated: record.updated_at || undefined,
-          score: row.score,
-          source: row.source,
-        });
+      const id = row.itemId.slice("memory:".length);
+      const record = this.dbReady
+        .prepare(
+          `SELECT id, category, content, created_at, updated_at FROM indexed_memories WHERE id = ?`,
+        )
+        .get(id) as
+        | {
+            id: string;
+            category: MemoryCategory;
+            content: string;
+            created_at: string;
+            updated_at: string | null;
+          }
+        | undefined;
+      if (!record) {
         continue;
       }
-
-      if (row.itemId.startsWith("file:")) {
-        const id = row.itemId.slice("file:".length);
-        const record = this.db
-          .prepare(
-            `SELECT id, path, start_line, end_line, content FROM indexed_file_chunks WHERE id = ?`,
-          )
-          .get(id) as
-          | {
-              id: string;
-              path: string;
-              start_line: number;
-              end_line: number;
-              content: string;
-            }
-          | undefined;
-        if (!record) {
-          continue;
-        }
-        files.push({
-          id: record.id,
-          path: record.path,
-          startLine: Number(record.start_line),
-          endLine: Number(record.end_line),
-          content: record.content,
-          score: row.score,
-          source: row.source,
-        });
-      }
+      memories.push({
+        id: record.id,
+        category: record.category,
+        content: record.content,
+        created: record.created_at,
+        updated: record.updated_at || undefined,
+        score: row.score,
+        source: row.source,
+      });
     }
 
-    return { memories, files, searchMode: mode };
-  }
-
-  async logActivity(kind: string, content: string): Promise<void> {
-    await this.initialize();
-    const normalized = normalizeText(content);
-    if (!normalized) {
-      return;
-    }
-
-    this.db
-      .prepare(
-        `INSERT INTO activity_log (kind, content, created_at) VALUES (?, ?, ?)`,
-      )
-      .run(kind, truncate(normalized, 4000), new Date().toISOString());
-  }
-
-  async listActivity(since?: string): Promise<ActivityEntry[]> {
-    await this.initialize();
-    const rows = since
-      ? (this.db
-          .prepare(
-            `SELECT kind, content, created_at FROM activity_log WHERE created_at >= ? ORDER BY created_at DESC`,
-          )
-          .all(since) as Array<{
-          kind: string;
-          content: string;
-          created_at: string;
-        }>)
-      : (this.db
-          .prepare(
-            `SELECT kind, content, created_at FROM activity_log ORDER BY created_at DESC LIMIT 200`,
-          )
-          .all() as Array<{
-          kind: string;
-          content: string;
-          created_at: string;
-        }>);
-
-    return rows.map((row) => ({
-      kind: row.kind,
-      content: row.content,
-      createdAt: row.created_at,
-    }));
+    return { memories, searchMode: mode };
   }
 
   private searchVectors(query: number[], limit: number): SearchRow[] {
-    const rows = this.db
+    const rows = this.dbReady
       .prepare(`
         SELECT m.item_id as item_id, v.distance as distance
         FROM vector_index v
@@ -990,7 +695,7 @@ class PiMemoryIndex {
 
     try {
       const memoryRows = category
-        ? (this.db
+        ? (this.dbReady
             .prepare(`
               SELECT id, bm25(memory_fts) as rank
               FROM memory_fts
@@ -1000,7 +705,7 @@ class PiMemoryIndex {
               LIMIT ?
             `)
             .all(q, category, limit) as Array<{ id: string; rank: number }>)
-        : (this.db
+        : (this.dbReady
             .prepare(`
               SELECT id, bm25(memory_fts) as rank
               FROM memory_fts
@@ -1017,35 +722,15 @@ class PiMemoryIndex {
           source: "fts",
         });
       }
-
-      if (!category) {
-        const fileRows = this.db
-          .prepare(`
-            SELECT id, bm25(file_chunk_fts) as rank
-            FROM file_chunk_fts
-            WHERE file_chunk_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
-          `)
-          .all(q, limit) as Array<{ id: string; rank: number }>;
-
-        for (const row of fileRows) {
-          rows.push({
-            itemId: `file:${row.id}`,
-            score: 1 / (1 + Math.abs(row.rank)),
-            source: "fts",
-          });
-        }
-      }
     } catch {
       const token = `%${normalizeText(query)}%`;
       const memoryRows = category
-        ? (this.db
+        ? (this.dbReady
             .prepare(
               `SELECT id FROM indexed_memories WHERE category = ? AND LOWER(content) LIKE LOWER(?) LIMIT ?`,
             )
             .all(category, token, limit) as Array<{ id: string }>)
-        : (this.db
+        : (this.dbReady
             .prepare(
               `SELECT id FROM indexed_memories WHERE LOWER(content) LIKE LOWER(?) LIMIT ?`,
             )
@@ -1057,22 +742,6 @@ class PiMemoryIndex {
           score: 0.6,
           source: "fts",
         });
-      }
-
-      if (!category) {
-        const fileRows = this.db
-          .prepare(
-            `SELECT id FROM indexed_file_chunks WHERE LOWER(content) LIKE LOWER(?) LIMIT ?`,
-          )
-          .all(token, limit) as Array<{ id: string }>;
-
-        for (const row of fileRows) {
-          rows.push({
-            itemId: `file:${row.id}`,
-            score: 0.5,
-            source: "fts",
-          });
-        }
       }
     }
 
@@ -1128,46 +797,6 @@ class PiMemoryIndex {
           source: "grep",
         });
       }
-
-      const { stdout } = await execFileAsync("rg", [
-        "--no-heading",
-        "--line-number",
-        "--max-count",
-        String(limit),
-        "--glob",
-        "!.git/**",
-        "--glob",
-        "!node_modules/**",
-        "--glob",
-        "!.pi/**",
-        query,
-        this.cwd,
-      ]);
-
-      const fileLines = stdout
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .slice(0, limit);
-
-      for (const line of fileLines) {
-        const [path, lineNumber] = line.split(":", 3);
-        const relativePath = relative(this.cwd, path).replaceAll("\\", "/");
-        const match = this.db
-          .prepare(
-            `SELECT id FROM indexed_file_chunks WHERE path = ? AND start_line <= ? AND end_line >= ? LIMIT 1`,
-          )
-          .get(relativePath, Number(lineNumber), Number(lineNumber)) as
-          | { id: string }
-          | undefined;
-        if (match) {
-          rows.push({
-            itemId: `file:${match.id}`,
-            score: 0.3,
-            source: "grep",
-          });
-        }
-      }
     } catch {
       return rows;
     }
@@ -1199,72 +828,9 @@ class PiMemoryIndex {
     return ids;
   }
 
-  private listFileChunks(path: string): FileChunk[] {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM indexed_file_chunks WHERE root_path = ? AND path = ? ORDER BY chunk_index`,
-      )
-      .all(this.cwd, path) as Array<{
-      id: string;
-      root_path: string;
-      path: string;
-      chunk_index: number;
-      start_line: number;
-      end_line: number;
-      content: string;
-      file_hash: string;
-      file_mtime_ms: number;
-    }>;
-
-    return rows.map((row) => ({
-      id: row.id,
-      rootPath: row.root_path,
-      path: row.path,
-      chunkIndex: Number(row.chunk_index),
-      startLine: Number(row.start_line),
-      endLine: Number(row.end_line),
-      content: row.content,
-      fileHash: row.file_hash,
-      fileMtimeMs: Number(row.file_mtime_ms),
-    }));
-  }
-
-  private deleteIndexedFile(path: string, chunks: FileChunk[]): void {
-    for (const chunk of chunks) {
-      this.db.prepare(`DELETE FROM file_chunk_fts WHERE id = ?`).run(chunk.id);
-      if (this.semanticAvailable) {
-        this.removeVector(`file:${chunk.id}`);
-      }
-    }
-    this.db
-      .prepare(`DELETE FROM indexed_file_chunks WHERE root_path = ? AND path = ?`)
-      .run(this.cwd, path);
-  }
-
-  private async walk(root: string): Promise<string[]> {
-    const entries = await readdir(root, { withFileTypes: true });
-    const files: string[] = [];
-
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (this.options.excludeDirs.includes(entry.name)) {
-          continue;
-        }
-        files.push(...(await this.walk(join(root, entry.name))));
-        continue;
-      }
-
-      if (entry.isFile()) {
-        files.push(join(root, entry.name));
-      }
-    }
-
-    return files;
-  }
-
   private indexVector(itemId: string, vector: number[]): void {
     const rowid = this.getOrCreateRowId(itemId);
-    this.db
+    this.dbReady
       .prepare(
         `INSERT OR REPLACE INTO vector_index(rowid, embedding) VALUES (?, ?)`,
       )
@@ -1272,21 +838,21 @@ class PiMemoryIndex {
   }
 
   private removeVector(itemId: string): void {
-    const existing = this.db
+    const existing = this.dbReady
       .prepare(`SELECT vector_rowid FROM vector_item_map WHERE item_id = ?`)
       .get(itemId) as { vector_rowid: number | bigint } | undefined;
     if (!existing) {
       return;
     }
 
-    this.db
+    this.dbReady
       .prepare(`DELETE FROM vector_index WHERE rowid = ?`)
       .run(this.toSqliteInteger(existing.vector_rowid));
-    this.db.prepare(`DELETE FROM vector_item_map WHERE item_id = ?`).run(itemId);
+    this.dbReady.prepare(`DELETE FROM vector_item_map WHERE item_id = ?`).run(itemId);
   }
 
   private getOrCreateRowId(itemId: string): bigint {
-    const existing = this.db
+    const existing = this.dbReady
       .prepare(`SELECT vector_rowid FROM vector_item_map WHERE item_id = ?`)
       .get(itemId) as { vector_rowid: number | bigint } | undefined;
     if (existing) {
@@ -1294,7 +860,7 @@ class PiMemoryIndex {
     }
 
     return this.toSqliteInteger(
-      this.db
+      this.dbReady
         .prepare(`INSERT INTO vector_item_map (item_id) VALUES (?)`)
         .run(itemId).lastInsertRowid,
     );
@@ -1310,18 +876,17 @@ export class MemoryManager {
   private store: NdjsonMemoryStore;
   private index: PiMemoryIndex;
   private initialized = false;
-  private lastFileSync = 0;
   private options: Required<MemoryManagerOptions>;
 
   constructor(cwd: string, options: MemoryManagerOptions = {}) {
     this.cwd = cwd;
     this.options = { ...DEFAULT_OPTIONS, ...options };
     this.store = new NdjsonMemoryStore(cwd, this.options.memoryDirName);
-    this.index = new PiMemoryIndex(
-      cwd,
-      this.store.memoryDir,
-      this.options,
-    );
+    this.index = new PiMemoryIndex(this.store.memoryDir, this.options);
+  }
+
+  async isReady(): Promise<boolean> {
+    return exists(this.store.memoryDir);
   }
 
   async initialize(): Promise<void> {
@@ -1353,10 +918,8 @@ export class MemoryManager {
     query: string;
     category?: MemoryCategory;
     limit?: number;
-    forceFileSync?: boolean;
   }): Promise<RecallResult> {
     await this.initialize();
-    await this.syncFilesIfNeeded(Boolean(options.forceFileSync));
     return this.index.search(
       options.query,
       options.category,
@@ -1393,29 +956,37 @@ export class MemoryManager {
     return { memories, counts };
   }
 
-  async init(force = false): Promise<InitResult> {
+  async init(force = false, seed = false): Promise<InitResult> {
+    if (force) {
+      await this.index.close();
+      const dbPath = join(this.store.memoryDir, "vector.db");
+      try {
+        await unlink(dbPath);
+      } catch {}
+      this.index = new PiMemoryIndex(this.store.memoryDir, this.options);
+      this.initialized = false;
+    }
+
     await this.initialize();
-    const seeds = await this.generateSeedMemories();
 
     let createdMemories = 0;
     let skippedMemories = 0;
-    for (const seed of seeds) {
-      const result = await this.remember(seed.category, seed.content);
-      if (result.created) {
-        createdMemories++;
-      } else {
-        skippedMemories++;
+
+    if (seed) {
+      const seeds = await this.generateSeedMemories();
+      for (const s of seeds) {
+        const result = await this.remember(s.category, s.content);
+        if (result.created) {
+          createdMemories++;
+        } else {
+          skippedMemories++;
+        }
       }
     }
 
-    const sync = await this.syncFiles(force);
     return {
       createdMemories,
       skippedMemories,
-      indexedFiles: sync.indexedFiles,
-      skippedFiles: sync.skippedFiles,
-      removedFiles: sync.removedFiles,
-      chunksIndexed: sync.chunksIndexed,
       semanticEnabled: this.index.isSemanticAvailable(),
     };
   }
@@ -1425,36 +996,79 @@ export class MemoryManager {
     return this.store.buildPromptContext();
   }
 
-  async logActivity(kind: string, content: string): Promise<void> {
+  async learn(_since?: string): Promise<string[]> {
     await this.initialize();
-    await this.index.logActivity(kind, content);
-  }
+    const sessions = await this.scanRecentSessions(5);
+    if (sessions.length === 0) {
+      return [];
+    }
 
-  async learn(since?: string): Promise<string[]> {
-    await this.initialize();
-    const activities = await this.index.listActivity(since);
-    const memories = await this.store.list();
-    const known = new Set(memories.map((memory) => normalizeText(memory.content)));
-    const candidates = new Set<string>();
-
-    for (const entry of activities) {
-      for (const sentence of splitSentences(entry.content)) {
-        const normalized = normalizeText(sentence);
-        if (!normalized) {
+    const snippets: string[] = [];
+    for (const session of sessions) {
+      snippets.push(`--- Session: ${session.file} ---`);
+      for (const entry of session.entries) {
+        if (entry.type !== "message" || !entry.message) {
           continue;
         }
-        if (
-          /(^|\b)(we use|we prefer|prefer|always|never|should|must|decided|decision|pattern|convention)(\b|$)/i.test(
-            normalized,
-          ) &&
-          !known.has(normalized)
-        ) {
-          candidates.add(normalized);
+        const role = entry.message.role;
+        if (role !== "user" && role !== "assistant") {
+          continue;
+        }
+        const text = extractMessageText(entry.message);
+        if (text) {
+          snippets.push(`[${role}]: ${text.slice(0, 400)}`);
         }
       }
     }
 
-    return Array.from(candidates).slice(0, 10);
+    return snippets;
+  }
+
+  private async scanRecentSessions(
+    limit: number,
+  ): Promise<Array<{ file: string; entries: unknown[] }>> {
+    const home = homedir();
+    const resolvedCwd = this.cwd.replace(/^\/+/, "").replace(/[/\\:]/g, "-");
+    const sessionDir = join(home, ".pi", "agent", "sessions", `--${resolvedCwd}--`);
+
+    try {
+      const files = await readdir(sessionDir);
+      const jsonlFiles = files
+        .filter((f) => f.endsWith(".jsonl"))
+        .map((f) => join(sessionDir, f));
+
+      const fileStats = await Promise.all(
+        jsonlFiles.map(async (path) => {
+          const s = await stat(path);
+          return { path, mtime: s.mtime.getTime() };
+        }),
+      );
+      fileStats.sort((a, b) => b.mtime - a.mtime);
+
+      const recent = fileStats.slice(0, limit).map((f) => f.path);
+      const results: Array<{ file: string; entries: unknown[] }> = [];
+
+      for (const file of recent) {
+        const content = await readFile(file, "utf8").catch(() => "");
+        if (!content) {
+          continue;
+        }
+        const lines = content.split(/\r?\n/).filter(Boolean);
+        const entries: unknown[] = [];
+        for (const line of lines) {
+          try {
+            entries.push(JSON.parse(line));
+          } catch {
+            // Skip malformed lines
+          }
+        }
+        results.push({ file: file.split("/").pop() ?? file, entries });
+      }
+
+      return results;
+    } catch {
+      return [];
+    }
   }
 
   async consolidate(since?: string): Promise<string[]> {
@@ -1496,26 +1110,6 @@ export class MemoryManager {
     }
 
     return suggestions.slice(0, 10);
-  }
-
-  isSemanticAvailable(): boolean {
-    return this.index.isSemanticAvailable();
-  }
-
-  private async syncFilesIfNeeded(force: boolean): Promise<void> {
-    const ageMs = Date.now() - this.lastFileSync;
-    if (!force && this.lastFileSync !== 0 && ageMs < 5 * 60 * 1000) {
-      return;
-    }
-
-    await this.syncFiles(force);
-  }
-
-  private async syncFiles(force: boolean): Promise<FileIndexResult> {
-    await this.initialize();
-    const result = await this.index.syncRepoFiles(force);
-    this.lastFileSync = Date.now();
-    return result;
   }
 
   private async generateSeedMemories(): Promise<
@@ -1638,64 +1232,27 @@ async function collectFiles(root: string, extension: string): Promise<string[]> 
   return files;
 }
 
+function extractMessageText(message: {
+  content?: string | Array<{ type?: string; text?: string }>;
+}): string {
+  const content = message.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .filter((c) => c.type === "text" && typeof c.text === "string")
+      .map((c) => c.text)
+      .join(" ");
+  }
+  return "";
+}
+
 function splitSentences(text: string): string[] {
   return text
     .split(/(?<=[.!?])\s+/)
     .map((entry) => entry.trim())
     .filter(Boolean);
-}
-
-function chunkText(
-  text: string,
-  chunkSizeLines: number,
-  overlapLines: number,
-): Array<{
-  chunkIndex: number;
-  startLine: number;
-  endLine: number;
-  content: string;
-}> {
-  const lines = text.split(/\r?\n/);
-  const chunks: Array<{
-    chunkIndex: number;
-    startLine: number;
-    endLine: number;
-    content: string;
-  }> = [];
-
-  const step = Math.max(1, chunkSizeLines - overlapLines);
-  for (
-    let start = 0, chunkIndex = 0;
-    start < lines.length;
-    start += step, chunkIndex++
-  ) {
-    const slice = lines.slice(start, start + chunkSizeLines);
-    const content = slice.join("\n").trim();
-    if (!content) {
-      continue;
-    }
-    chunks.push({
-      chunkIndex,
-      startLine: start + 1,
-      endLine: start + slice.length,
-      content,
-    });
-
-    if (start + chunkSizeLines >= lines.length) {
-      break;
-    }
-  }
-
-  return chunks;
-}
-
-function looksBinary(buffer: Buffer): boolean {
-  for (let i = 0; i < buffer.length; i++) {
-    if (buffer[i] === 0) {
-      return true;
-    }
-  }
-  return false;
 }
 
 function truncate(value: string, length: number): string {
