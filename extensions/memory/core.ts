@@ -7,9 +7,11 @@ import {
   mkdir,
   readFile,
   readdir,
+  stat,
   unlink,
   writeFile,
 } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import * as sqliteVec from "sqlite-vec";
 
@@ -54,12 +56,6 @@ interface SearchRow {
   itemId: string;
   score: number;
   source: "semantic" | "fts" | "grep";
-}
-
-interface ActivityEntry {
-  kind: string;
-  content: string;
-  createdAt: string;
 }
 
 interface MemoryManagerOptions {
@@ -472,12 +468,6 @@ class PiMemoryIndex {
         content
       );
 
-      CREATE TABLE IF NOT EXISTS activity_log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind TEXT NOT NULL,
-        content TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
     `);
 
     if (this.options.semanticEnabled) {
@@ -671,49 +661,6 @@ class PiMemoryIndex {
     }
 
     return { memories, searchMode: mode };
-  }
-
-  async logActivity(kind: string, content: string): Promise<void> {
-    await this.initialize();
-    const normalized = normalizeText(content);
-    if (!normalized) {
-      return;
-    }
-
-    this.dbReady
-      .prepare(
-        `INSERT INTO activity_log (kind, content, created_at) VALUES (?, ?, ?)`,
-      )
-      .run(kind, truncate(normalized, 4000), new Date().toISOString());
-  }
-
-  async listActivity(since?: string): Promise<ActivityEntry[]> {
-    await this.initialize();
-    const rows = since
-      ? (this.dbReady
-          .prepare(
-            `SELECT kind, content, created_at FROM activity_log WHERE created_at >= ? ORDER BY created_at DESC`,
-          )
-          .all(since) as Array<{
-          kind: string;
-          content: string;
-          created_at: string;
-        }>)
-      : (this.dbReady
-          .prepare(
-            `SELECT kind, content, created_at FROM activity_log ORDER BY created_at DESC LIMIT 200`,
-          )
-          .all() as Array<{
-          kind: string;
-          content: string;
-          created_at: string;
-        }>);
-
-    return rows.map((row) => ({
-      kind: row.kind,
-      content: row.content,
-      createdAt: row.created_at,
-    }));
   }
 
   private searchVectors(query: number[], limit: number): SearchRow[] {
@@ -1049,36 +996,79 @@ export class MemoryManager {
     return this.store.buildPromptContext();
   }
 
-  async logActivity(kind: string, content: string): Promise<void> {
+  async learn(_since?: string): Promise<string[]> {
     await this.initialize();
-    await this.index.logActivity(kind, content);
-  }
+    const sessions = await this.scanRecentSessions(5);
+    if (sessions.length === 0) {
+      return [];
+    }
 
-  async learn(since?: string): Promise<string[]> {
-    await this.initialize();
-    const activities = await this.index.listActivity(since);
-    const memories = await this.store.list();
-    const known = new Set(memories.map((memory) => normalizeText(memory.content)));
-    const candidates = new Set<string>();
-
-    for (const entry of activities) {
-      for (const sentence of splitSentences(entry.content)) {
-        const normalized = normalizeText(sentence);
-        if (!normalized) {
+    const snippets: string[] = [];
+    for (const session of sessions) {
+      snippets.push(`--- Session: ${session.file} ---`);
+      for (const entry of session.entries) {
+        if (entry.type !== "message" || !entry.message) {
           continue;
         }
-        if (
-          /(^|\b)(we use|we prefer|prefer|always|never|should|must|decided|decision|pattern|convention)(\b|$)/i.test(
-            normalized,
-          ) &&
-          !known.has(normalized)
-        ) {
-          candidates.add(normalized);
+        const role = entry.message.role;
+        if (role !== "user" && role !== "assistant") {
+          continue;
+        }
+        const text = extractMessageText(entry.message);
+        if (text) {
+          snippets.push(`[${role}]: ${text.slice(0, 400)}`);
         }
       }
     }
 
-    return Array.from(candidates).slice(0, 10);
+    return snippets;
+  }
+
+  private async scanRecentSessions(
+    limit: number,
+  ): Promise<Array<{ file: string; entries: unknown[] }>> {
+    const home = homedir();
+    const resolvedCwd = this.cwd.replace(/^\/+/, "").replace(/[/\\:]/g, "-");
+    const sessionDir = join(home, ".pi", "agent", "sessions", `--${resolvedCwd}--`);
+
+    try {
+      const files = await readdir(sessionDir);
+      const jsonlFiles = files
+        .filter((f) => f.endsWith(".jsonl"))
+        .map((f) => join(sessionDir, f));
+
+      const fileStats = await Promise.all(
+        jsonlFiles.map(async (path) => {
+          const s = await stat(path);
+          return { path, mtime: s.mtime.getTime() };
+        }),
+      );
+      fileStats.sort((a, b) => b.mtime - a.mtime);
+
+      const recent = fileStats.slice(0, limit).map((f) => f.path);
+      const results: Array<{ file: string; entries: unknown[] }> = [];
+
+      for (const file of recent) {
+        const content = await readFile(file, "utf8").catch(() => "");
+        if (!content) {
+          continue;
+        }
+        const lines = content.split(/\r?\n/).filter(Boolean);
+        const entries: unknown[] = [];
+        for (const line of lines) {
+          try {
+            entries.push(JSON.parse(line));
+          } catch {
+            // Skip malformed lines
+          }
+        }
+        results.push({ file: file.split("/").pop() ?? file, entries });
+      }
+
+      return results;
+    } catch {
+      return [];
+    }
   }
 
   async consolidate(since?: string): Promise<string[]> {
@@ -1240,6 +1230,22 @@ async function collectFiles(root: string, extension: string): Promise<string[]> 
     }
   }
   return files;
+}
+
+function extractMessageText(message: {
+  content?: string | Array<{ type?: string; text?: string }>;
+}): string {
+  const content = message.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content
+      .filter((c) => c.type === "text" && typeof c.text === "string")
+      .map((c) => c.text)
+      .join(" ");
+  }
+  return "";
 }
 
 function splitSentences(text: string): string[] {

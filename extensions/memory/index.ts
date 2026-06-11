@@ -282,12 +282,12 @@ export default function (pi: ExtensionAPI) {
         return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
       }
 
-      const suggestions = await manager.learn(params.since);
+      const snippets = await manager.learn(params.since);
       return textResult(
-        suggestions.length > 0
-          ? `Suggested memories:\n${suggestions.map((entry) => `- ${entry}`).join("\n")}`
-          : "No new memory suggestions found.",
-        { count: suggestions.length },
+        snippets.length > 0
+          ? `Recent conversations from ${snippets.filter((s) => s.startsWith("--- Session")).length} sessions:\n\n${snippets.join("\n")}`
+          : "No recent sessions found. Use `memory_remember` to add memories manually.",
+        { sessionCount: snippets.filter((s) => s.startsWith("--- Session")).length },
       );
     },
   });
