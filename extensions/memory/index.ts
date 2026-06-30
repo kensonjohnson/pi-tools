@@ -106,10 +106,16 @@ export default function (pi: ExtensionAPI) {
     name: "memory_remember",
     label: "Memory Remember",
     description: "Store a new project memory in NDJSON and sync the local index.",
-    promptSnippet: "Store a durable project memory",
+    promptSnippet: "Store durable project knowledge, practices, or decisions",
     promptGuidelines: [
-      "Use this for stable project facts, conventions, or decisions worth keeping across sessions.",
-      "Choose the most specific category: knowledge, practices, or decisions.",
+      "Use memory_remember proactively, without waiting for the user to ask, whenever the conversation establishes a reusable project fact.",
+      "Compress each memory into one terse, self-contained sentence. Do not include rationale, examples, or prose.",
+      "Do not include session-specific context such as turn numbers, option labels like 'Option A', timestamps, or references to the current conversation.",
+      "Encode as knowledge when the fact describes what the codebase is: tech stack, dependencies, directory layout, external APIs, or build/test commands.",
+      "Encode as practices when the fact describes how the codebase works: naming conventions, coding patterns, test style, file organization, or repeated workflows.",
+      "Encode as decisions when the fact explains why a choice was made: architecture tradeoffs, rejected alternatives, scope boundaries, or library selection rationale.",
+      "Choose the most specific memory_remember category: knowledge, practices, or decisions.",
+      "After writing a memory, continue the task without asking the user for confirmation.",
     ],
     parameters: Type.Object({
       category: Type.Union(
@@ -141,9 +147,11 @@ export default function (pi: ExtensionAPI) {
     label: "Memory Recall",
     description:
       "Retrieve relevant project memories using local semantic search with fallbacks.",
-    promptSnippet: "Recall project memory",
+    promptSnippet: "Retrieve relevant project memories before acting",
     promptGuidelines: [
-      "Use category when the user is clearly asking about knowledge, practices, or decisions only.",
+      "Use memory_recall when the user asks about project conventions, history, architecture, or why something is the way it is.",
+      "Use memory_recall before changing project patterns, conventions, file organization, or architecture to check for existing guidance.",
+      "Use memory_recall's category parameter only when the query is clearly about knowledge, practices, or decisions.",
     ],
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
@@ -233,6 +241,10 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // Lifecycle / review tools are intentionally NOT given promptSnippet or
+  // promptGuidelines. They should only be used when the user explicitly asks
+  // for memory initialization, session review, or consolidation.
+
   pi.registerTool({
     name: "memory_init",
     label: "Memory Init",
@@ -321,6 +333,10 @@ export default function (pi: ExtensionAPI) {
     name: "memory_list",
     label: "Memory List",
     description: "List stored memories and category counts.",
+    promptSnippet: "Audit stored project memories",
+    promptGuidelines: [
+      "Use memory_list when the user asks what the project remembers, or before consolidating/updating memories.",
+    ],
     parameters: Type.Object({
       category: Type.Optional(
         Type.String({
