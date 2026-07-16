@@ -48,4 +48,12 @@ Connects to Brave Browser on `localhost:9222`.
 | `browser_cookies` | List cookies for the current tab |
 | `browser_pick` | Interactive element picker — click to select |
 
+### `custom-stats-footer`
+
+Replaces Pi's default footer with context usage and last/average tokens per second.
+
+If you happen to be using a codex subscription, you can toggle `/codex-quota` in Pi to see your remaining weekly quota. This  uses your existing `openai-codex` ChatGPT subscription login, refreshes every five minutes, and stores only the enabled setting in `~/.pi/agent/codex-quota-footer.json`. `/codex-quota on` and `/codex-quota off` remain available for explicit control.
+
+The quota source is an undocumented ChatGPT endpoint, so the feature is best-effort. Access tokens and account identifiers are used only in memory and are never written or displayed by the extension.
+
 
