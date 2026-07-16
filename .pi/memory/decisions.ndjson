@@ -1,0 +1,1 @@
+{"content":"The Codex quota footer uses ModelRegistry.getApiKeyForProvider plus readStoredCredential because Pi 0.80.8 removed extension access to ModelRegistry.authStorage.","id":"019f6cae-8b8e-76aa-bd35-ec926fd51086","created":"2026-07-16T20:46:46.159Z"}
