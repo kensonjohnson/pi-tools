@@ -1,3 +1,6 @@
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type {
   ExtensionAPI,
@@ -28,11 +31,138 @@ function formatTokensExact(count: number): string {
   return `${(count / 1000000).toFixed(1)}M`;
 }
 
+type QuotaSettings = {
+  enabled: boolean;
+  refreshMinutes: number;
+};
+
+type CodexQuota = {
+  remainingPercent: number;
+  resetAtMs: number;
+};
+
+type RateLimitWindow = {
+  used_percent?: unknown;
+  limit_window_seconds?: unknown;
+  reset_at?: unknown;
+  reset_after_seconds?: unknown;
+};
+
+const DEFAULT_QUOTA_SETTINGS: QuotaSettings = {
+  enabled: false,
+  refreshMinutes: 5,
+};
+const WEEK_SECONDS = 7 * 24 * 60 * 60;
+const QUOTA_SETTINGS_PATH = join(
+  process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
+  "codex-quota-footer.json",
+);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function parseQuotaSettings(value: unknown): QuotaSettings {
+  if (!isRecord(value)) return { ...DEFAULT_QUOTA_SETTINGS };
+
+  return {
+    enabled: value.enabled === true,
+    refreshMinutes:
+      typeof value.refreshMinutes === "number" &&
+      Number.isFinite(value.refreshMinutes) &&
+      value.refreshMinutes >= 1
+        ? Math.min(value.refreshMinutes, 60)
+        : DEFAULT_QUOTA_SETTINGS.refreshMinutes,
+  };
+}
+
+async function loadQuotaSettings(): Promise<QuotaSettings> {
+  try {
+    return parseQuotaSettings(JSON.parse(await readFile(QUOTA_SETTINGS_PATH, "utf8")));
+  } catch {
+    return { ...DEFAULT_QUOTA_SETTINGS };
+  }
+}
+
+async function saveQuotaSettings(settings: QuotaSettings): Promise<void> {
+  await mkdir(dirname(QUOTA_SETTINGS_PATH), { recursive: true });
+  const temporaryPath = `${QUOTA_SETTINGS_PATH}.${process.pid}.tmp`;
+  await writeFile(temporaryPath, `${JSON.stringify(settings, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  await rename(temporaryPath, QUOTA_SETTINGS_PATH);
+}
+
+function findWeeklyWindow(value: unknown): RateLimitWindow | undefined {
+  if (!isRecord(value)) return undefined;
+
+  const windows = [value.primary_window, value.secondary_window];
+  for (const window of windows) {
+    if (!isRecord(window)) continue;
+    if (window.limit_window_seconds === WEEK_SECONDS) return window;
+  }
+  return undefined;
+}
+
+function parseCodexQuota(value: unknown): CodexQuota | undefined {
+  if (!isRecord(value)) return undefined;
+
+  const rateLimits: unknown[] = [value.rate_limit];
+  if (Array.isArray(value.additional_rate_limits)) {
+    for (const limit of value.additional_rate_limits) {
+      if (isRecord(limit)) rateLimits.push(limit.rate_limit);
+    }
+  }
+
+  for (const rateLimit of rateLimits) {
+    const window = findWeeklyWindow(rateLimit);
+    if (
+      !window ||
+      typeof window.used_percent !== "number" ||
+      !Number.isFinite(window.used_percent)
+    ) {
+      continue;
+    }
+
+    const resetAtMs =
+      typeof window.reset_at === "number" && Number.isFinite(window.reset_at)
+        ? window.reset_at * 1000
+        : typeof window.reset_after_seconds === "number" &&
+            Number.isFinite(window.reset_after_seconds)
+          ? Date.now() + window.reset_after_seconds * 1000
+          : 0;
+
+    return {
+      remainingPercent: Math.max(0, Math.min(100, Math.round(100 - window.used_percent))),
+      resetAtMs,
+    };
+  }
+
+  return undefined;
+}
+
+function formatResetDuration(resetAtMs: number): string {
+  const seconds = Math.max(0, Math.ceil((resetAtMs - Date.now()) / 1000));
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+
+  if (days > 0) return `${days}d ${hours}h`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  return `${Math.max(1, minutes)}m`;
+}
+
 // Module-level state to track TPS across agent runs
 let agentStartMs: number | null = null;
 let lastTps: number | null = null;
 let totalTpsSum = 0;
 let tpsCount = 0;
+let quotaSettings: QuotaSettings = { ...DEFAULT_QUOTA_SETTINGS };
+let codexQuota: CodexQuota | undefined;
+let quotaUnavailable = false;
+let quotaTimer: ReturnType<typeof setInterval> | undefined;
+let quotaRefresh: Promise<void> | undefined;
 
 function isAssistantMessage(message: unknown): message is AssistantMessage {
   if (!message || typeof message !== "object") return false;
@@ -69,6 +199,69 @@ export default function (pi: ExtensionAPI) {
     totalTpsSum += tps;
     tpsCount++;
   });
+
+  const stopQuotaUpdates = () => {
+    if (quotaTimer) clearInterval(quotaTimer);
+    quotaTimer = undefined;
+  };
+
+  const refreshQuota = (ctx: ExtensionContext): Promise<void> => {
+    if (quotaRefresh) return quotaRefresh;
+
+    quotaRefresh = (async () => {
+      try {
+        const authStorage = ctx.modelRegistry.authStorage;
+        const token = await authStorage.getApiKey("openai-codex");
+        const credential = authStorage.get("openai-codex");
+        const accountId =
+          credential &&
+          credential.type === "oauth" &&
+          typeof credential.accountId === "string"
+            ? credential.accountId
+            : undefined;
+
+        if (!token || !accountId) throw new Error("OpenAI Codex login is unavailable");
+
+        const response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "chatgpt-account-id": accountId,
+            originator: "pi",
+            "User-Agent": "pi quota footer",
+          },
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!response.ok) throw new Error(`Codex usage request failed (${response.status})`);
+
+        const quota = parseCodexQuota(await response.json());
+        if (!quota) throw new Error("Codex weekly limit was not present in the response");
+
+        codexQuota = quota;
+        quotaUnavailable = false;
+      } catch {
+        // This is an optional, undocumented endpoint: do not expose request errors or credentials.
+        codexQuota = undefined;
+        quotaUnavailable = true;
+      } finally {
+        quotaRefresh = undefined;
+        setupFooter(ctx);
+      }
+    })();
+
+    return quotaRefresh;
+  };
+
+  const startQuotaUpdates = (ctx: ExtensionContext) => {
+    stopQuotaUpdates();
+    if (!quotaSettings.enabled) return;
+
+    void refreshQuota(ctx);
+    quotaTimer = setInterval(
+      () => void refreshQuota(ctx),
+      quotaSettings.refreshMinutes * 60 * 1000,
+    );
+    quotaTimer.unref?.();
+  };
 
   // Function to set up the custom footer
   const setupFooter = (ctx: ExtensionContext) => {
@@ -148,6 +341,32 @@ export default function (pi: ExtensionAPI) {
           // Model name on the right
           // (modelName already fetched inside try-catch above)
 
+          if (quotaSettings.enabled) {
+            if (codexQuota) {
+              const fullQuota = `Codex ${codexQuota.remainingPercent}% · resets ${formatResetDuration(codexQuota.resetAtMs)}`;
+              const compactQuota = `Codex ${codexQuota.remainingPercent}%`;
+              const minimumPadding = 2;
+              const baseStats = statsParts.join(" | ");
+              const fullWidth = visibleWidth(
+                [baseStats, fullQuota].filter(Boolean).join(" | "),
+              );
+              const quotaText =
+                fullWidth + minimumPadding + visibleWidth(modelName) <= width
+                  ? fullQuota
+                  : compactQuota;
+
+              if (codexQuota.remainingPercent < 20) {
+                statsParts.push(theme.fg("error", quotaText));
+              } else if (codexQuota.remainingPercent <= 50) {
+                statsParts.push(theme.fg("warning", quotaText));
+              } else {
+                statsParts.push(theme.fg("success", quotaText));
+              }
+            } else if (quotaUnavailable) {
+              statsParts.push(theme.fg("warning", "Codex unavailable"));
+            }
+          }
+
           // Format stats line with " | " separator
           let statsLeft = statsParts.join(" | ");
           let statsLeftWidth = visibleWidth(statsLeft);
@@ -218,9 +437,46 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
-  // Set up custom footer on session start
+  pi.registerCommand("codex-quota", {
+    description: "Toggle the Codex weekly-quota footer (optional: on|off)",
+    handler: async (args, ctx) => {
+      let action = args.trim().toLowerCase();
+      if (action === "") action = quotaSettings.enabled ? "off" : "on";
+
+      if (action === "on") {
+        quotaSettings = { ...quotaSettings, enabled: true };
+        await saveQuotaSettings(quotaSettings);
+        quotaUnavailable = false;
+        startQuotaUpdates(ctx);
+        setupFooter(ctx);
+        ctx.ui.notify("Codex quota footer enabled", "info");
+        return;
+      }
+
+      if (action === "off") {
+        quotaSettings = { ...quotaSettings, enabled: false };
+        await saveQuotaSettings(quotaSettings);
+        stopQuotaUpdates();
+        codexQuota = undefined;
+        quotaUnavailable = false;
+        setupFooter(ctx);
+        ctx.ui.notify("Codex quota footer disabled", "info");
+        return;
+      }
+
+      ctx.ui.notify("Usage: /codex-quota [on|off]", "warning");
+    },
+  });
+
+  // Set up custom footer and begin quota polling only after a user has opted in.
   pi.on("session_start", async (_event, ctx) => {
+    quotaSettings = await loadQuotaSettings();
     setupFooter(ctx);
+    startQuotaUpdates(ctx);
+  });
+
+  pi.on("session_shutdown", () => {
+    stopQuotaUpdates();
   });
 
   // Re-assert footer when agent starts (prevents reset during agent activity)
