@@ -1,12 +1,13 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { AssistantMessage } from "@mariozechner/pi-ai";
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import {
+  readStoredCredential,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 /**
  * Custom Default Footer Extension with TPS
@@ -210,9 +211,8 @@ export default function (pi: ExtensionAPI) {
 
     quotaRefresh = (async () => {
       try {
-        const authStorage = ctx.modelRegistry.authStorage;
-        const token = await authStorage.getApiKey("openai-codex");
-        const credential = authStorage.get("openai-codex");
+        const token = await ctx.modelRegistry.getApiKeyForProvider("openai-codex");
+        const credential = readStoredCredential("openai-codex");
         const accountId =
           credential &&
           credential.type === "oauth" &&
@@ -244,7 +244,12 @@ export default function (pi: ExtensionAPI) {
         quotaUnavailable = true;
       } finally {
         quotaRefresh = undefined;
-        setupFooter(ctx);
+        // A session may shut down while this optional request is in flight.
+        try {
+          setupFooter(ctx);
+        } catch {
+          // Its context is stale; the replacement runtime owns the footer.
+        }
       }
     })();
 
