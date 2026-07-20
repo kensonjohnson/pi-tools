@@ -5,6 +5,9 @@
   "keywords": [
     "pi-package"
   ],
+  "scripts": {
+    "test:memory": "node --experimental-strip-types --test extensions/memory/core.test.ts"
+  },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "@mozilla/readability": "^0.6.0",

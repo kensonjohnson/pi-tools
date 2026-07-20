@@ -4,9 +4,11 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
   access,
+  appendFile,
   mkdir,
   readFile,
   readdir,
+  rename,
   stat,
   unlink,
   writeFile,
@@ -46,9 +48,15 @@ export interface RecallResult {
   searchMode: "semantic" | "fts" | "grep";
 }
 
+export interface RecoveryResult {
+  removedLines: Record<MemoryCategory, number>;
+  totalRemovedLines: number;
+}
+
 export interface InitResult {
   createdMemories: number;
   skippedMemories: number;
+  recoveredLines: number;
   semanticEnabled: boolean;
 }
 
@@ -190,23 +198,27 @@ function parseMemoryLine(
     return null;
   }
 
-  const parsed = JSON.parse(trimmed) as Partial<MemoryLine>;
-  if (
-    typeof parsed.id !== "string" ||
-    typeof parsed.content !== "string" ||
-    typeof parsed.created !== "string"
-  ) {
+  try {
+    const parsed = JSON.parse(trimmed) as Partial<MemoryLine>;
+    if (
+      typeof parsed.id !== "string" ||
+      typeof parsed.content !== "string" ||
+      typeof parsed.created !== "string"
+    ) {
+      return null;
+    }
+
+    return {
+      category,
+      id: parsed.id,
+      content: parsed.content,
+      created: parsed.created,
+      updated:
+        typeof parsed.updated === "string" ? parsed.updated : undefined,
+    };
+  } catch {
     return null;
   }
-
-  return {
-    category,
-    id: parsed.id,
-    content: parsed.content,
-    created: parsed.created,
-    updated:
-      typeof parsed.updated === "string" ? parsed.updated : undefined,
-  };
 }
 
 function normalizeText(value: string): string {
@@ -229,8 +241,36 @@ function ftsQuery(query: string): string {
   return tokens.map((token) => `${token}*`).join(" OR ");
 }
 
+function emptyRecoveryResult(): RecoveryResult {
+  return {
+    removedLines: {
+      knowledge: 0,
+      practices: 0,
+      decisions: 0,
+    },
+    totalRemovedLines: 0,
+  };
+}
+
+function combineRecoveryResults(
+  first: RecoveryResult,
+  second: RecoveryResult,
+): RecoveryResult {
+  const removedLines = Object.fromEntries(
+    MEMORY_CATEGORIES.map((category) => [
+      category,
+      first.removedLines[category] + second.removedLines[category],
+    ]),
+  ) as Record<MemoryCategory, number>;
+  return {
+    removedLines,
+    totalRemovedLines: first.totalRemovedLines + second.totalRemovedLines,
+  };
+}
+
 export class NdjsonMemoryStore {
   private memoryDirName: string;
+  private categoryLocks = new Map<MemoryCategory, Promise<void>>();
   readonly memoryDir: string;
 
   constructor(cwd: string, memoryDirName: string) {
@@ -282,45 +322,51 @@ export class NdjsonMemoryStore {
     category: MemoryCategory,
     content: string,
   ): Promise<{ memory: StoredMemoryLine; created: boolean }> {
-    const normalized = normalizeText(content);
-    const existing = (await this.readCategory(category)).find(
-      (memory) => normalizeText(memory.content) === normalized,
-    );
-    if (existing) {
-      return { memory: existing, created: false };
-    }
+    return this.withCategoryLock(category, async () => {
+      const normalized = normalizeText(content);
+      const existing = (await this.readCategory(category)).find(
+        (memory) => normalizeText(memory.content) === normalized,
+      );
+      if (existing) {
+        return { memory: existing, created: false };
+      }
 
-    const memory: StoredMemoryLine = {
-      category,
-      id: uuidv7(),
-      content: normalized,
-      created: new Date().toISOString(),
-    };
+      const memory: StoredMemoryLine = {
+        category,
+        id: uuidv7(),
+        content: normalized,
+        created: new Date().toISOString(),
+      };
 
-    await this.append(category, serializeMemoryLine(memory));
-    return { memory, created: true };
+      await this.append(category, serializeMemoryLine(memory));
+      return { memory, created: true };
+    });
   }
 
   async update(
     id: string,
     content: string,
   ): Promise<StoredMemoryLine | null> {
-    const normalized = normalizeText(content);
     for (const category of MEMORY_CATEGORIES) {
-      const memories = await this.readCategory(category);
-      const index = memories.findIndex((memory) => memory.id === id);
-      if (index === -1) {
-        continue;
-      }
+      const updated = await this.withCategoryLock(category, async () => {
+        const memories = await this.readCategory(category);
+        const index = memories.findIndex((memory) => memory.id === id);
+        if (index === -1) {
+          return null;
+        }
 
-      const updated: StoredMemoryLine = {
-        ...memories[index],
-        content: normalized,
-        updated: new Date().toISOString(),
-      };
-      memories[index] = updated;
-      await this.writeCategory(category, memories);
-      return updated;
+        const updated: StoredMemoryLine = {
+          ...memories[index],
+          content: normalizeText(content),
+          updated: new Date().toISOString(),
+        };
+        memories[index] = updated;
+        await this.writeCategory(category, memories);
+        return updated;
+      });
+      if (updated) {
+        return updated;
+      }
     }
 
     return null;
@@ -328,18 +374,64 @@ export class NdjsonMemoryStore {
 
   async forget(id: string): Promise<StoredMemoryLine | null> {
     for (const category of MEMORY_CATEGORIES) {
-      const memories = await this.readCategory(category);
-      const index = memories.findIndex((memory) => memory.id === id);
-      if (index === -1) {
-        continue;
-      }
+      const removed = await this.withCategoryLock(category, async () => {
+        const memories = await this.readCategory(category);
+        const index = memories.findIndex((memory) => memory.id === id);
+        if (index === -1) {
+          return null;
+        }
 
-      const [removed] = memories.splice(index, 1);
-      await this.writeCategory(category, memories);
-      return removed;
+        const [removed] = memories.splice(index, 1);
+        await this.writeCategory(category, memories);
+        return removed;
+      });
+      if (removed) {
+        return removed;
+      }
     }
 
     return null;
+  }
+
+  async repair(): Promise<RecoveryResult> {
+    await this.ensureReady();
+    const entries = await Promise.all(
+      MEMORY_CATEGORIES.map(async (category) => [
+        category,
+        await this.withCategoryLock(category, async () => {
+          const filePath = join(this.memoryDir, categoryFileName(category));
+          const contents = await readFile(filePath, "utf8");
+          const memories: StoredMemoryLine[] = [];
+          let removedLines = 0;
+
+          for (const line of contents.split(/\r?\n/)) {
+            const memory = parseMemoryLine(line, category);
+            if (memory) {
+              memories.push(memory);
+            } else if (line.trim()) {
+              removedLines++;
+            }
+          }
+
+          if (removedLines > 0) {
+            await this.writeCategory(category, memories);
+          }
+          return removedLines;
+        }),
+      ]),
+    );
+    const removedLines = Object.fromEntries(entries) as Record<
+      MemoryCategory,
+      number
+    >;
+
+    return {
+      removedLines,
+      totalRemovedLines: Object.values(removedLines).reduce(
+        (total, count) => total + count,
+        0,
+      ),
+    };
   }
 
   async categoryCounts(): Promise<Record<MemoryCategory, number>> {
@@ -404,7 +496,7 @@ export class NdjsonMemoryStore {
     const filePath = join(this.memoryDir, categoryFileName(category));
     const contents = await readFile(filePath, "utf8");
     const prefix = contents.length > 0 && !contents.endsWith("\n") ? "\n" : "";
-    await writeFile(filePath, `${contents}${prefix}${line}\n`, "utf8");
+    await appendFile(filePath, `${prefix}${line}\n`, "utf8");
   }
 
   private async writeCategory(
@@ -413,7 +505,41 @@ export class NdjsonMemoryStore {
   ): Promise<void> {
     const filePath = join(this.memoryDir, categoryFileName(category));
     const body = memories.map(serializeMemoryLine).join("\n");
-    await writeFile(filePath, body.length > 0 ? `${body}\n` : "", "utf8");
+    const temporaryPath = `${filePath}.${uuidv7()}.tmp`;
+    try {
+      await writeFile(
+        temporaryPath,
+        body.length > 0 ? `${body}\n` : "",
+        "utf8",
+      );
+      await rename(temporaryPath, filePath);
+    } catch (error) {
+      await unlink(temporaryPath).catch(() => {});
+      throw error;
+    }
+  }
+
+  private async withCategoryLock<T>(
+    category: MemoryCategory,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.categoryLocks.get(category) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(() => current);
+    this.categoryLocks.set(category, tail);
+
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.categoryLocks.get(category) === tail) {
+        this.categoryLocks.delete(category);
+      }
+    }
   }
 }
 
@@ -876,6 +1002,8 @@ export class MemoryManager {
   private store: NdjsonMemoryStore;
   private index: PiMemoryIndex;
   private initialized = false;
+  private initializing: Promise<void> | null = null;
+  private lastRecovery = emptyRecoveryResult();
   private options: Required<MemoryManagerOptions>;
 
   constructor(cwd: string, options: MemoryManagerOptions = {}) {
@@ -893,11 +1021,26 @@ export class MemoryManager {
     if (this.initialized) {
       return;
     }
+    if (this.initializing) {
+      return this.initializing;
+    }
 
-    await this.store.ensureReady();
-    await this.index.initialize();
-    await this.index.syncMemories(await this.store.list());
-    this.initialized = true;
+    const initializing = (async () => {
+      await this.store.ensureReady();
+      this.lastRecovery = await this.store.repair();
+      await this.index.initialize();
+      await this.index.syncMemories(await this.store.list());
+      this.initialized = true;
+    })();
+    this.initializing = initializing;
+
+    try {
+      await initializing;
+    } finally {
+      if (this.initializing === initializing) {
+        this.initializing = null;
+      }
+    }
   }
 
   async close(): Promise<void> {
@@ -956,6 +1099,23 @@ export class MemoryManager {
     return { memories, counts };
   }
 
+  async repair(): Promise<RecoveryResult> {
+    const wasInitialized = this.initialized;
+    await this.initialize();
+    const initializationRecovery = wasInitialized
+      ? emptyRecoveryResult()
+      : this.lastRecovery;
+    const recovery = combineRecoveryResults(
+      initializationRecovery,
+      await this.store.repair(),
+    );
+    if (recovery.totalRemovedLines > 0) {
+      await this.index.syncMemories(await this.store.list());
+    }
+    this.lastRecovery = recovery;
+    return recovery;
+  }
+
   async init(force = false, seed = false): Promise<InitResult> {
     if (force) {
       await this.index.close();
@@ -965,9 +1125,10 @@ export class MemoryManager {
       } catch {}
       this.index = new PiMemoryIndex(this.store.memoryDir, this.options);
       this.initialized = false;
+      this.lastRecovery = emptyRecoveryResult();
     }
 
-    await this.initialize();
+    const recovery = await this.repair();
 
     let createdMemories = 0;
     let skippedMemories = 0;
@@ -987,6 +1148,7 @@ export class MemoryManager {
     return {
       createdMemories,
       skippedMemories,
+      recoveredLines: recovery.totalRemovedLines,
       semanticEnabled: this.index.isSemanticAvailable(),
     };
   }
