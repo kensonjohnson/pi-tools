@@ -1,4 +1,7 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
   MEMORY_CATEGORIES,
@@ -9,7 +12,9 @@ import {
 const managers = new Map<string, Promise<MemoryManager>>();
 
 function isMemoryCategory(value: string | undefined): value is MemoryCategory {
-  return value !== undefined && MEMORY_CATEGORIES.includes(value as MemoryCategory);
+  return (
+    value !== undefined && MEMORY_CATEGORIES.includes(value as MemoryCategory)
+  );
 }
 
 async function getManager(cwd: string): Promise<MemoryManager> {
@@ -26,7 +31,9 @@ async function getManager(cwd: string): Promise<MemoryManager> {
 const NOT_ENABLED_MESSAGE =
   "Memory tracking is not enabled for this project. Run `memory_init` to create the memory store and enable it.";
 
-function formatRecall(result: Awaited<ReturnType<MemoryManager["recall"]>>): string {
+function formatRecall(
+  result: Awaited<ReturnType<MemoryManager["recall"]>>,
+): string {
   if (result.memories.length === 0) {
     return `No memory matches found.`;
   }
@@ -105,7 +112,8 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "memory_remember",
     label: "Memory Remember",
-    description: "Store a new project memory in NDJSON and sync the local index.",
+    description:
+      "Store a new project memory in NDJSON and sync the local index.",
     promptSnippet: "Store durable project knowledge, practices, or decisions",
     promptGuidelines: [
       "Use memory_remember proactively, without waiting for the user to ask, whenever the conversation establishes a reusable project fact.",
@@ -249,11 +257,12 @@ export default function (pi: ExtensionAPI) {
     name: "memory_init",
     label: "Memory Init",
     description:
-      "Bootstrap .pi/memory NDJSON files and build the local search index. Optionally seed initial knowledge/practices, or force-rebuild the index from the NDJSON source of truth.",
+      "Bootstrap .pi/memory NDJSON files, then build the local search index. Optionally seed initial knowledge/practices, or force-rebuild the index from the NDJSON source of truth.",
     parameters: Type.Object({
       seed: Type.Optional(
         Type.Boolean({
-          description: "Scan the project and auto-seed initial knowledge and practices",
+          description:
+            "Scan the project and auto-seed initial knowledge and practices",
         }),
       ),
       force: Type.Optional(
@@ -264,13 +273,45 @@ export default function (pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getManager(ctx.cwd);
-      const result = await manager.init(Boolean(params.force), Boolean(params.seed));
+      const result = await manager.init(
+        Boolean(params.force),
+        Boolean(params.seed),
+      );
       const seedText = params.seed
         ? ` created ${result.createdMemories}, skipped ${result.skippedMemories},`
         : "";
       const forceText = params.force ? " (rebuilt index)" : "";
+      const recoveryText =
+        result.recoveredLines > 0
+          ? ` Removed ${result.recoveredLines} malformed NDJSON line${result.recoveredLines === 1 ? "" : "s"}.`
+          : "";
       return textResult(
-        `Initialized memory${forceText}.${seedText} semantic ${result.semanticEnabled ? "enabled" : "fallback-only"}.`,
+        `Initialized memory${forceText}.${seedText}${recoveryText} Semantic ${result.semanticEnabled ? "enabled" : "fallback-only"}.`,
+        result,
+      );
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_repair",
+    label: "Memory Repair",
+    description:
+      "Remove malformed NDJSON lines while retaining valid memories, then resync the local index.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const manager = await getManager(ctx.cwd);
+      if (!(await manager.isReady())) {
+        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
+      }
+
+      const result = await manager.repair();
+      const detail = MEMORY_CATEGORIES.map(
+        (category) => `${category}=${result.removedLines[category]}`,
+      ).join(", ");
+      return textResult(
+        result.totalRemovedLines > 0
+          ? `Removed ${result.totalRemovedLines} malformed NDJSON line${result.totalRemovedLines === 1 ? "" : "s"} (${detail}) and resynced the index.`
+          : "No malformed NDJSON lines found.",
         result,
       );
     },
@@ -299,7 +340,10 @@ export default function (pi: ExtensionAPI) {
         snippets.length > 0
           ? `Recent conversations from ${snippets.filter((s) => s.startsWith("--- Session")).length} sessions:\n\n${snippets.join("\n")}`
           : "No recent sessions found. Use `memory_remember` to add memories manually.",
-        { sessionCount: snippets.filter((s) => s.startsWith("--- Session")).length },
+        {
+          sessionCount: snippets.filter((s) => s.startsWith("--- Session"))
+            .length,
+        },
       );
     },
   });
@@ -312,7 +356,8 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       since: Type.Optional(
         Type.String({
-          description: "Only review memories created or updated after this ISO timestamp",
+          description:
+            "Only review memories created or updated after this ISO timestamp",
         }),
       ),
     }),

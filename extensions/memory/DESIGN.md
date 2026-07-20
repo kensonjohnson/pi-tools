@@ -80,7 +80,8 @@ function serializeMemory(obj: MemoryLine): string {
 
 - **Source of truth stays NDJSON** in `.pi/memory/*.ndjson`.
 - **`.pi/memory/vector.db` is a derived local index**, not the canonical memory store.
-- Update and delete use **whole-file rewrite** for the affected category file.
+- New memories use atomic append writes; update and delete use **atomic whole-file replacement** for the affected category file.
+- Initialization safely discards malformed non-empty NDJSON lines while preserving valid memory lines, and `memory_repair` can run that recovery on demand.
 - When no category filter is provided, `memory_recall` may return **both stored memories and indexed repo file hits**.
 - `memory_list` is implemented as a small helper tool even though it is not part of the minimum design surface.
 
@@ -110,7 +111,8 @@ Pi starts a fresh session with **<1K tokens**.
 | `memory_update` | Replace the content of an existing memory by ID. |
 | `memory_learn` | Review recent activity and suggest NEW memories. Returns preview only. |
 | `memory_consolidate` | Review stored memories and suggest cleanup. User-triggered, interactive. |
-| `memory_init` | Scan codebase to seed `knowledge.ndjson` and `practices.ndjson`. User-triggered, idempotent. |
+| `memory_init` | Bootstrap/repair the memory files and build the local index; optionally seed `knowledge.ndjson` and `practices.ndjson`. |
+| `memory_repair` | Remove malformed non-empty NDJSON lines, retain valid memories, and resync the local index. |
 
 ### Parameters
 
@@ -122,7 +124,8 @@ Pi starts a fresh session with **<1K tokens**.
 | `memory_update` | `id`, `content` | Confirmation |
 | `memory_learn` | `since?` | Preview |
 | `memory_consolidate` | `since?` | Interactive report |
-| `memory_init` | `force?` | Summary |
+| `memory_init` | `force?`, `seed?` | Summary, including recovered-line count |
+| `memory_repair` | — | Removed-line counts by category |
 
 ### `memory_recall` Behavior
 

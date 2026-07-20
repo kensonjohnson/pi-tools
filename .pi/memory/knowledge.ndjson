@@ -1,1 +1,2 @@
 {"content":"The custom Codex quota footer is implemented in extensions/custom-stats-footer.ts and its user opt-in setting is ~/.pi/agent/codex-quota-footer.json.","id":"019f6caa-49ca-70e9-a7f3-4c2104d26b8d","created":"2026-07-16T20:42:07.179Z"}
+{"content":"The memory extension stores NDJSON with atomic appends, repairs malformed non-empty lines during initialization, and exposes memory_repair for on-demand recovery.","id":"019f7ba0-35e2-7789-aa46-f079b03f6232","created":"2026-07-19T18:25:24.962Z"}
