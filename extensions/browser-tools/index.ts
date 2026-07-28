@@ -1,10 +1,18 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import {
+	CONFIG_DIR_NAME,
+	type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import puppeteer from "puppeteer-core";
 import { spawn, execSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Text } from "@mariozechner/pi-tui";
+import { Text } from "@earendil-works/pi-tui";
+import { publishExtensionSettings } from "../../lib/pi-tools-config.ts";
+import {
+	isExtensionEnabled,
+	removeDisabledTools,
+} from "../../lib/pi-tools-runtime-settings.ts";
 
 // ------------------------------------------------------------------------------
 // Shared State
@@ -13,6 +21,18 @@ import { Text } from "@mariozechner/pi-tui";
 const BRAVE_PATH = "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser";
 const CDP_URL = "http://localhost:9222";
 const SCRAPING_DIR = `${process.env.HOME}/.cache/browser-tools`;
+const BROWSER_TOOLS_EXTENSION_ID = "browser-tools";
+const BROWSER_TOOL_NAMES = [
+	"browser_start",
+	"browser_stop",
+	"browser_navigate",
+	"browser_eval",
+	"browser_screenshot",
+	"browser_content",
+	"browser_cookies",
+	"browser_pick",
+	"browser_logs",
+] as const;
 
 let braveProcess: ReturnType<typeof spawn> | null = null;
 
@@ -155,6 +175,28 @@ async function installConsoleInterceptor(page: Awaited<ReturnType<typeof getActi
 // ------------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	publishExtensionSettings(pi.events, {
+		id: BROWSER_TOOLS_EXTENSION_ID,
+		label: "Browser Tools",
+		description: "Enables local Brave Browser automation tools.",
+		fields: {
+			enabled: {
+				type: "boolean",
+				default: true,
+				label: "Enabled",
+			},
+		},
+		toolNames: BROWSER_TOOL_NAMES,
+	});
+
+	pi.on("session_start", async (_event, ctx) => {
+		removeDisabledTools(
+			pi,
+			BROWSER_TOOL_NAMES,
+			await isExtensionEnabled(ctx, CONFIG_DIR_NAME, BROWSER_TOOLS_EXTENSION_ID),
+		);
+	});
+
 	// No persistent connection to clean up — each tool connects/disconnects.
 	// Brave process is left running on session_shutdown (user might want it).
 

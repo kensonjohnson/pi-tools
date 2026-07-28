@@ -5,12 +5,23 @@
  * Get an API key at https://brave.com/search/api/ (free tier: 2000 queries/month)
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import {
+  CONFIG_DIR_NAME,
+  type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Readability } from "@mozilla/readability";
 import { JSDOM, VirtualConsole } from "jsdom";
 import TurndownService from "turndown";
 import * as turndownPluginGfm from "turndown-plugin-gfm";
+import { publishExtensionSettings } from "../../lib/pi-tools-config.ts";
+import {
+  isExtensionEnabled,
+  removeDisabledTools,
+} from "../../lib/pi-tools-runtime-settings.ts";
+
+const BRAVE_SEARCH_EXTENSION_ID = "brave-search";
+const BRAVE_SEARCH_TOOL_NAMES = ["brave_search", "web_content"] as const;
 
 // Suppress CSS parsing errors - jsdom's CSSOM parser doesn't support
 // all modern CSS features (nested selectors, layer statements, etc.)
@@ -182,6 +193,28 @@ async function fetchWebContent(url: string): Promise<{
 }
 
 export default function (pi: ExtensionAPI) {
+  publishExtensionSettings(pi.events, {
+    id: BRAVE_SEARCH_EXTENSION_ID,
+    label: "Brave Search",
+    description: "Enables Brave web search and readable web-content extraction.",
+    fields: {
+      enabled: {
+        type: "boolean",
+        default: true,
+        label: "Enabled",
+      },
+    },
+    toolNames: BRAVE_SEARCH_TOOL_NAMES,
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    removeDisabledTools(
+      pi,
+      BRAVE_SEARCH_TOOL_NAMES,
+      await isExtensionEnabled(ctx, CONFIG_DIR_NAME, BRAVE_SEARCH_EXTENSION_ID),
+    );
+  });
+
   pi.registerTool({
     name: "brave_search",
     label: "Brave Search",
