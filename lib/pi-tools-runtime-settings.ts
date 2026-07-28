@@ -41,5 +41,7 @@ export function removeDisabledTools(
 ): void {
   if (enabled) return;
   const disabled = new Set(toolNames);
-  pi.setActiveTools(pi.getActiveTools().filter((toolName) => !disabled.has(toolName)));
+  pi.setActiveTools(
+    pi.getActiveTools().filter((toolName) => !disabled.has(toolName)),
+  );
 }

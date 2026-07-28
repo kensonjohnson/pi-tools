@@ -113,7 +113,8 @@ export default function (pi: ExtensionAPI) {
   publishExtensionSettings(pi.events, {
     id: MEMORY_EXTENSION_ID,
     label: "Project Memory",
-    description: "Enables project memory tools and automatic memory-context injection.",
+    description:
+      "Enables project memory tools and automatic memory-context injection.",
     fields: {
       enabled: {
         type: "boolean",
@@ -314,7 +315,9 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (!(await isExtensionEnabled(ctx, CONFIG_DIR_NAME, MEMORY_EXTENSION_ID))) {
+      if (
+        !(await isExtensionEnabled(ctx, CONFIG_DIR_NAME, MEMORY_EXTENSION_ID))
+      ) {
         return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
       }
       const manager = await getManager(ctx.cwd);

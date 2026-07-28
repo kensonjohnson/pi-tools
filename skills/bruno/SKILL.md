@@ -13,6 +13,7 @@ description: |
 Bruno stores API collections as plain text YAML files in your filesystem—version controlled, reviewable, and collaborative via Git. No cloud sync, no proprietary formats.
 
 **Core Philosophy:**
+
 - **Git-First**: Collections live alongside code, reviewed in PRs
 - **Offline-Only**: No cloud dependency, everything local
 - **YAML Format**: Human-readable OpenCollection specification
@@ -42,6 +43,7 @@ My Collection/
 ```
 
 **Critical Rules:**
+
 - Every collection MUST have `opencollection.yml` with `opencollection: 1.0.0` header
 - Request files use `.yml` extension (NOT `.yaml`)
 - Environments go in `environments/` directory
@@ -141,7 +143,7 @@ variables:
     value: v1
   - name: apiKey
     value: ""
-    secret: true  # Never committed to Git
+    secret: true # Never committed to Git
   - name: authToken
     value: ""
     secret: true
@@ -178,24 +180,24 @@ Available in `before-request` scripts:
 
 ```javascript
 // URL and method
-req.getUrl()                          // Get current URL
-req.setUrl(url)                       // Set URL
-req.getMethod()                       // Get HTTP method
-req.setMethod('POST')                 // Set method (GET, POST, PUT, DELETE, PATCH)
+req.getUrl(); // Get current URL
+req.setUrl(url); // Set URL
+req.getMethod(); // Get HTTP method
+req.setMethod("POST"); // Set method (GET, POST, PUT, DELETE, PATCH)
 
 // Headers
-req.getHeader('content-type')         // Get specific header
-req.getHeaders()                      // Get all headers as object
-req.setHeader('x-api-key', 'value')   // Set single header
-req.setHeaders({ key: 'value' })      // Set multiple headers
+req.getHeader("content-type"); // Get specific header
+req.getHeaders(); // Get all headers as object
+req.setHeader("x-api-key", "value"); // Set single header
+req.setHeaders({ key: "value" }); // Set multiple headers
 
 // Body
-req.getBody()                         // Get request body
-req.setBody(JSON.stringify(data))      // Set request body
+req.getBody(); // Get request body
+req.setBody(JSON.stringify(data)); // Set request body
 
 // Configuration
-req.setTimeout(5000)                  // Timeout in milliseconds
-req.setMaxRedirects(5)                // Max redirect follows
+req.setTimeout(5000); // Timeout in milliseconds
+req.setMaxRedirects(5); // Max redirect follows
 ```
 
 ### Response Object (res)
@@ -204,17 +206,17 @@ Available in `after-response` and `tests` scripts:
 
 ```javascript
 // Properties
-res.status                            // HTTP status code (200, 404, etc.)
-res.statusText                        // Status text ("OK", "Not Found")
-res.headers                           // Response headers object
-res.body                              // Parsed response body (JSON auto-parsed)
-res.responseTime                      // Response time in milliseconds
+res.status; // HTTP status code (200, 404, etc.)
+res.statusText; // Status text ("OK", "Not Found")
+res.headers; // Response headers object
+res.body; // Parsed response body (JSON auto-parsed)
+res.responseTime; // Response time in milliseconds
 
 // Methods
-res.getStatus()                       // Get status code
-res.getHeader('content-type')         // Get specific header
-res.getHeaders()                      // Get all headers
-res.getBody()                         // Get raw response body
+res.getStatus(); // Get status code
+res.getHeader("content-type"); // Get specific header
+res.getHeaders(); // Get all headers
+res.getBody(); // Get raw response body
 ```
 
 ### Bruno Runtime (bru)
@@ -223,32 +225,32 @@ Available in all scripts:
 
 ```javascript
 // Runtime variables (request-scoped, persists across requests in runner)
-bru.setVar('key', 'value')
-bru.getVar('key')
+bru.setVar("key", "value");
+bru.getVar("key");
 
 // Environment variables (stored in active environment file)
-bru.setEnvVar('key', 'value')
-bru.getEnvVar('key')
-bru.setEnvVar('key', null)            // Delete environment variable
+bru.setEnvVar("key", "value");
+bru.getEnvVar("key");
+bru.setEnvVar("key", null); // Delete environment variable
 
 // Global environment variables (shared across all environments)
-bru.setGlobalEnvVar('key', 'value')
-bru.getGlobalEnvVar('key')
+bru.setGlobalEnvVar("key", "value");
+bru.getGlobalEnvVar("key");
 
 // Process environment (CI/CD, system env vars)
-bru.getProcessEnv('API_KEY')
+bru.getProcessEnv("API_KEY");
 
 // Request chaining
-bru.setNextRequest('Request Name')    // Chain to specific request
-bru.setNextRequest(null)              // Stop chain
+bru.setNextRequest("Request Name"); // Chain to specific request
+bru.setNextRequest(null); // Stop chain
 
 // Utilities
-bru.sleep(1000)                       // Pause execution (ms)
-bru.cwd()                             // Get current working directory
-bru.interpolate('{{variableName}}')   // Interpolate variables
+bru.sleep(1000); // Pause execution (ms)
+bru.cwd(); // Get current working directory
+bru.interpolate("{{variableName}}"); // Interpolate variables
 
 // Runner control
-bru.runner.skipRequest()              // Skip current request
+bru.runner.skipRequest(); // Skip current request
 ```
 
 ### Cookie Management
@@ -257,27 +259,27 @@ bru.runner.skipRequest()              // Skip current request
 const jar = bru.cookies.jar();
 
 // Set cookie
-jar.setCookie('https://api.example.com', 'sessionId', 'abc123');
+jar.setCookie("https://api.example.com", "sessionId", "abc123");
 
 // Set cookie with options
-jar.setCookie('https://api.example.com', {
-  key: 'authToken',
-  value: 'xyz789',
-  domain: 'example.com',
-  path: '/api',
+jar.setCookie("https://api.example.com", {
+  key: "authToken",
+  value: "xyz789",
+  domain: "example.com",
+  path: "/api",
   secure: true,
   httpOnly: true,
-  maxAge: 3600
+  maxAge: 3600,
 });
 
 // Get cookies
-const cookie = await jar.getCookie('https://api.example.com', 'sessionId');
-const allCookies = await jar.getCookies('https://api.example.com');
+const cookie = await jar.getCookie("https://api.example.com", "sessionId");
+const allCookies = await jar.getCookies("https://api.example.com");
 
 // Delete cookies
-jar.deleteCookie('https://api.example.com', 'sessionId');
-jar.deleteCookies('https://api.example.com');
-jar.clear();                          // Clear all cookies
+jar.deleteCookie("https://api.example.com", "sessionId");
+jar.deleteCookies("https://api.example.com");
+jar.clear(); // Clear all cookies
 ```
 
 ### Dynamic Variables
@@ -309,9 +311,10 @@ Use in URLs, headers, body:
 ```
 
 Usage in scripts:
+
 ```javascript
-const email = bru.interpolate('{{$randomEmail}}');
-bru.setVar('userEmail', email);
+const email = bru.interpolate("{{$randomEmail}}");
+bru.setVar("userEmail", email);
 ```
 
 ---
@@ -345,7 +348,7 @@ http:
     type: apikey
     key: x-api-key
     value: "{{apiKey}}"
-    placement: header  # or "query"
+    placement: header # or "query"
 ```
 
 ### OAuth2
@@ -366,6 +369,7 @@ http:
 ### Auth Flow Example (Login → Use Token)
 
 **auth/Login.yml:**
+
 ```yaml
 info:
   name: Login
@@ -402,6 +406,7 @@ runtime:
 ```
 
 **auth/Get User Profile.yml:**
+
 ```yaml
 info:
   name: Get User Profile
@@ -512,6 +517,7 @@ runtime:
 ```
 
 **Chai.js Methods:**
+
 - `expect(value).to.equal(expected)` - Strict equality
 - `expect(value).to.deep.equal(expected)` - Deep equality
 - `expect(value).to.be.a("type")` - Type check (string, number, object, array)
@@ -598,6 +604,7 @@ bru run --collection ./path/to/collection --env Production
 ### CRUD Operations
 
 **users/Get Users.yml:**
+
 ```yaml
 info:
   name: Get Users
@@ -628,6 +635,7 @@ runtime:
 ```
 
 **users/Create User.yml:**
+
 ```yaml
 info:
   name: Create User
@@ -673,6 +681,7 @@ runtime:
 ```
 
 **users/Update User.yml:**
+
 ```yaml
 info:
   name: Update User
@@ -707,6 +716,7 @@ runtime:
 ```
 
 **users/Delete User.yml:**
+
 ```yaml
 info:
   name: Delete User
@@ -732,6 +742,7 @@ runtime:
 ### Request Chaining Example
 
 **e2e/Create Order Flow.yml:**
+
 ```yaml
 info:
   name: Create Order Flow
@@ -765,6 +776,7 @@ runtime:
 ```
 
 **e2e/Process Payment.yml:**
+
 ```yaml
 info:
   name: Process Payment
@@ -797,6 +809,7 @@ runtime:
 ```
 
 **e2e/Send Confirmation Email.yml:**
+
 ```yaml
 info:
   name: Send Confirmation Email
@@ -937,30 +950,35 @@ ws:
 ## Best Practices
 
 ### File Organization
+
 1. Use descriptive names: `Get User by ID.yml`, not `request1.yml`
 2. Organize by feature/resource: `auth/`, `users/`, `orders/`
 3. Use `folder.yml` for shared folder-level settings
 4. Keep environments consistent across team
 
 ### Variable Management
+
 1. **Environment variables** for per-env values (URLs, API keys)
 2. **Runtime variables** for temporary data during execution
 3. **Secrets** use `secret: true` in environment files (never commit)
 4. Use `{{$randomEmail}}` etc. for test data generation
 
 ### Testing Strategy
+
 1. Use `assertions` for simple checks, `tests` for complex logic
 2. Test at collection, folder, and request levels
 3. Validate status codes, headers, response structure, data
 4. Extract and reuse response data for chaining
 
 ### Security
+
 1. Never hardcode secrets in `.yml` files
 2. Use `secret: true` for sensitive environment variables
 3. Reference CI/CD secrets via `bru.getProcessEnv()`
 4. Add `.gitignore` to exclude sensitive files
 
 ### Git Workflow
+
 1. Commit collection changes alongside code changes
 2. Review API changes in pull requests
 3. Use branches for experimental API modifications

@@ -213,8 +213,7 @@ function parseMemoryLine(
       id: parsed.id,
       content: parsed.content,
       created: parsed.created,
-      updated:
-        typeof parsed.updated === "string" ? parsed.updated : undefined,
+      updated: typeof parsed.updated === "string" ? parsed.updated : undefined,
     };
   } catch {
     return null;
@@ -292,7 +291,11 @@ export class NdjsonMemoryStore {
       }
     }
     if (changed) {
-      await writeFile(gitignorePath, `${Array.from(lines).join("\n")}\n`, "utf8");
+      await writeFile(
+        gitignorePath,
+        `${Array.from(lines).join("\n")}\n`,
+        "utf8",
+      );
     }
 
     for (const category of MEMORY_CATEGORIES) {
@@ -343,10 +346,7 @@ export class NdjsonMemoryStore {
     });
   }
 
-  async update(
-    id: string,
-    content: string,
-  ): Promise<StoredMemoryLine | null> {
+  async update(id: string, content: string): Promise<StoredMemoryLine | null> {
     for (const category of MEMORY_CATEGORIES) {
       const updated = await this.withCategoryLock(category, async () => {
         const memories = await this.readCategory(category);
@@ -483,7 +483,9 @@ export class NdjsonMemoryStore {
     return sections.join("\n\n");
   }
 
-  private async readCategory(category: MemoryCategory): Promise<StoredMemoryLine[]> {
+  private async readCategory(
+    category: MemoryCategory,
+  ): Promise<StoredMemoryLine[]> {
     const filePath = join(this.memoryDir, categoryFileName(category));
     const contents = await readFile(filePath, "utf8");
     return contents
@@ -553,10 +555,7 @@ class PiMemoryIndex {
   private readonly embeddingModel: string;
   private readonly embeddingDimensions: number;
 
-  constructor(
-    memoryDir: string,
-    options: Required<MemoryManagerOptions>,
-  ) {
+  constructor(memoryDir: string, options: Required<MemoryManagerOptions>) {
     this.memoryDir = memoryDir;
     this.options = options;
     this.embeddingModel = options.embeddingModel;
@@ -658,7 +657,8 @@ class PiMemoryIndex {
 
     const now = new Date().toISOString();
     this.dbReady
-      .prepare(`
+      .prepare(
+        `
         INSERT INTO indexed_memories (id, category, content, created_at, updated_at, indexed_at)
         VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
@@ -667,7 +667,8 @@ class PiMemoryIndex {
           created_at = excluded.created_at,
           updated_at = excluded.updated_at,
           indexed_at = excluded.indexed_at
-      `)
+      `,
+      )
       .run(
         memory.id,
         memory.category,
@@ -791,14 +792,16 @@ class PiMemoryIndex {
 
   private searchVectors(query: number[], limit: number): SearchRow[] {
     const rows = this.dbReady
-      .prepare(`
+      .prepare(
+        `
         SELECT m.item_id as item_id, v.distance as distance
         FROM vector_index v
         JOIN vector_item_map m ON m.vector_rowid = v.rowid
         WHERE v.embedding MATCH ?
           AND v.k = ?
         ORDER BY v.distance
-      `)
+      `,
+      )
       .all(new Float32Array(query), limit) as Array<{
       item_id: string;
       distance: number;
@@ -822,23 +825,27 @@ class PiMemoryIndex {
     try {
       const memoryRows = category
         ? (this.dbReady
-            .prepare(`
+            .prepare(
+              `
               SELECT id, bm25(memory_fts) as rank
               FROM memory_fts
               WHERE memory_fts MATCH ?
                 AND category = ?
               ORDER BY rank
               LIMIT ?
-            `)
+            `,
+            )
             .all(q, category, limit) as Array<{ id: string; rank: number }>)
         : (this.dbReady
-            .prepare(`
+            .prepare(
+              `
               SELECT id, bm25(memory_fts) as rank
               FROM memory_fts
               WHERE memory_fts MATCH ?
               ORDER BY rank
               LIMIT ?
-            `)
+            `,
+            )
             .all(q, limit) as Array<{ id: string; rank: number }>);
 
       for (const row of memoryRows) {
@@ -974,7 +981,9 @@ class PiMemoryIndex {
     this.dbReady
       .prepare(`DELETE FROM vector_index WHERE rowid = ?`)
       .run(this.toSqliteInteger(existing.vector_rowid));
-    this.dbReady.prepare(`DELETE FROM vector_item_map WHERE item_id = ?`).run(itemId);
+    this.dbReady
+      .prepare(`DELETE FROM vector_item_map WHERE item_id = ?`)
+      .run(itemId);
   }
 
   private getOrCreateRowId(itemId: string): bigint {
@@ -1191,7 +1200,13 @@ export class MemoryManager {
   ): Promise<Array<{ file: string; entries: unknown[] }>> {
     const home = homedir();
     const resolvedCwd = this.cwd.replace(/^\/+/, "").replace(/[/\\:]/g, "-");
-    const sessionDir = join(home, ".pi", "agent", "sessions", `--${resolvedCwd}--`);
+    const sessionDir = join(
+      home,
+      ".pi",
+      "agent",
+      "sessions",
+      `--${resolvedCwd}--`,
+    );
 
     try {
       const files = await readdir(sessionDir);
@@ -1309,7 +1324,10 @@ export class MemoryManager {
         });
       }
 
-      if (pkg.dependencies && "@mariozechner/pi-coding-agent" in pkg.dependencies) {
+      if (
+        pkg.dependencies &&
+        "@mariozechner/pi-coding-agent" in pkg.dependencies
+      ) {
         seeds.push({
           category: "knowledge",
           content:
@@ -1321,7 +1339,8 @@ export class MemoryManager {
     if (await exists(join(this.cwd, "extensions"))) {
       seeds.push({
         category: "knowledge",
-        content: "Pi extensions in this repo live under the extensions/ directory.",
+        content:
+          "Pi extensions in this repo live under the extensions/ directory.",
       });
     }
 
@@ -1332,11 +1351,15 @@ export class MemoryManager {
       });
     }
 
-    const extensionFiles = await collectFiles(join(this.cwd, "extensions"), ".ts");
+    const extensionFiles = await collectFiles(
+      join(this.cwd, "extensions"),
+      ".ts",
+    );
     if (extensionFiles.length > 0) {
       seeds.push({
         category: "practices",
-        content: "Pi extensions in this repo are implemented as TypeScript modules.",
+        content:
+          "Pi extensions in this repo are implemented as TypeScript modules.",
       });
     }
 
@@ -1345,7 +1368,8 @@ export class MemoryManager {
       if (contents.includes("pi.registerTool(")) {
         seeds.push({
           category: "practices",
-          content: "Pi extensions register LLM-callable tools via pi.registerTool(...).",
+          content:
+            "Pi extensions register LLM-callable tools via pi.registerTool(...).",
         });
         break;
       }
@@ -1376,7 +1400,10 @@ function dedupeSeeds(
   return output;
 }
 
-async function collectFiles(root: string, extension: string): Promise<string[]> {
+async function collectFiles(
+  root: string,
+  extension: string,
+): Promise<string[]> {
   if (!(await exists(root))) {
     return [];
   }

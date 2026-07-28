@@ -23,8 +23,7 @@ export type PiToolsCommand =
     };
 
 export type ParseCommandResult =
-  | { command: PiToolsCommand }
-  | { error: string };
+  { command: PiToolsCommand } | { error: string };
 
 export function parsePiToolsCommand(args: string): ParseCommandResult {
   const tokenResult = tokenize(args);
@@ -38,10 +37,12 @@ export function parsePiToolsCommand(args: string): ParseCommandResult {
     if (token === "--" && !optionsEnded) {
       optionsEnded = true;
     } else if (token === "--global" && !optionsEnded) {
-      if (scope && scope !== "global") return { error: "Choose either --global or --project." };
+      if (scope && scope !== "global")
+        return { error: "Choose either --global or --project." };
       scope = "global";
     } else if (token === "--project" && !optionsEnded) {
-      if (scope && scope !== "project") return { error: "Choose either --global or --project." };
+      if (scope && scope !== "project")
+        return { error: "Choose either --global or --project." };
       scope = "project";
     } else {
       remaining.push(token);
@@ -61,25 +62,38 @@ export function parsePiToolsCommand(args: string): ParseCommandResult {
         ? { command: { action: "paths" } }
         : { error: "Usage: /pi-tools paths" };
     case "get": {
-      if (values.length !== 1) return { error: "Usage: /pi-tools get <extension.setting>" };
+      if (values.length !== 1)
+        return { error: "Usage: /pi-tools get <extension.setting>" };
       const address = parseSettingAddress(values[0]);
-      return address ? { command: { action: "get", address } } : invalidAddress();
+      return address
+        ? { command: { action: "get", address } }
+        : invalidAddress();
     }
     case "set": {
       if (values.length < 2) {
-        return { error: "Usage: /pi-tools [--global|--project] set <extension.setting> <value>" };
+        return {
+          error:
+            "Usage: /pi-tools [--global|--project] set <extension.setting> <value>",
+        };
       }
       const address = parseSettingAddress(values[0]);
       if (!address) return invalidAddress();
       return {
-        command: { action: "set", scope, address, input: values.slice(1).join(" ") },
+        command: {
+          action: "set",
+          scope,
+          address,
+          input: values.slice(1).join(" "),
+        },
       };
     }
     case "enable":
     case "disable":
       return values.length === 1 && isExtensionId(values[0])
         ? { command: { action, scope, extensionId: values[0] } }
-        : { error: `Usage: /pi-tools [--global|--project] ${action} <extension>` };
+        : {
+            error: `Usage: /pi-tools [--global|--project] ${action} <extension>`,
+          };
     default:
       return { error: `Unknown pi-tools command '${action}'.` };
   }

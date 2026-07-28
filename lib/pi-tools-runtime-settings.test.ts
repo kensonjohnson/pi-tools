@@ -3,10 +3,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
-import {
-  CONFIG_FILE_NAME,
-  settingsRegistry,
-} from "./pi-tools-config.ts";
+import { CONFIG_FILE_NAME, settingsRegistry } from "./pi-tools-config.ts";
 import {
   isExtensionEnabled,
   removeDisabledTools,

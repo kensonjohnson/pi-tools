@@ -115,7 +115,9 @@ export class SettingsRegistry {
     const existing = this.definitions.get(definition.id);
     if (existing) {
       if (JSON.stringify(existing) !== JSON.stringify(frozen)) {
-        throw new Error(`Conflicting settings are registered for extension '${definition.id}'.`);
+        throw new Error(
+          `Conflicting settings are registered for extension '${definition.id}'.`,
+        );
       }
       return;
     }
@@ -204,7 +206,14 @@ export async function getEffectiveSettings(
           value = globalValue;
           source = "global";
         } else {
-          diagnostics.push(invalidValueDiagnostic("global", paths.global, definition.id, field));
+          diagnostics.push(
+            invalidValueDiagnostic(
+              "global",
+              paths.global,
+              definition.id,
+              field,
+            ),
+          );
         }
       }
 
@@ -214,7 +223,14 @@ export async function getEffectiveSettings(
           value = projectValue;
           source = "project";
         } else {
-          diagnostics.push(invalidValueDiagnostic("project", paths.project, definition.id, field));
+          diagnostics.push(
+            invalidValueDiagnostic(
+              "project",
+              paths.project,
+              definition.id,
+              field,
+            ),
+          );
         }
       }
 
@@ -239,7 +255,9 @@ export async function updateSetting(
   options: UpdateSettingOptions,
 ): Promise<void> {
   if (options.scope === "project" && !options.projectTrusted) {
-    throw new Error("Cannot write project pi-tools settings until the project is trusted.");
+    throw new Error(
+      "Cannot write project pi-tools settings until the project is trusted.",
+    );
   }
 
   const registry = options.registry ?? settingsRegistry;
@@ -306,7 +324,9 @@ export function parseSettingInput(
 
 function validateDefinition(definition: ExtensionSettingsDefinition): void {
   if (!isSafePathSegment(definition.id)) {
-    throw new Error("Extension setting ids must be non-empty, dot-free strings.");
+    throw new Error(
+      "Extension setting ids must be non-empty, dot-free strings.",
+    );
   }
   if (!definition.label.trim()) {
     throw new Error(`Extension '${definition.id}' must have a label.`);
@@ -314,7 +334,9 @@ function validateDefinition(definition: ExtensionSettingsDefinition): void {
 
   for (const [field, setting] of Object.entries(definition.fields)) {
     if (!isValidFieldPath(field)) {
-      throw new Error(`Invalid settings field '${field}' for '${definition.id}'.`);
+      throw new Error(
+        `Invalid settings field '${field}' for '${definition.id}'.`,
+      );
     }
     if (setting.label !== undefined && !setting.label.trim()) {
       throw new Error(`Invalid display label for '${definition.id}.${field}'.`);
@@ -334,7 +356,9 @@ function validateDefinition(definition: ExtensionSettingsDefinition): void {
       }
     }
     if (setting.type === "enum" && setting.values.length === 0) {
-      throw new Error(`Enum '${definition.id}.${field}' must declare at least one value.`);
+      throw new Error(
+        `Enum '${definition.id}.${field}' must declare at least one value.`,
+      );
     }
   }
 }
@@ -352,13 +376,20 @@ function freezeDefinition(
         ]),
       ),
     ),
-    toolNames: definition.toolNames ? Object.freeze([...definition.toolNames]) : undefined,
+    toolNames: definition.toolNames
+      ? Object.freeze([...definition.toolNames])
+      : undefined,
   });
 }
 
-function freezeSettingDefinition(setting: SettingDefinition): SettingDefinition {
+function freezeSettingDefinition(
+  setting: SettingDefinition,
+): SettingDefinition {
   if (setting.type === "enum") {
-    return Object.freeze({ ...setting, values: Object.freeze([...setting.values]) });
+    return Object.freeze({
+      ...setting,
+      values: Object.freeze([...setting.values]),
+    });
   }
   return Object.freeze({ ...setting });
 }
@@ -417,7 +448,11 @@ async function readConfigDocument(
 }
 
 function parseConfigDocument(value: unknown): ConfigDocument | undefined {
-  if (!isRecord(value) || value.version !== CONFIG_VERSION || !isRecord(value.extensions)) {
+  if (
+    !isRecord(value) ||
+    value.version !== CONFIG_VERSION ||
+    !isRecord(value.extensions)
+  ) {
     return undefined;
   }
 
@@ -431,7 +466,10 @@ function parseConfigDocument(value: unknown): ConfigDocument | undefined {
   return { version: CONFIG_VERSION, extensions };
 }
 
-async function writeConfigDocument(path: string, document: ConfigDocument): Promise<void> {
+async function writeConfigDocument(
+  path: string,
+  document: ConfigDocument,
+): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporaryPath = `${path}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
   const body = `${JSON.stringify(document, null, 2)}\n`;
@@ -464,13 +502,18 @@ function invalidValueDiagnostic(
 function getPath(value: Record<string, unknown>, path: string): unknown {
   let current: unknown = value;
   for (const segment of path.split(".")) {
-    if (!isRecord(current) || !Object.hasOwn(current, segment)) return undefined;
+    if (!isRecord(current) || !Object.hasOwn(current, segment))
+      return undefined;
     current = current[segment];
   }
   return current;
 }
 
-function setPath(value: Record<string, unknown>, path: string, setting: unknown): void {
+function setPath(
+  value: Record<string, unknown>,
+  path: string,
+  setting: unknown,
+): void {
   const segments = path.split(".");
   const last = segments.pop();
   if (!last) throw new Error(`Invalid empty settings path '${path}'.`);

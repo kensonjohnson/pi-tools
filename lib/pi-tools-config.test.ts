@@ -150,10 +150,7 @@ test("ignores malformed documents and invalid field values", async () => {
 
     assert.equal(getSettingValue(settings, "alpha", "enabled"), true);
     assert.equal(getSettingValue(settings, "alpha", "mode"), "safe");
-    assert.equal(
-      getSettingValue(settings, "alpha", "quota.refreshMinutes"),
-      5,
-    );
+    assert.equal(getSettingValue(settings, "alpha", "quota.refreshMinutes"), 5);
     assert.equal(settings.diagnostics.length, 4);
   });
 });
@@ -223,7 +220,11 @@ test("publishes extension definitions over Pi's shared event bus", () => {
       const listeners = handlers.get(channel) ?? [];
       listeners.push(handler);
       handlers.set(channel, listeners);
-      return () => handlers.set(channel, listeners.filter((entry) => entry !== handler));
+      return () =>
+        handlers.set(
+          channel,
+          listeners.filter((entry) => entry !== handler),
+        );
     },
   };
   const definition = {
@@ -274,7 +275,10 @@ test("parses scalar input according to registered field definitions", () => {
   assert.equal(parseSettingInput(fields.enabled, "off"), false);
   assert.equal(parseSettingInput(fields.enabled, "maybe"), undefined);
   assert.equal(parseSettingInput(fields["quota.refreshMinutes"], "30"), 30);
-  assert.equal(parseSettingInput(fields["quota.refreshMinutes"], "0"), undefined);
+  assert.equal(
+    parseSettingInput(fields["quota.refreshMinutes"], "0"),
+    undefined,
+  );
   assert.equal(parseSettingInput(fields.mode, "fast"), "fast");
   assert.equal(parseSettingInput(fields.mode, "unsafe"), undefined);
   assert.equal(parseSettingInput(fields.label, "weekly quota"), "weekly quota");

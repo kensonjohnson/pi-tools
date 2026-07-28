@@ -3,6 +3,7 @@
 ## Systems Analyzed
 
 ### 1. opencode-plugin-simple-memory
+
 **Source**: https://github.com/cnicolov/opencode-plugin-simple-memory
 
 **Architecture**: Plain-text logfmt files in `.opencode/memory/`. Daily log rotation. No external dependencies.
@@ -16,6 +17,7 @@
 **What works**: Simple file I/O is fast and inspectable. Types force structure without over-engineering.
 
 **What fails**:
+
 - No semantic search — retrieval is exact-match or type-filtered only
 - No memory management (accumulates forever, no decay, no consolidation)
 - No reflection loop — memories are raw observations, never distilled into patterns
@@ -27,6 +29,7 @@
 ---
 
 ### 2. Letta / MemGPT
+
 **Source**: https://www.letta.com/blog/agent-memory, https://github.com/letta-ai/letta
 **Papers**: arXiv:2310.08560
 
@@ -43,9 +46,11 @@
 ---
 
 ### 3. Claude Diary (by Lance Martin, LangChain)
+
 **Source**: https://rlancemartin.github.io/2025/12/01/claude_diary/
 
 **Architecture**: Three components inspired by Generative Agents paper:
+
 1. **Observations** — raw diary entries from sessions
 2. **Reflection** — `/reflect` command analyzes multiple diaries for patterns
 3. **Retrieval** — loads CLAUDE.md with distilled rules
@@ -61,6 +66,7 @@
 ---
 
 ### 4. claude-mem
+
 **Source**: https://github.com/thedotmack/claude-mem
 
 **Architecture**: SQLite + FTS5 + ChromaDB. Express server on port 37777. Web UI.
@@ -82,9 +88,11 @@
 ---
 
 ### 5. memU (by NevaMind-AI)
+
 **Source**: https://github.com/NevaMind-AI/memU
 
 **Architecture**: Three-layer hierarchy:
+
 - **Resource** (mount point) — Raw conversations, documents, files
 - **Memory Item** (file) — Extracted facts, preferences, skills
 - **Memory Category** (folder) — Auto-organized topics with summaries
@@ -92,6 +100,7 @@
 **Filesystem metaphor**: Categories = folders, Items = files, Cross-references = symlinks, Mount points = resources.
 
 **Dual retrieval**:
+
 - RAG (fast): embedding search for real-time context
 - LLM-based (deep): reads files directly for anticipatory reasoning
 
@@ -110,6 +119,7 @@
 ---
 
 ### 6. Claude Code (Anthropic)
+
 **Source**: https://code.claude.com/docs/en/memory
 
 **Architecture**: Hierarchical markdown files (`CLAUDE.md`) read recursively from cwd. Lazy-loaded by subdirectory. `.claude/rules/` for scoped rules. `/memory` command shows loaded files.
@@ -129,6 +139,7 @@
 ---
 
 ### 7. fsck.com Episodic Memory (by Jesse Vincent)
+
 **Source**: https://blog.fsck.com/2025/10/23/episodic-memory/
 
 **Architecture**: Archives all conversations from `~/.claude/projects` into SQLite with vector search. Haiku subagent manages context bloat.
@@ -143,14 +154,14 @@
 
 ### Key Papers
 
-| Paper | Date | Contribution |
-|-------|------|------------|
-| "Memory in the Age of AI Agents: A Survey" (arXiv:2512.13564) | Dec 2025 | Four memory types: factual, experiential, working. Write-manage-read framework. |
-| "Rethinking Memory in LLM-based Agents" (arXiv:2505.00675) | May 2025 | Six operations: Consolidation, Updating, Indexing, Forgetting, Retrieval, Condensation. |
-| Generative Agents (arXiv:2304.03442, UIST 2023) | Apr 2023 | Observation + Reflection + Planning architecture. Smallville simulation. |
-| Reflexion (arXiv:2303.11366, NeurIPS 2023) | Mar 2023 | Verbal reinforcement learning. Actor + Evaluator + Self-Reflection model. |
-| Mem0 paper (arXiv:2504.19413) | Apr 2025 | Two-phase pipeline (Extraction + Update). Graph-based memory. |
-| Zep architecture (arXiv:2501.13956) | Jan 2025 | Temporal knowledge graphs. Bi-temporal model. 94.8% on DMR. |
+| Paper                                                         | Date     | Contribution                                                                            |
+| ------------------------------------------------------------- | -------- | --------------------------------------------------------------------------------------- |
+| "Memory in the Age of AI Agents: A Survey" (arXiv:2512.13564) | Dec 2025 | Four memory types: factual, experiential, working. Write-manage-read framework.         |
+| "Rethinking Memory in LLM-based Agents" (arXiv:2505.00675)    | May 2025 | Six operations: Consolidation, Updating, Indexing, Forgetting, Retrieval, Condensation. |
+| Generative Agents (arXiv:2304.03442, UIST 2023)               | Apr 2023 | Observation + Reflection + Planning architecture. Smallville simulation.                |
+| Reflexion (arXiv:2303.11366, NeurIPS 2023)                    | Mar 2023 | Verbal reinforcement learning. Actor + Evaluator + Self-Reflection model.               |
+| Mem0 paper (arXiv:2504.19413)                                 | Apr 2025 | Two-phase pipeline (Extraction + Update). Graph-based memory.                           |
+| Zep architecture (arXiv:2501.13956)                           | Jan 2025 | Temporal knowledge graphs. Bi-temporal model. 94.8% on DMR.                             |
 
 ### The Write-Manage-Read Loop
 
@@ -171,28 +182,28 @@ Most implementations nail write and read, neglect manage. Result: noise accumula
 
 ### Key Failure Modes
 
-| Failure | Description | Example |
-|---------|-------------|---------|
-| Summarization drift | Repeated compression loses fidelity. After 5 summaries, memory barely resembles reality. | Claude Code long sessions degrading |
-| Semantic vs causal mismatch | Embeddings find similar text but miss cause/effect. | Debugging: agent sees similar errors but misses root cause |
-| Memory blindness | Important fact never resurfaces because retrieval limit is too low. | The 11th memory you need is never retrieved |
-| Silent orchestration | Paging/eviction does wrong thing, no error thrown. | MemGPT evicting wrong memory block |
-| Staleness | Outside world changes, memory doesn't. | "We use Redux" but migrated to Zustand 3 weeks ago |
-| Self-reinforcing errors | Bad memory treated as ground truth forever. | Agent decides SmartThings integration is faulty, ignores all future data from it |
-| Contradictions | New info conflicts with old, agent can't resolve. | "Workflow exists" vs "workflow failed" oscillation |
+| Failure                     | Description                                                                              | Example                                                                          |
+| --------------------------- | ---------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Summarization drift         | Repeated compression loses fidelity. After 5 summaries, memory barely resembles reality. | Claude Code long sessions degrading                                              |
+| Semantic vs causal mismatch | Embeddings find similar text but miss cause/effect.                                      | Debugging: agent sees similar errors but misses root cause                       |
+| Memory blindness            | Important fact never resurfaces because retrieval limit is too low.                      | The 11th memory you need is never retrieved                                      |
+| Silent orchestration        | Paging/eviction does wrong thing, no error thrown.                                       | MemGPT evicting wrong memory block                                               |
+| Staleness                   | Outside world changes, memory doesn't.                                                   | "We use Redux" but migrated to Zustand 3 weeks ago                               |
+| Self-reinforcing errors     | Bad memory treated as ground truth forever.                                              | Agent decides SmartThings integration is faulty, ignores all future data from it |
+| Contradictions              | New info conflicts with old, agent can't resolve.                                        | "Workflow exists" vs "workflow failed" oscillation                               |
 
 ### Cost Benchmarks
 
 Per-query for personal agent (~100 queries/day):
 
-| Component | Cost/Query | Monthly |
-|-----------|-----------|---------|
-| Intent recognition (Haiku) | ~$0.00025 | ~$0.75 |
-| Embedding generation | ~$0.000004 | ~$0.01 |
-| Vector search (self-hosted) | $0 | $0 |
-| Re-ranking (optional) | ~$0.002 | ~$6 |
-| Context assembly (Sonnet) | ~$0.014 | ~$42 |
-| **Total** | **~$0.016** | **~$48** |
+| Component                   | Cost/Query  | Monthly  |
+| --------------------------- | ----------- | -------- |
+| Intent recognition (Haiku)  | ~$0.00025   | ~$0.75   |
+| Embedding generation        | ~$0.000004  | ~$0.01   |
+| Vector search (self-hosted) | $0          | $0       |
+| Re-ranking (optional)       | ~$0.002     | ~$6      |
+| Context assembly (Sonnet)   | ~$0.014     | ~$42     |
+| **Total**                   | **~$0.016** | **~$48** |
 
 Without re-ranking, using cheaper models: **~$3/month**.
 
@@ -208,13 +219,13 @@ Implication: The storage format matters less than expected. Retrieval and manage
 
 ## What Other Coding Agents Do
 
-| Tool | Memory Approach | Cross-Session? | Notes |
-|------|-----------------|---------------|-------|
-| Claude Code | `CLAUDE.md` files | Yes | Hierarchical, lazy-loaded. Manual maintenance. |
-| Cursor | `.cursor/commands/*.md` + rules | Partial | No built-in cross-session memory yet. |
-| Cline | `.clinerules` | No | Project standards only. |
-| Windsurf | "Memories & Rules" layer | Yes | "Occasionally clings to outdated patterns after major refactors" |
-| GitHub Copilot | Chat history only | No | Per-session context. |
+| Tool           | Memory Approach                 | Cross-Session? | Notes                                                            |
+| -------------- | ------------------------------- | -------------- | ---------------------------------------------------------------- |
+| Claude Code    | `CLAUDE.md` files               | Yes            | Hierarchical, lazy-loaded. Manual maintenance.                   |
+| Cursor         | `.cursor/commands/*.md` + rules | Partial        | No built-in cross-session memory yet.                            |
+| Cline          | `.clinerules`                   | No             | Project standards only.                                          |
+| Windsurf       | "Memories & Rules" layer        | Yes            | "Occasionally clings to outdated patterns after major refactors" |
+| GitHub Copilot | Chat history only               | No             | Per-session context.                                             |
 
 ---
 
@@ -240,4 +251,4 @@ Implication: The storage format matters less than expected. Retrieval and manage
 
 ---
 
-*Last updated: 2026-05-01*
+_Last updated: 2026-05-01_

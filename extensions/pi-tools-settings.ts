@@ -83,7 +83,9 @@ function formatSettingsStatus(settings: EffectiveSettings): string {
     for (const field of Object.keys(definition.fields)) {
       const value = getSettingValue(settings, definition.id, field);
       const source = settings.sources[definition.id]?.[field] ?? "default";
-      lines.push(`  ${field} = ${formatValue(value)} (${formatSource(source)})`);
+      lines.push(
+        `  ${field} = ${formatValue(value)} (${formatSource(source)})`,
+      );
     }
   }
 
@@ -91,7 +93,9 @@ function formatSettingsStatus(settings: EffectiveSettings): string {
     lines.push("\nNo pi-tools extensions have registered settings yet.");
   }
   if (settings.diagnostics.length > 0) {
-    lines.push(`\nIgnored ${settings.diagnostics.length} invalid configuration value(s).`);
+    lines.push(
+      `\nIgnored ${settings.diagnostics.length} invalid configuration value(s).`,
+    );
   }
   return lines.join("\n");
 }
@@ -115,7 +119,9 @@ function createTextSubmenu(
         theme.fg(
           "accent",
           theme.bold(
-            prefillCurrentValue ? `Edit ${label}` : `Edit ${label} (current: ${currentValue})`,
+            prefillCurrentValue
+              ? `Edit ${label}`
+              : `Edit ${label} (current: ${currentValue})`,
           ),
         ),
         "Enter to save · Esc to cancel",
@@ -139,7 +145,8 @@ function createSettingItem(
   label = field.setting.label ?? field.field,
 ): SettingItem {
   const value = getSettingValue(settings, field.definition.id, field.field);
-  const source = settings.sources[field.definition.id]?.[field.field] ?? "default";
+  const source =
+    settings.sources[field.definition.id]?.[field.field] ?? "default";
   const description = [
     field.setting.description ?? field.definition.description,
     `Effective value: ${formatSource(source)}`,
@@ -221,7 +228,9 @@ function getDefaultScope(
   ctx: ExtensionCommandContext,
 ): WritableConfigScope {
   if (requestedScope === "project" && !ctx.isProjectTrusted()) {
-    throw new Error("Cannot edit project pi-tools settings until the project is trusted.");
+    throw new Error(
+      "Cannot edit project pi-tools settings until the project is trusted.",
+    );
   }
   return requestedScope ?? "global";
 }
@@ -249,7 +258,10 @@ async function openSettingsUI(
   requestedScope?: WritableConfigScope,
 ): Promise<void> {
   if (ctx.mode !== "tui") {
-    ctx.ui.notify("Open /pi-tools in TUI mode, or use /pi-tools get/set commands.", "warning");
+    ctx.ui.notify(
+      "Open /pi-tools in TUI mode, or use /pi-tools get/set commands.",
+      "warning",
+    );
     return;
   }
 
@@ -257,7 +269,10 @@ async function openSettingsUI(
   try {
     scope = getDefaultScope(requestedScope, ctx);
   } catch (error) {
-    ctx.ui.notify(error instanceof Error ? error.message : String(error), "warning");
+    ctx.ui.notify(
+      error instanceof Error ? error.message : String(error),
+      "warning",
+    );
     return;
   }
 
@@ -266,13 +281,15 @@ async function openSettingsUI(
   let settingsChanged = false;
 
   await ctx.ui.custom((tui, theme, _keybindings, done) => {
-    const registeredFields = managerSettingsRegistry.list().flatMap((definition) =>
-      Object.entries(definition.fields).map(([field, setting]) => ({
-        definition,
-        field,
-        setting,
-      })),
-    );
+    const registeredFields = managerSettingsRegistry
+      .list()
+      .flatMap((definition) =>
+        Object.entries(definition.fields).map(([field, setting]) => ({
+          definition,
+          field,
+          setting,
+        })),
+      );
     const items = createSettingsItems(
       registeredFields,
       settings,
@@ -340,7 +357,12 @@ async function openSettingsUI(
 
         const separator = id.indexOf(".");
         const registered =
-          separator > 0 ? getRegisteredField(id.slice(0, separator), id.slice(separator + 1)) : undefined;
+          separator > 0
+            ? getRegisteredField(
+                id.slice(0, separator),
+                id.slice(separator + 1),
+              )
+            : undefined;
         if (!registered) {
           ctx.ui.notify(`Unknown pi-tools setting '${id}'.`, "error");
           return;
@@ -348,7 +370,10 @@ async function openSettingsUI(
 
         const value = parseSettingInput(registered.setting, input);
         if (value === undefined) {
-          ctx.ui.notify(`Invalid value for ${registered.definition.id}.${registered.field}.`, "warning");
+          ctx.ui.notify(
+            `Invalid value for ${registered.definition.id}.${registered.field}.`,
+            "warning",
+          );
           return;
         }
 
@@ -358,7 +383,9 @@ async function openSettingsUI(
           })
           .catch((error) => {
             ctx.ui.notify(
-              error instanceof Error ? `Could not save setting: ${error.message}` : "Could not save setting.",
+              error instanceof Error
+                ? `Could not save setting: ${error.message}`
+                : "Could not save setting.",
               "error",
             );
           });
@@ -433,7 +460,8 @@ async function handleCommand(
       return;
     }
     const value = getSettingValue(settings, field.definition.id, field.field);
-    const source = settings.sources[field.definition.id]?.[field.field] ?? "default";
+    const source =
+      settings.sources[field.definition.id]?.[field.field] ?? "default";
     ctx.ui.notify(`${formatValue(value)} (${formatSource(source)})`, "info");
     return;
   }
@@ -448,10 +476,18 @@ async function handleCommand(
     return;
   }
 
-  const input = command.action === "set" ? command.input : command.action === "enable" ? "on" : "off";
+  const input =
+    command.action === "set"
+      ? command.input
+      : command.action === "enable"
+        ? "on"
+        : "off";
   const value = parseSettingInput(field.setting, input);
   if (value === undefined) {
-    ctx.ui.notify(`Invalid value for ${field.definition.id}.${field.field}.`, "warning");
+    ctx.ui.notify(
+      `Invalid value for ${field.definition.id}.${field.field}.`,
+      "warning",
+    );
     return;
   }
   await saveAndReload(ctx, scope, field, value);
@@ -460,7 +496,9 @@ async function handleCommand(
 export default function (pi: ExtensionAPI) {
   pi.events.on(SETTINGS_DEFINITION_EVENT, (definition) => {
     try {
-      managerSettingsRegistry.replace(definition as ExtensionSettingsDefinition);
+      managerSettingsRegistry.replace(
+        definition as ExtensionSettingsDefinition,
+      );
     } catch {
       // Ignore malformed or conflicting definitions from another extension.
     }
@@ -486,7 +524,9 @@ export default function (pi: ExtensionAPI) {
         await handleCommand(parsed.command, ctx);
       } catch (error) {
         ctx.ui.notify(
-          error instanceof Error ? error.message : "Could not update pi-tools settings.",
+          error instanceof Error
+            ? error.message
+            : "Could not update pi-tools settings.",
           "error",
         );
       }

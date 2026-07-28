@@ -196,7 +196,8 @@ export default function (pi: ExtensionAPI) {
   publishExtensionSettings(pi.events, {
     id: BRAVE_SEARCH_EXTENSION_ID,
     label: "Brave Search",
-    description: "Enables Brave web search and readable web-content extraction.",
+    description:
+      "Enables Brave web search and readable web-content extraction.",
     fields: {
       enabled: {
         type: "boolean",

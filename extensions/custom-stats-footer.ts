@@ -135,7 +135,10 @@ function parseCodexQuota(value: unknown): CodexQuota | undefined {
           : 0;
 
     return {
-      remainingPercent: Math.max(0, Math.min(100, Math.round(100 - window.used_percent))),
+      remainingPercent: Math.max(
+        0,
+        Math.min(100, Math.round(100 - window.used_percent)),
+      ),
       resetAtMs,
     };
   }
@@ -168,11 +171,15 @@ let quotaRefresh: Promise<void> | undefined;
 
 async function loadFooterSettings(ctx: ExtensionContext): Promise<void> {
   const settings = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);
-  footerEnabled = getSettingValue<boolean>(settings, FOOTER_SETTINGS_ID, "enabled") !== false;
+  footerEnabled =
+    getSettingValue<boolean>(settings, FOOTER_SETTINGS_ID, "enabled") !== false;
   quotaSettings = {
     enabled:
-      getSettingValue<boolean>(settings, FOOTER_SETTINGS_ID, "codexQuota.enabled") ??
-      DEFAULT_QUOTA_SETTINGS.enabled,
+      getSettingValue<boolean>(
+        settings,
+        FOOTER_SETTINGS_ID,
+        "codexQuota.enabled",
+      ) ?? DEFAULT_QUOTA_SETTINGS.enabled,
     refreshMinutes:
       getSettingValue<number>(
         settings,
@@ -182,7 +189,9 @@ async function loadFooterSettings(ctx: ExtensionContext): Promise<void> {
   };
 }
 
-async function migrateLegacyQuotaSettings(ctx: ExtensionContext): Promise<void> {
+async function migrateLegacyQuotaSettings(
+  ctx: ExtensionContext,
+): Promise<void> {
   const legacy = await readLegacyQuotaSettings();
   if (!legacy) return;
 
@@ -190,7 +199,9 @@ async function migrateLegacyQuotaSettings(ctx: ExtensionContext): Promise<void> 
     { cwd: ctx.cwd, isProjectTrusted: () => false },
     CONFIG_DIR_NAME,
   );
-  if (settings.sources[FOOTER_SETTINGS_ID]?.["codexQuota.enabled"] === "default") {
+  if (
+    settings.sources[FOOTER_SETTINGS_ID]?.["codexQuota.enabled"] === "default"
+  ) {
     await updateSetting({
       scope: "global",
       cwd: ctx.cwd,
@@ -228,7 +239,8 @@ export default function (pi: ExtensionAPI) {
   publishExtensionSettings(pi.events, {
     id: FOOTER_SETTINGS_ID,
     label: "Custom Stats Footer",
-    description: "Controls the replacement Pi footer and optional Codex quota display.",
+    description:
+      "Controls the replacement Pi footer and optional Codex quota display.",
     fields: {
       enabled: {
         type: "boolean",
@@ -290,7 +302,8 @@ export default function (pi: ExtensionAPI) {
 
     quotaRefresh = (async () => {
       try {
-        const token = await ctx.modelRegistry.getApiKeyForProvider("openai-codex");
+        const token =
+          await ctx.modelRegistry.getApiKeyForProvider("openai-codex");
         const credential = readStoredCredential("openai-codex");
         const accountId =
           credential &&
@@ -299,21 +312,27 @@ export default function (pi: ExtensionAPI) {
             ? credential.accountId
             : undefined;
 
-        if (!token || !accountId) throw new Error("OpenAI Codex login is unavailable");
+        if (!token || !accountId)
+          throw new Error("OpenAI Codex login is unavailable");
 
-        const response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "chatgpt-account-id": accountId,
-            originator: "pi",
-            "User-Agent": "pi quota footer",
+        const response = await fetch(
+          "https://chatgpt.com/backend-api/wham/usage",
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "chatgpt-account-id": accountId,
+              originator: "pi",
+              "User-Agent": "pi quota footer",
+            },
+            signal: AbortSignal.timeout(10_000),
           },
-          signal: AbortSignal.timeout(10_000),
-        });
-        if (!response.ok) throw new Error(`Codex usage request failed (${response.status})`);
+        );
+        if (!response.ok)
+          throw new Error(`Codex usage request failed (${response.status})`);
 
         const quota = parseCodexQuota(await response.json());
-        if (!quota) throw new Error("Codex weekly limit was not present in the response");
+        if (!quota)
+          throw new Error("Codex weekly limit was not present in the response");
 
         codexQuota = quota;
         quotaUnavailable = false;
