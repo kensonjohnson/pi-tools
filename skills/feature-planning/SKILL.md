@@ -21,7 +21,7 @@ The workflow has two distinct phases:
 **Your role**: Partner with the user to create the implementation plan
 
 - Explore the codebase together
-- Discuss architectural decisions  
+- Discuss architectural decisions
 - Propose phase breakdowns
 - Hash out details through conversation
 - Create planning documents collaboratively
@@ -148,6 +148,7 @@ User: "Great! Create the docs"
 **When user says "Create the planning docs":**
 
 1. **Create directory** (if needed):
+
    ```bash
    mkdir -p tmp/features
    ```
@@ -352,8 +353,8 @@ When updating SESSION_CONTEXT.md after completing work, use this format:
 ---
 
 ## Dependencies
-
 ```
+
 Phase 1 (Foundation)
 ↓
 Phase 2 (Backend)
@@ -361,6 +362,7 @@ Phase 2 (Backend)
 Phase 3 (Frontend)
 ↓
 Phase 4 (Polish)
+
 ```
 
 **Critical path**: Phase 1 must complete before Phase 2, etc.

@@ -46,7 +46,7 @@ interface MemoryLine {
 function serializeMemory(obj: MemoryLine): string {
   const ordered = { content: obj.content };
   for (const [k, v] of Object.entries(obj)) {
-    if (k !== 'content') ordered[k] = v;
+    if (k !== "content") ordered[k] = v;
   }
   return JSON.stringify(ordered);
 }
@@ -54,11 +54,11 @@ function serializeMemory(obj: MemoryLine): string {
 
 ## Categories
 
-| Category | Definition | Sourceable by `memory_init`? |
-|----------|-----------|------------------------------|
-| **knowledge** | What the codebase *is* — frameworks, languages, dependencies | Yes |
-| **practices** | How the codebase *works* — conventions, patterns, idioms | Yes |
-| **decisions** | Why specific choices were made — tradeoffs, architecture rationale | No |
+| Category      | Definition                                                         | Sourceable by `memory_init`? |
+| ------------- | ------------------------------------------------------------------ | ---------------------------- |
+| **knowledge** | What the codebase _is_ — frameworks, languages, dependencies       | Yes                          |
+| **practices** | How the codebase _works_ — conventions, patterns, idioms           | Yes                          |
+| **decisions** | Why specific choices were made — tradeoffs, architecture rationale | No                           |
 
 ```
 .pi/memory/
@@ -69,6 +69,7 @@ function serializeMemory(obj: MemoryLine): string {
 ```
 
 **`.pi/memory/.gitignore`**:
+
 ```gitignore
 *.db
 *.db-journal
@@ -90,42 +91,43 @@ function serializeMemory(obj: MemoryLine): string {
 Pi starts a fresh session with **<1K tokens**.
 
 **Session start** (and after compaction):
+
 1. Inject full contents of `knowledge.ndjson`
 2. Inject a compact index of `practices.ndjson` + `decisions.ndjson`
 
 **On-demand**: Agent calls `memory_recall` to retrieve full entries.
 
-| | `knowledge.ndjson` | `practices.ndjson` + `decisions.ndjson` |
-|--|-------------------|-----------------------------------------|
-| **Loaded** | Eager | Lazy |
-| **Volatility** | Low | Medium |
-| **Size** | <50 lines typical | Grows with project |
+|                | `knowledge.ndjson` | `practices.ndjson` + `decisions.ndjson` |
+| -------------- | ------------------ | --------------------------------------- |
+| **Loaded**     | Eager              | Lazy                                    |
+| **Volatility** | Low                | Medium                                  |
+| **Size**       | <50 lines typical  | Grows with project                      |
 
 ## Tools
 
-| Tool | Purpose |
-|------|---------|
-| `memory_remember` | Store a new memory. Requires `category` and `content`. |
-| `memory_recall` | Retrieve memories by query. |
-| `memory_forget` | Remove a memory by ID. |
-| `memory_update` | Replace the content of an existing memory by ID. |
-| `memory_learn` | Review recent activity and suggest NEW memories. Returns preview only. |
-| `memory_consolidate` | Review stored memories and suggest cleanup. User-triggered, interactive. |
-| `memory_init` | Bootstrap/repair the memory files and build the local index; optionally seed `knowledge.ndjson` and `practices.ndjson`. |
-| `memory_repair` | Remove malformed non-empty NDJSON lines, retain valid memories, and resync the local index. |
+| Tool                 | Purpose                                                                                                                 |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `memory_remember`    | Store a new memory. Requires `category` and `content`.                                                                  |
+| `memory_recall`      | Retrieve memories by query.                                                                                             |
+| `memory_forget`      | Remove a memory by ID.                                                                                                  |
+| `memory_update`      | Replace the content of an existing memory by ID.                                                                        |
+| `memory_learn`       | Review recent activity and suggest NEW memories. Returns preview only.                                                  |
+| `memory_consolidate` | Review stored memories and suggest cleanup. User-triggered, interactive.                                                |
+| `memory_init`        | Bootstrap/repair the memory files and build the local index; optionally seed `knowledge.ndjson` and `practices.ndjson`. |
+| `memory_repair`      | Remove malformed non-empty NDJSON lines, retain valid memories, and resync the local index.                             |
 
 ### Parameters
 
-| Tool | Parameters | Returns |
-|------|-----------|---------|
-| `memory_remember` | `content`, `category` | `id` |
-| `memory_recall` | `query`, `category?`, `limit?` | Matches |
-| `memory_forget` | `id` | Confirmation |
-| `memory_update` | `id`, `content` | Confirmation |
-| `memory_learn` | `since?` | Preview |
-| `memory_consolidate` | `since?` | Interactive report |
-| `memory_init` | `force?`, `seed?` | Summary, including recovered-line count |
-| `memory_repair` | — | Removed-line counts by category |
+| Tool                 | Parameters                     | Returns                                 |
+| -------------------- | ------------------------------ | --------------------------------------- |
+| `memory_remember`    | `content`, `category`          | `id`                                    |
+| `memory_recall`      | `query`, `category?`, `limit?` | Matches                                 |
+| `memory_forget`      | `id`                           | Confirmation                            |
+| `memory_update`      | `id`, `content`                | Confirmation                            |
+| `memory_learn`       | `since?`                       | Preview                                 |
+| `memory_consolidate` | `since?`                       | Interactive report                      |
+| `memory_init`        | `force?`, `seed?`              | Summary, including recovered-line count |
+| `memory_repair`      | —                              | Removed-line counts by category         |
 
 ### `memory_recall` Behavior
 
@@ -141,11 +143,11 @@ Pi starts a fresh session with **<1K tokens**.
 
 ### Technology
 
-| Component | Package |
-|-----------|---------|
-| Vector DB | `sqlite-vec` |
-| Embeddings | `@huggingface/transformers` |
-| Model | `onnx-community/all-MiniLM-L6-v2` (384 dims) |
+| Component  | Package                                      |
+| ---------- | -------------------------------------------- |
+| Vector DB  | `sqlite-vec`                                 |
+| Embeddings | `@huggingface/transformers`                  |
+| Model      | `onnx-community/all-MiniLM-L6-v2` (384 dims) |
 
 ### Fallbacks
 

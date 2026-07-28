@@ -1,13 +1,32 @@
-import type {
-  ExtensionAPI,
-  ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
+import {
+  CONFIG_DIR_NAME,
+  type ExtensionAPI,
+  type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import {
   MEMORY_CATEGORIES,
   type MemoryCategory,
   MemoryManager,
 } from "./core.ts";
+import { publishExtensionSettings } from "../../lib/pi-tools-config.ts";
+import {
+  isExtensionEnabled,
+  removeDisabledTools,
+} from "../../lib/pi-tools-runtime-settings.ts";
+
+const MEMORY_EXTENSION_ID = "memory";
+const MEMORY_TOOL_NAMES = [
+  "memory_remember",
+  "memory_recall",
+  "memory_update",
+  "memory_forget",
+  "memory_init",
+  "memory_repair",
+  "memory_learn",
+  "memory_consolidate",
+  "memory_list",
+] as const;
 
 const managers = new Map<string, Promise<MemoryManager>>();
 
@@ -30,6 +49,17 @@ async function getManager(cwd: string): Promise<MemoryManager> {
 
 const NOT_ENABLED_MESSAGE =
   "Memory tracking is not enabled for this project. Run `memory_init` to create the memory store and enable it.";
+
+async function getReadyManager(
+  ctx: ExtensionContext,
+): Promise<MemoryManager | undefined> {
+  if (!(await isExtensionEnabled(ctx, CONFIG_DIR_NAME, MEMORY_EXTENSION_ID))) {
+    return undefined;
+  }
+
+  const manager = await getManager(ctx.cwd);
+  return (await manager.isReady()) ? manager : undefined;
+}
 
 function formatRecall(
   result: Awaited<ReturnType<MemoryManager["recall"]>>,
@@ -62,10 +92,8 @@ function textResult(text: string, details?: unknown) {
 const injectedSessions = new Set<string>();
 
 async function injectMemoryMessage(ctx: ExtensionContext) {
-  const manager = await getManager(ctx.cwd);
-  if (!(await manager.isReady())) {
-    return;
-  }
+  const manager = await getReadyManager(ctx);
+  if (!manager) return;
 
   const promptContext = await manager.buildPromptContext();
   if (!promptContext) {
@@ -82,6 +110,29 @@ async function injectMemoryMessage(ctx: ExtensionContext) {
 }
 
 export default function (pi: ExtensionAPI) {
+  publishExtensionSettings(pi.events, {
+    id: MEMORY_EXTENSION_ID,
+    label: "Project Memory",
+    description:
+      "Enables project memory tools and automatic memory-context injection.",
+    fields: {
+      enabled: {
+        type: "boolean",
+        default: true,
+        label: "Enabled",
+      },
+    },
+    toolNames: MEMORY_TOOL_NAMES,
+  });
+
+  pi.on("session_start", async (_event, ctx) => {
+    removeDisabledTools(
+      pi,
+      MEMORY_TOOL_NAMES,
+      await isExtensionEnabled(ctx, CONFIG_DIR_NAME, MEMORY_EXTENSION_ID),
+    );
+  });
+
   pi.on("session_shutdown", async () => {
     for (const entry of managers.values()) {
       const manager = await entry;
@@ -135,10 +186,8 @@ export default function (pi: ExtensionAPI) {
       }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const manager = await getManager(ctx.cwd);
-      if (!(await manager.isReady())) {
-        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
-      }
+      const manager = await getReadyManager(ctx);
+      if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
 
       const result = await manager.remember(params.category, params.content);
       return textResult(
@@ -175,10 +224,8 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const manager = await getManager(ctx.cwd);
-      if (!(await manager.isReady())) {
-        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
-      }
+      const manager = await getReadyManager(ctx);
+      if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
 
       const result = await manager.recall({
         query: params.query,
@@ -202,10 +249,8 @@ export default function (pi: ExtensionAPI) {
       content: Type.String({ description: "New memory content" }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const manager = await getManager(ctx.cwd);
-      if (!(await manager.isReady())) {
-        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
-      }
+      const manager = await getReadyManager(ctx);
+      if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
 
       const updated = await manager.update(params.id, params.content);
       if (!updated) {
@@ -230,10 +275,8 @@ export default function (pi: ExtensionAPI) {
       id: Type.String({ description: "Memory id to remove" }),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const manager = await getManager(ctx.cwd);
-      if (!(await manager.isReady())) {
-        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
-      }
+      const manager = await getReadyManager(ctx);
+      if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
 
       const removed = await manager.forget(params.id);
       if (!removed) {
@@ -272,6 +315,11 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (
+        !(await isExtensionEnabled(ctx, CONFIG_DIR_NAME, MEMORY_EXTENSION_ID))
+      ) {
+        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
+      }
       const manager = await getManager(ctx.cwd);
       const result = await manager.init(
         Boolean(params.force),
@@ -299,10 +347,8 @@ export default function (pi: ExtensionAPI) {
       "Remove malformed NDJSON lines while retaining valid memories, then resync the local index.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      const manager = await getManager(ctx.cwd);
-      if (!(await manager.isReady())) {
-        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
-      }
+      const manager = await getReadyManager(ctx);
+      if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
 
       const result = await manager.repair();
       const detail = MEMORY_CATEGORIES.map(
@@ -330,10 +376,8 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const manager = await getManager(ctx.cwd);
-      if (!(await manager.isReady())) {
-        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
-      }
+      const manager = await getReadyManager(ctx);
+      if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
 
       const snippets = await manager.learn(params.since);
       return textResult(
@@ -362,10 +406,8 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const manager = await getManager(ctx.cwd);
-      if (!(await manager.isReady())) {
-        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
-      }
+      const manager = await getReadyManager(ctx);
+      if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
 
       const suggestions = await manager.consolidate(params.since);
       return textResult(suggestions.map((entry) => `- ${entry}`).join("\n"), {
@@ -390,10 +432,8 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const manager = await getManager(ctx.cwd);
-      if (!(await manager.isReady())) {
-        return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
-      }
+      const manager = await getReadyManager(ctx);
+      if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
 
       const { memories, counts } = await manager.list();
       const filtered = isMemoryCategory(params.category)

@@ -17,10 +17,10 @@ Respond terse. All technical substance stay. Only fluff die.
 
 ## Levels
 
-| Level | Description |
-|-------|-------------|
-| lite | Minimal terseness. Drop obvious filler. |
-| full | Standard terseness. Concise sentences. |
+| Level | Description                                     |
+| ----- | ----------------------------------------------- |
+| lite  | Minimal terseness. Drop obvious filler.         |
+| full  | Standard terseness. Concise sentences.          |
 | ultra | Maximum terseness. Fragments, abbreviations OK. |
 
 Switch: `/skill:caveman lite|full|ultra`
@@ -28,6 +28,7 @@ Switch: `/skill:caveman lite|full|ultra`
 ## Boundaries
 
 Always write normal for:
+
 - Code, commits, PRs
 - Security warnings
 - Irreversible actions

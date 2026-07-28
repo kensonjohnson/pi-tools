@@ -1,13 +1,20 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
+  CONFIG_DIR_NAME,
   readStoredCredential,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import {
+  getSettingValue,
+  publishExtensionSettings,
+  updateSetting,
+} from "../lib/pi-tools-config.ts";
+import { getRuntimeSettings } from "../lib/pi-tools-runtime-settings.ts";
 
 /**
  * Custom Default Footer Extension with TPS
@@ -54,7 +61,8 @@ const DEFAULT_QUOTA_SETTINGS: QuotaSettings = {
   refreshMinutes: 5,
 };
 const WEEK_SECONDS = 7 * 24 * 60 * 60;
-const QUOTA_SETTINGS_PATH = join(
+const FOOTER_SETTINGS_ID = "custom-stats-footer";
+const LEGACY_QUOTA_SETTINGS_PATH = join(
   process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
   "codex-quota-footer.json",
 );
@@ -77,22 +85,14 @@ function parseQuotaSettings(value: unknown): QuotaSettings {
   };
 }
 
-async function loadQuotaSettings(): Promise<QuotaSettings> {
+async function readLegacyQuotaSettings(): Promise<QuotaSettings | undefined> {
   try {
-    return parseQuotaSettings(JSON.parse(await readFile(QUOTA_SETTINGS_PATH, "utf8")));
+    return parseQuotaSettings(
+      JSON.parse(await readFile(LEGACY_QUOTA_SETTINGS_PATH, "utf8")),
+    );
   } catch {
-    return { ...DEFAULT_QUOTA_SETTINGS };
+    return undefined;
   }
-}
-
-async function saveQuotaSettings(settings: QuotaSettings): Promise<void> {
-  await mkdir(dirname(QUOTA_SETTINGS_PATH), { recursive: true });
-  const temporaryPath = `${QUOTA_SETTINGS_PATH}.${process.pid}.tmp`;
-  await writeFile(temporaryPath, `${JSON.stringify(settings, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  await rename(temporaryPath, QUOTA_SETTINGS_PATH);
 }
 
 function findWeeklyWindow(value: unknown): RateLimitWindow | undefined {
@@ -135,7 +135,10 @@ function parseCodexQuota(value: unknown): CodexQuota | undefined {
           : 0;
 
     return {
-      remainingPercent: Math.max(0, Math.min(100, Math.round(100 - window.used_percent))),
+      remainingPercent: Math.max(
+        0,
+        Math.min(100, Math.round(100 - window.used_percent)),
+      ),
       resetAtMs,
     };
   }
@@ -159,11 +162,72 @@ let agentStartMs: number | null = null;
 let lastTps: number | null = null;
 let totalTpsSum = 0;
 let tpsCount = 0;
+let footerEnabled = true;
 let quotaSettings: QuotaSettings = { ...DEFAULT_QUOTA_SETTINGS };
 let codexQuota: CodexQuota | undefined;
 let quotaUnavailable = false;
 let quotaTimer: ReturnType<typeof setInterval> | undefined;
 let quotaRefresh: Promise<void> | undefined;
+
+async function loadFooterSettings(ctx: ExtensionContext): Promise<void> {
+  const settings = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);
+  footerEnabled =
+    getSettingValue<boolean>(settings, FOOTER_SETTINGS_ID, "enabled") !== false;
+  quotaSettings = {
+    enabled:
+      getSettingValue<boolean>(
+        settings,
+        FOOTER_SETTINGS_ID,
+        "codexQuota.enabled",
+      ) ?? DEFAULT_QUOTA_SETTINGS.enabled,
+    refreshMinutes:
+      getSettingValue<number>(
+        settings,
+        FOOTER_SETTINGS_ID,
+        "codexQuota.refreshMinutes",
+      ) ?? DEFAULT_QUOTA_SETTINGS.refreshMinutes,
+  };
+}
+
+async function migrateLegacyQuotaSettings(
+  ctx: ExtensionContext,
+): Promise<void> {
+  const legacy = await readLegacyQuotaSettings();
+  if (!legacy) return;
+
+  const settings = await getRuntimeSettings(
+    { cwd: ctx.cwd, isProjectTrusted: () => false },
+    CONFIG_DIR_NAME,
+  );
+  if (
+    settings.sources[FOOTER_SETTINGS_ID]?.["codexQuota.enabled"] === "default"
+  ) {
+    await updateSetting({
+      scope: "global",
+      cwd: ctx.cwd,
+      projectTrusted: false,
+      configDirName: CONFIG_DIR_NAME,
+      extensionId: FOOTER_SETTINGS_ID,
+      field: "codexQuota.enabled",
+      value: legacy.enabled,
+    });
+  }
+  if (
+    settings.sources[FOOTER_SETTINGS_ID]?.["codexQuota.refreshMinutes"] ===
+    "default"
+  ) {
+    await updateSetting({
+      scope: "global",
+      cwd: ctx.cwd,
+      projectTrusted: false,
+      configDirName: CONFIG_DIR_NAME,
+      extensionId: FOOTER_SETTINGS_ID,
+      field: "codexQuota.refreshMinutes",
+      value: legacy.refreshMinutes,
+    });
+  }
+  await unlink(LEGACY_QUOTA_SETTINGS_PATH);
+}
 
 function isAssistantMessage(message: unknown): message is AssistantMessage {
   if (!message || typeof message !== "object") return false;
@@ -172,13 +236,40 @@ function isAssistantMessage(message: unknown): message is AssistantMessage {
 }
 
 export default function (pi: ExtensionAPI) {
+  publishExtensionSettings(pi.events, {
+    id: FOOTER_SETTINGS_ID,
+    label: "Custom Stats Footer",
+    description:
+      "Controls the replacement Pi footer and optional Codex quota display.",
+    fields: {
+      enabled: {
+        type: "boolean",
+        default: true,
+        label: "Enabled",
+      },
+      "codexQuota.enabled": {
+        type: "boolean",
+        default: false,
+        label: "Codex quota",
+      },
+      "codexQuota.refreshMinutes": {
+        type: "number",
+        default: 5,
+        label: "Refresh minutes",
+        minimum: 1,
+        maximum: 60,
+      },
+    },
+  });
+
   // Track agent timing for TPS calculation
   pi.on("agent_start", () => {
+    if (!footerEnabled) return;
     agentStartMs = Date.now();
   });
 
   pi.on("agent_end", (event, _ctx) => {
-    if (agentStartMs === null) return;
+    if (!footerEnabled || agentStartMs === null) return;
 
     const elapsedMs = Date.now() - agentStartMs;
     agentStartMs = null;
@@ -211,7 +302,8 @@ export default function (pi: ExtensionAPI) {
 
     quotaRefresh = (async () => {
       try {
-        const token = await ctx.modelRegistry.getApiKeyForProvider("openai-codex");
+        const token =
+          await ctx.modelRegistry.getApiKeyForProvider("openai-codex");
         const credential = readStoredCredential("openai-codex");
         const accountId =
           credential &&
@@ -220,21 +312,27 @@ export default function (pi: ExtensionAPI) {
             ? credential.accountId
             : undefined;
 
-        if (!token || !accountId) throw new Error("OpenAI Codex login is unavailable");
+        if (!token || !accountId)
+          throw new Error("OpenAI Codex login is unavailable");
 
-        const response = await fetch("https://chatgpt.com/backend-api/wham/usage", {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "chatgpt-account-id": accountId,
-            originator: "pi",
-            "User-Agent": "pi quota footer",
+        const response = await fetch(
+          "https://chatgpt.com/backend-api/wham/usage",
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+              "chatgpt-account-id": accountId,
+              originator: "pi",
+              "User-Agent": "pi quota footer",
+            },
+            signal: AbortSignal.timeout(10_000),
           },
-          signal: AbortSignal.timeout(10_000),
-        });
-        if (!response.ok) throw new Error(`Codex usage request failed (${response.status})`);
+        );
+        if (!response.ok)
+          throw new Error(`Codex usage request failed (${response.status})`);
 
         const quota = parseCodexQuota(await response.json());
-        if (!quota) throw new Error("Codex weekly limit was not present in the response");
+        if (!quota)
+          throw new Error("Codex weekly limit was not present in the response");
 
         codexQuota = quota;
         quotaUnavailable = false;
@@ -271,6 +369,10 @@ export default function (pi: ExtensionAPI) {
   // Function to set up the custom footer
   const setupFooter = (ctx: ExtensionContext) => {
     if (!ctx.hasUI) return;
+    if (!footerEnabled) {
+      ctx.ui.setFooter(undefined);
+      return;
+    }
 
     ctx.ui.setFooter((tui, theme, footerData) => {
       const unsub = footerData.onBranchChange(() => tui.requestRender());
@@ -442,40 +544,15 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
-  pi.registerCommand("codex-quota", {
-    description: "Toggle the Codex weekly-quota footer (optional: on|off)",
-    handler: async (args, ctx) => {
-      let action = args.trim().toLowerCase();
-      if (action === "") action = quotaSettings.enabled ? "off" : "on";
-
-      if (action === "on") {
-        quotaSettings = { ...quotaSettings, enabled: true };
-        await saveQuotaSettings(quotaSettings);
-        quotaUnavailable = false;
-        startQuotaUpdates(ctx);
-        setupFooter(ctx);
-        ctx.ui.notify("Codex quota footer enabled", "info");
-        return;
-      }
-
-      if (action === "off") {
-        quotaSettings = { ...quotaSettings, enabled: false };
-        await saveQuotaSettings(quotaSettings);
-        stopQuotaUpdates();
-        codexQuota = undefined;
-        quotaUnavailable = false;
-        setupFooter(ctx);
-        ctx.ui.notify("Codex quota footer disabled", "info");
-        return;
-      }
-
-      ctx.ui.notify("Usage: /codex-quota [on|off]", "warning");
-    },
-  });
-
   // Set up custom footer and begin quota polling only after a user has opted in.
   pi.on("session_start", async (_event, ctx) => {
-    quotaSettings = await loadQuotaSettings();
+    await migrateLegacyQuotaSettings(ctx);
+    await loadFooterSettings(ctx);
+    if (!footerEnabled) {
+      stopQuotaUpdates();
+      codexQuota = undefined;
+      quotaUnavailable = false;
+    }
     setupFooter(ctx);
     startQuotaUpdates(ctx);
   });
@@ -486,6 +563,6 @@ export default function (pi: ExtensionAPI) {
 
   // Re-assert footer when agent starts (prevents reset during agent activity)
   pi.on("agent_start", async (_event, ctx) => {
-    setupFooter(ctx);
+    if (footerEnabled) setupFooter(ctx);
   });
 }

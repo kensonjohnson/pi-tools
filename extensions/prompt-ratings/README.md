@@ -39,6 +39,7 @@ This directory is reserved for a future implementation of a prompt ratings exten
 ### Ratings
 
 Commands:
+
 - `/u` — upvote the latest unrated response (rating `1`).
 - `/d` — downvote the latest unrated response (rating `-1`).
 - `/s` — skip/neutral the latest unrated response (rating `0`).
@@ -46,6 +47,7 @@ Commands:
 - `/votestats [provider?]` — per-model leaderboard.
 
 Shortcuts (TUI only):
+
 - `Ctrl+Shift+U` — upvote
 - `Ctrl+Shift+D` — downvote
 - `Ctrl+Shift+S` — skip
