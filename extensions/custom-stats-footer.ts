@@ -323,11 +323,11 @@ export default function (pi: ExtensionAPI) {
           if (contextWindow > 0) {
             const contextStr = `${formatTokensExact(contextTokens)}/${formatTokens(contextWindow)} (${contextPercent.toFixed(0)}%)`;
 
-            // Colorize based on usage
+            // Colorize at 50% (warning) and 80% (error) context usage.
             let coloredContext: string;
-            if (contextPercent > 90) {
+            if (contextPercent >= 80) {
               coloredContext = theme.fg("error", contextStr);
-            } else if (contextPercent > 70) {
+            } else if (contextPercent >= 50) {
               coloredContext = theme.fg("warning", contextStr);
             } else {
               coloredContext = contextStr;
