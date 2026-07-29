@@ -164,7 +164,7 @@ test("explicit Go profile apply stores Pi full output before replacing a visible
           "tool-output-compression": {
             mode: "apply",
             eligibleTools: "bash",
-            profiles: { goTest: { mode: "apply" } },
+            profiles: { test: { go: { mode: "apply" } } },
             storage: { path: databasePath },
           },
         },

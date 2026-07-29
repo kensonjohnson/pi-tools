@@ -43,7 +43,7 @@ const OTHER_RUNNER_MARKER = /^\s*(?:RUN\s+v\d|✓\s)/;
 
 export const goTestProfile: OutputProfile = {
   id: GO_TEST_PROFILE_ID,
-  settingKey: "goTest",
+  settingPath: "test.go",
   label: "Go test",
   toolNames: ["bash"],
   mayMatch: mayContainGoTestOutput,

@@ -15,7 +15,7 @@ export type ProfileAnalysis = ProfileCandidate | ProfileBypass;
 /** A strict result-side grammar adapter; the engine owns storage and patching. */
 export type OutputProfile = {
   id: string;
-  settingKey: string;
+  settingPath: string;
   label: string;
   toolNames: readonly string[];
   mayMatch(visibleContent: string): boolean;

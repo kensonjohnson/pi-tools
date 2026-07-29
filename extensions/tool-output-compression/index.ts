@@ -98,7 +98,7 @@ async function loadSettings(ctx: ExtensionContext): Promise<void> {
           getSettingValue<string>(
             runtime,
             TOOL_OUTPUT_COMPRESSION_ID,
-            `profiles.${profile.settingKey}.mode`,
+            `profiles.${profile.settingPath}.mode`,
           ) ?? DEFAULT_PROFILE_MODE,
         ),
       ]),
@@ -319,7 +319,7 @@ async function dashboardData(): Promise<DashboardData> {
 function profileSettingFields() {
   return Object.fromEntries(
     OUTPUT_PROFILES.map((profile) => [
-      `profiles.${profile.settingKey}.mode`,
+      `profiles.${profile.settingPath}.mode`,
       {
         type: "enum" as const,
         default: DEFAULT_PROFILE_MODE,
