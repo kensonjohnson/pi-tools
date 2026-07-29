@@ -3,7 +3,6 @@ import { chmod, mkdir, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 
-export const STORE_SCHEMA_VERSION = 1;
 export const DEFAULT_STORAGE_MAX_BYTES = 512 * 1024 * 1024;
 export const DEFAULT_STORAGE_RETENTION_DAYS = 30;
 export const DEFAULT_MAX_OUTPUT_BYTES = 5 * 1024 * 1024;
@@ -18,6 +17,14 @@ export type StorageSettings = {
   retrievalMaxBytes: number;
 };
 
+export type StructuredOutputProvenance = {
+  strategy: string;
+  source: "visible" | "full-output-path";
+  visibleBytes: number;
+  compactBytes: number;
+  metadata?: string;
+};
+
 export type StoredToolOutput = {
   id: string;
   sessionId: string;
@@ -28,6 +35,7 @@ export type StoredToolOutput = {
   contentBytes: number;
   createdAtMs: number;
   expiresAtMs: number;
+  provenance?: StructuredOutputProvenance;
 };
 
 export type StoreOutputInput = Omit<StoredToolOutput, "id" | "contentBytes"> & {
@@ -159,8 +167,9 @@ export class ToolOutputStore {
           `
             INSERT INTO tool_outputs (
               id, session_id, tool_call_id, tool_name, content_hash, content,
-              content_bytes, created_at_ms, expires_at_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              content_bytes, created_at_ms, expires_at_ms, strategy, source,
+              visible_bytes, compact_bytes, profile_metadata
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `,
         )
         .run(
@@ -173,6 +182,11 @@ export class ToolOutputStore {
           output.contentBytes,
           output.createdAtMs,
           output.expiresAtMs,
+          output.provenance?.strategy ?? null,
+          output.provenance?.source ?? null,
+          output.provenance?.visibleBytes ?? null,
+          output.provenance?.compactBytes ?? null,
+          output.provenance?.metadata ?? null,
         );
 
       return output;
@@ -328,7 +342,7 @@ export class ToolOutputStore {
           this.dbReady.pragma("journal_mode = WAL");
           this.dbReady.pragma("synchronous = FULL");
           this.dbReady.pragma("foreign_keys = ON");
-          this.migrate();
+          this.initializeSchema();
         });
         await secureStorageFiles(this.settings.path);
       } catch (error) {
@@ -350,46 +364,31 @@ export class ToolOutputStore {
     }
   }
 
-  private migrate(): void {
-    const version = this.dbReady.pragma("user_version", {
-      simple: true,
-    }) as number;
-    if (version > STORE_SCHEMA_VERSION) {
-      throw new StorageUnavailableError(
-        `Tool-output storage schema ${version} is newer than this extension supports.`,
+  private initializeSchema(): void {
+    this.dbReady.exec(`
+      CREATE TABLE IF NOT EXISTS tool_outputs (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        tool_call_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        content TEXT NOT NULL,
+        content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
+        created_at_ms INTEGER NOT NULL,
+        expires_at_ms INTEGER NOT NULL,
+        strategy TEXT,
+        source TEXT,
+        visible_bytes INTEGER,
+        compact_bytes INTEGER,
+        profile_metadata TEXT
       );
-    }
-    if (version === STORE_SCHEMA_VERSION) return;
-
-    this.dbReady.exec("BEGIN IMMEDIATE");
-    try {
-      if (version < 1) {
-        this.dbReady.exec(`
-          CREATE TABLE IF NOT EXISTS tool_outputs (
-            id TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            tool_call_id TEXT NOT NULL,
-            tool_name TEXT NOT NULL,
-            content_hash TEXT NOT NULL,
-            content TEXT NOT NULL,
-            content_bytes INTEGER NOT NULL CHECK (content_bytes >= 0),
-            created_at_ms INTEGER NOT NULL,
-            expires_at_ms INTEGER NOT NULL
-          );
-          CREATE UNIQUE INDEX IF NOT EXISTS tool_outputs_session_call
-            ON tool_outputs(session_id, tool_call_id);
-          CREATE INDEX IF NOT EXISTS tool_outputs_expiry
-            ON tool_outputs(expires_at_ms);
-          CREATE INDEX IF NOT EXISTS tool_outputs_session_hash
-            ON tool_outputs(session_id, content_hash);
-        `);
-      }
-      this.dbReady.pragma(`user_version = ${STORE_SCHEMA_VERSION}`);
-      this.dbReady.exec("COMMIT");
-    } catch (error) {
-      rollback(this.dbReady);
-      throw error;
-    }
+      CREATE UNIQUE INDEX IF NOT EXISTS tool_outputs_session_call
+        ON tool_outputs(session_id, tool_call_id);
+      CREATE INDEX IF NOT EXISTS tool_outputs_expiry
+        ON tool_outputs(expires_at_ms);
+      CREATE INDEX IF NOT EXISTS tool_outputs_session_hash
+        ON tool_outputs(session_id, content_hash);
+    `);
   }
 
   private async withImmediateTransaction<T>(

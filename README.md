@@ -61,11 +61,12 @@ Observes configured text-only tool results and reports RTK-style estimated token
 
 - **observe** (default) never changes a result or persists raw output.
 - **apply** stores the first eligible result in a private SQLite database, then replaces only a later byte-identical result from the same session when a compact retrieval reference is smaller.
-- Errors, image-bearing results, unconfigured tools, storage failures, and cancellation pass through unchanged.
+- **Go package profile** is separately `observe` by default. It recognizes successful, complete normal or `-v` Go test output from `bash`, reports potential package-summary savings, and persists no raw output in observe mode. Set both the extension mode and **Go package profile** to `apply` to store the complete successful raw stream before replacing package summaries (and, for verbose runs, runner/log detail) with tested/cached/no-test totals and a retrieval reference.
+- Errors, image-bearing results, unconfigured tools, malformed/failed Go runs, storage failures, and cancellation pass through unchanged.
 
-The default eligible tools are `read,bash`; change the comma-separated **Tool Output Compression → Eligible tools** setting in `/pi-tools` to opt in other text tools. Storage defaults to `~/.pi/agent/tool-output-compression.sqlite`, uses WAL and full synchronous durability, and has configurable quota, retention, per-output, and retrieval-chunk limits. Stored output is private to the creating session and can be recovered by the agent with `retrieve_tool_output` when a compression reference provides its id.
+The default eligible tools are `read,bash`; change the comma-separated **Tool Output Compression → Eligible tools** setting in `/pi-tools` to opt in other text tools. Storage defaults to `~/.pi/agent/tool-output-compression.sqlite`, uses WAL and full synchronous durability, and exposes a raw-storage budget in MiB plus retention. Stored output is private to the creating session and can be recovered by the agent with `retrieve_tool_output` when a compression reference provides its id.
 
-Use `/tool-output` for session savings and storage status. `/tool-output prune` removes expired output; `/tool-output vacuum` compacts the SQLite database.
+Use `/tool-output` for session savings, Go-profile candidates/bypasses, and storage status. `/tool-output prune` removes expired output; `/tool-output vacuum` compacts the SQLite database. Go-profile compactness is compared against Pi's visible result (including a truncated tail), not against the recovered raw stream, so it never expands model context. Raw retrieval remains session-scoped through `retrieve_tool_output`.
 
 ## Configuration
 

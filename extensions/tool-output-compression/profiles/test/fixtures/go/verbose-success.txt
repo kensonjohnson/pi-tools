@@ -1,0 +1,12 @@
+just test-unit-verbose
+🧪 Running Go unit tests...
+=== RUN   TestOne
+--- PASS: TestOne (0.00s)
+application INFO request completed
+PASS
+ok      example/internal/one (cached)
+?       example/internal/generated [no test files]
+=== RUN   TestTwo
+--- PASS: TestTwo (0.01s)
+PASS
+ok      example/internal/two 0.010s coverage: 100.0% of statements

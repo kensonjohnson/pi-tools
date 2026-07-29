@@ -1,0 +1,12 @@
+just test-unit
+🧪 Running Go unit tests...
+ok      example/internal/one (cached)
+?       example/internal/generated [no test files]
+ok      example/internal/two (cached)
+ok      example/internal/three 0.010s
+?       example/internal/tools [no test files]
+ok      example/internal/four (cached)
+ok      example/internal/five (cached)
+ok      example/internal/six (cached)
+ok      example/internal/seven (cached)
+ok      example/internal/eight (cached)

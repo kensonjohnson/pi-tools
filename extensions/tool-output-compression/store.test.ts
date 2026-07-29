@@ -45,6 +45,13 @@ function output(
     content: string;
     createdAtMs: number;
     expiresAtMs: number;
+    provenance: {
+      strategy: string;
+      source: "visible" | "full-output-path";
+      visibleBytes: number;
+      compactBytes: number;
+      metadata?: string;
+    };
   }> = {},
 ) {
   return {
@@ -62,12 +69,38 @@ function output(
 test("stores provenance durably with SQLite safety pragmas and bounded chunks", async () => {
   await withStore(async ({ path, settings, now }) => {
     const first = new ToolOutputStore(settings, { now: () => now.value });
-    const stored = await first.store(output());
+    const stored = await first.store(
+      output({
+        toolName: "bash",
+        content: "full raw output",
+        contentHash: "raw-hash",
+        provenance: {
+          strategy: "go-test",
+          source: "full-output-path",
+          visibleBytes: 100,
+          compactBytes: 20,
+          metadata: '{"passEntries":2}',
+        },
+      }),
+    );
     await first.close();
 
     const db = new Database(path, { readonly: true });
     assert.equal(db.pragma("journal_mode", { simple: true }), "wal");
-    assert.equal(db.pragma("user_version", { simple: true }), 1);
+    assert.deepEqual(
+      db
+        .prepare(
+          `SELECT strategy, source, visible_bytes, compact_bytes, profile_metadata FROM tool_outputs WHERE id = ?`,
+        )
+        .get(stored.id),
+      {
+        strategy: "go-test",
+        source: "full-output-path",
+        visible_bytes: 100,
+        compact_bytes: 20,
+        profile_metadata: '{"passEntries":2}',
+      },
+    );
     db.close();
     assert.equal((await stat(path)).mode & 0o777, 0o600);
 
@@ -76,9 +109,9 @@ test("stores provenance durably with SQLite safety pragmas and bounded chunks", 
     const chunk = await resumed.retrieve(stored.id, "session-a", {
       maxBytes: 9,
     });
-    assert.equal(chunk?.toolName, "read");
-    assert.equal(chunk?.content, "hello ");
-    assert.equal(chunk?.nextOffset, 6);
+    assert.equal(chunk?.toolName, "bash");
+    assert.equal(chunk?.content, "full raw ");
+    assert.equal(chunk?.nextOffset, 9);
     assert.equal(
       (await resumed.retrieve(stored.id, "session-b")) === undefined,
       true,
@@ -87,7 +120,7 @@ test("stores provenance durably with SQLite safety pragmas and bounded chunks", 
       offset: chunk?.nextOffset,
       maxBytes: 100,
     });
-    assert.equal(full?.content, "🌍 tool output");
+    assert.equal(full?.content, "output");
     assert.equal(full?.nextOffset, undefined);
     assert.equal((await resumed.stats()).outputCount, 1);
     await resumed.close();

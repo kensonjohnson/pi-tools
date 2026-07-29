@@ -5,14 +5,22 @@ import {
   percentage,
   type CompressionMode,
   type ObservationMetrics,
+  type ProfileObservationMetrics,
   type ToolObservationMetrics,
 } from "./core.ts";
 import type { StorageStats } from "./store.ts";
+
+export type DashboardProfile = {
+  id: string;
+  label: string;
+  mode: CompressionMode;
+};
 
 export type DashboardData = {
   enabled: boolean;
   mode: CompressionMode;
   eligibleTools: readonly string[];
+  profiles: readonly DashboardProfile[];
   metrics: ObservationMetrics;
   storage?: StorageStats;
 };
@@ -37,12 +45,14 @@ export function formatDashboard(data: DashboardData): string {
       formatToolRow(toolName, data.metrics.byTool[toolName], appliesReuse),
     ),
     "",
+    ...formatProfiles(data),
+    "",
     ...formatStorage(data.storage),
     "",
     "Data handling",
     data.mode === "observe" || !data.enabled
       ? "  Observe mode persists no raw output."
-      : "  Apply mode stores an original before replacing an exact duplicate.",
+      : "  Apply mode stores an original before replacing output.",
     appliesReuse
       ? `  Exact duplicates reused: ${data.metrics.appliedReuses}.`
       : `  Exact reuses are supporting evidence: ${data.metrics.exactReuses}.`,
@@ -62,7 +72,11 @@ export function createDashboardComponent(
       const lines = report.split("\n");
       const styled = lines.map((line, index) => {
         if (index === 0) return theme.fg("accent", theme.bold(line));
-        if (line === "Current session" || line === "Configured tools") {
+        if (
+          line === "Current session" ||
+          line === "Configured tools" ||
+          line === "Profiles"
+        ) {
           return theme.fg("accent", theme.bold(line));
         }
         if (line === "Data handling" || line === "Storage")
@@ -81,6 +95,24 @@ export function createDashboardComponent(
       }
     },
   };
+}
+
+function formatProfiles(data: DashboardData): string[] {
+  const lines = ["Profiles"];
+  for (const profile of data.profiles) {
+    const metrics = data.metrics.profiles[profile.id] ?? emptyProfileMetrics();
+    const applies =
+      data.enabled && data.mode === "apply" && profile.mode === "apply";
+    const savedBytes = applies
+      ? metrics.actualSavedBytes
+      : metrics.potentialSavedBytes;
+    lines.push(
+      `  ${profile.label} (${profile.mode.toUpperCase()}) · ${metrics.candidates} candidates · ${formatTokens(savedBytes)} ${applies ? "actual" : "potential"} savings`,
+      `    Raw / visible / compact ${formatBytes(metrics.rawBytes)} / ${formatBytes(metrics.visibleBytes)} / ${formatBytes(metrics.projectedCompactBytes)} · ${metrics.recoveredFullOutput} full recoveries`,
+      `    Summary ${formatSummary(metrics.summary)} · Bypasses ${formatBypasses(metrics.bypasses)}`,
+    );
+  }
+  return lines;
 }
 
 function formatStorage(storage: StorageStats | undefined): string[] {
@@ -130,6 +162,35 @@ function formatToolRow(
     pad(formatPercent(percentage(savedBytes, value.outputBytes)), 11),
     String(reuseCount),
   ].join(" ");
+}
+
+function emptyProfileMetrics(): ProfileObservationMetrics {
+  return {
+    candidates: 0,
+    applied: 0,
+    visibleBytes: 0,
+    rawBytes: 0,
+    projectedCompactBytes: 0,
+    potentialSavedBytes: 0,
+    actualSavedBytes: 0,
+    recoveredFullOutput: 0,
+    summary: {},
+    bypasses: {},
+  };
+}
+
+function formatSummary(summary: Record<string, number>): string {
+  const entries = Object.entries(summary);
+  return entries.length === 0
+    ? "none"
+    : entries.map(([name, value]) => `${name}: ${value}`).join(", ");
+}
+
+function formatBypasses(bypasses: Record<string, number>): string {
+  const entries = Object.entries(bypasses);
+  return entries.length === 0
+    ? "none"
+    : entries.map(([reason, count]) => `${reason}: ${count}`).join(", ");
 }
 
 function formatBytes(bytes: number): string {

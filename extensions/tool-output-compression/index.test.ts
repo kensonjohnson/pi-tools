@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -65,9 +65,36 @@ test("registers settings and observes tool results without patching them", async
     assert.equal(patch, undefined);
     assert.deepEqual(event, before);
 
+    const fullOutputPath = join(root, "go-verbose.txt");
+    await writeFile(
+      fullOutputPath,
+      [
+        "=== RUN   TestOne",
+        "--- PASS: TestOne (0.00s)",
+        "PASS",
+        "ok      example/internal/one (cached)",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const verbose = {
+      toolCallId: "go-observe",
+      toolName: "bash",
+      content: [
+        { type: "text" as const, text: "=== RUN   VisibleTail\n".repeat(100) },
+      ],
+      isError: false,
+      details: { fullOutputPath },
+    };
+    const verboseBefore = structuredClone(verbose);
+    assert.equal(await handlers.get("tool_result")?.(verbose, ctx), undefined);
+    assert.deepEqual(verbose, verboseBefore);
+
     await commands.get("tool-output")?.handler("", ctx);
     assert.equal(notifications.length, 1);
-    assert.match(notifications[0] ?? "", /~125 tokens/);
+    assert.match(notifications[0] ?? "", /Eligible tool output/);
+    assert.match(notifications[0] ?? "", /Go test \(OBSERVE\)/);
+    assert.match(notifications[0] ?? "", /Go test \(OBSERVE\) · 1 candidates/);
     const database = new Database(
       join(root, "agent", "tool-output-compression.sqlite"),
       { readonly: true },
