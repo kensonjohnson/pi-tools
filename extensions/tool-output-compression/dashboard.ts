@@ -7,12 +7,14 @@ import {
   type ObservationMetrics,
   type ToolObservationMetrics,
 } from "./core.ts";
+import type { StorageStats } from "./store.ts";
 
 export type DashboardData = {
   enabled: boolean;
   mode: CompressionMode;
   eligibleTools: readonly string[];
   metrics: ObservationMetrics;
+  storage?: StorageStats;
 };
 
 export function formatDashboard(data: DashboardData): string {
@@ -32,8 +34,12 @@ export function formatDashboard(data: DashboardData): string {
       formatToolRow(toolName, data.metrics.byTool[toolName]),
     ),
     "",
+    ...formatStorage(data.storage),
+    "",
     "Data handling",
-    "  Metrics are session-only. Raw output is not stored in observe reporting.",
+    data.mode === "observe" || !data.enabled
+      ? "  Observe mode persists no raw output."
+      : "  Apply mode remains observational until exact reuse is enabled.",
     `  Exact reuses are supporting evidence: ${data.metrics.exactReuses}.`,
   ];
 
@@ -54,7 +60,7 @@ export function createDashboardComponent(
         if (line === "Current session" || line === "Configured tools") {
           return theme.fg("accent", theme.bold(line));
         }
-        if (line === "Data handling")
+        if (line === "Data handling" || line === "Storage")
           return theme.fg("muted", theme.bold(line));
         if (line.startsWith("Mode:") || line.startsWith("  Metrics")) {
           return theme.fg("dim", line);
@@ -70,6 +76,19 @@ export function createDashboardComponent(
       }
     },
   };
+}
+
+function formatStorage(storage: StorageStats | undefined): string[] {
+  if (!storage) {
+    return ["Storage", "  Database has not been opened in this session."];
+  }
+  return [
+    "Storage",
+    `  Database on disk          ${formatBytes(storage.databaseBytes)}`,
+    `  Stored raw output         ${formatBytes(storage.storedBytes)} / ${formatBytes(storage.maxBytes)} (${storage.outputCount} outputs)`,
+    `  Retention                 ${storage.retentionDays} days · ${storage.expiredCount} expired`,
+    "  Maintenance               /tool-output prune · /tool-output vacuum",
+  ];
 }
 
 function formatToolHeader(): string {
@@ -102,6 +121,15 @@ function formatToolRow(
     ),
     String(value.exactReuses),
   ].join(" ");
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1_024) return `${bytes} B`;
+  if (bytes < 1_024 * 1_024) return `${(bytes / 1_024).toFixed(1)} KiB`;
+  if (bytes < 1_024 * 1_024 * 1_024) {
+    return `${(bytes / (1_024 * 1_024)).toFixed(1)} MiB`;
+  }
+  return `${(bytes / (1_024 * 1_024 * 1_024)).toFixed(1)} GiB`;
 }
 
 function formatTokens(bytes: number): string {

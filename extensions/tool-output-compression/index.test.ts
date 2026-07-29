@@ -3,8 +3,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import Database from "better-sqlite3";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import extension from "./index.ts";
 
 test("registers settings and observes tool results without patching them", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-tool-output-compression-"));
@@ -12,6 +12,7 @@ test("registers settings and observes tool results without patching them", async
   process.env.PI_CODING_AGENT_DIR = join(root, "agent");
 
   try {
+    const { default: extension } = await import("./index.ts");
     const handlers = new Map<string, (event: unknown, ctx: any) => unknown>();
     const commands = new Map<
       string,
@@ -27,6 +28,7 @@ test("registers settings and observes tool results without patching them", async
       on(name: string, handler: (event: unknown, ctx: any) => unknown) {
         handlers.set(name, handler);
       },
+      registerTool() {},
       registerCommand(
         name: string,
         command: { handler: (args: string, ctx: any) => unknown },
@@ -66,6 +68,16 @@ test("registers settings and observes tool results without patching them", async
     await commands.get("tool-output")?.handler("", ctx);
     assert.equal(notifications.length, 1);
     assert.match(notifications[0] ?? "", /~125 tokens/);
+    const database = new Database(
+      join(root, "agent", "tool-output-compression.sqlite"),
+      { readonly: true },
+    );
+    assert.equal(
+      database.prepare(`SELECT COUNT(*) AS count FROM tool_outputs`).get()
+        .count,
+      0,
+    );
+    database.close();
   } finally {
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
