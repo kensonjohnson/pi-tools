@@ -1,0 +1,11 @@
+ RUN  v4.1.10 /workspace/frontend
+
+ ✓ src/auth.test.ts > auth > still passes 1ms
+
+ Test Files  1 passed (1)
+      Tests  1 passed (1)
+   Start at  13:04:01
+   Duration  1.32s (transform 3ms, setup 0ms, import 7ms, tests 4ms)
+
+⎯⎯⎯ Unhandled Errors ⎯⎯⎯
+Vitest caught 1 unhandled error during the test run.

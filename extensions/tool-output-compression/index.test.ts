@@ -18,10 +18,17 @@ test("registers settings and observes tool results without patching them", async
       string,
       { handler: (args: string, ctx: any) => unknown }
     >();
+    const settingsHandlers = new Map<string, (event: unknown) => void>();
+    const settingsDefinitions: any[] = [];
     const pi = {
       events: {
-        emit() {},
-        on() {
+        emit(channel: string, data: unknown) {
+          if (channel === "pi-tools:settings-definition") {
+            settingsDefinitions.push(data);
+          }
+        },
+        on(channel: string, handler: (event: unknown) => void) {
+          settingsHandlers.set(channel, handler);
           return () => {};
         },
       },
@@ -41,6 +48,18 @@ test("registers settings and observes tool results without patching them", async
     assert.ok(handlers.has("session_start"));
     assert.ok(handlers.has("tool_result"));
     assert.ok(commands.has("tool-output"));
+    settingsHandlers.get("pi-tools:settings-definition-request")?.({});
+    const definition = settingsDefinitions.find(
+      (candidate) => candidate.id === "tool-output-compression",
+    );
+    assert.deepEqual(definition.fields["profiles.test.vitest.mode"], {
+      type: "enum",
+      default: "observe",
+      values: ["off", "observe", "apply"],
+      label: "Vitest profile",
+      description:
+        "Observe candidates without persistence; Apply stores raw output before replacing a verified result.",
+    });
 
     const notifications: string[] = [];
     const ctx = {
@@ -95,6 +114,7 @@ test("registers settings and observes tool results without patching them", async
     assert.match(notifications[0] ?? "", /Eligible tool output/);
     assert.match(notifications[0] ?? "", /Go test \(OBSERVE\)/);
     assert.match(notifications[0] ?? "", /Go test \(OBSERVE\) · 1 candidates/);
+    assert.match(notifications[0] ?? "", /Vitest \(OBSERVE\) · 0 candidates/);
     const database = new Database(
       join(root, "agent", "tool-output-compression.sqlite"),
       { readonly: true },

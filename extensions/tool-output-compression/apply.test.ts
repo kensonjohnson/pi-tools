@@ -136,6 +136,129 @@ test("apply mode stores an original before replacing later exact duplicates", as
   }
 });
 
+test("explicit Vitest profile apply stores Pi full output before replacing a visible tail", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-vitest-apply-"));
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+
+  try {
+    const agentDir = process.env.PI_CODING_AGENT_DIR;
+    const databasePath = join(agentDir, "tool-output.sqlite");
+    const fullOutputPath = join(root, "vitest-full.txt");
+    const raw = [
+      "pnpm vitest run",
+      "",
+      " RUN  v4.1.10 /workspace/frontend",
+      "",
+      " ✓ src/auth.test.ts > auth > reports an error without failing 1ms",
+      " ✓ src/auth.test.ts > auth > handles a failure response 0ms",
+      " ✓ src/math.test.ts > math > adds values 2.5ms",
+      "",
+      " Test Files  2 passed (2)",
+      "      Tests  3 passed (3)",
+      "   Start at  13:04:01",
+      "   Duration  1.32s (transform 3ms, setup 0ms, import 7ms, tests 4ms)",
+      "",
+    ].join("\n");
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(fullOutputPath, raw, "utf8");
+    await writeFile(
+      join(agentDir, "pi-tools.json"),
+      JSON.stringify({
+        version: 1,
+        extensions: {
+          "tool-output-compression": {
+            mode: "apply",
+            eligibleTools: "bash",
+            profiles: { test: { vitest: { mode: "apply" } } },
+            storage: { path: databasePath },
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    const { default: extension } = await import("./index.ts");
+    const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+    const pi = {
+      events: {
+        emit() {},
+        on() {
+          return () => {};
+        },
+      },
+      on(name: string, handler: (event: any, ctx: any) => unknown) {
+        handlers.set(name, handler);
+      },
+      registerTool() {},
+      registerCommand() {},
+      getActiveTools: () => ["bash", "retrieve_tool_output"],
+      setActiveTools() {},
+    };
+    extension(pi as unknown as ExtensionAPI);
+    const ctx = {
+      cwd: root,
+      isProjectTrusted: () => false,
+      mode: "print",
+      signal: undefined,
+      sessionManager: { getSessionId: () => "session-vitest" },
+      ui: { notify() {} },
+    };
+    await handlers.get("session_start")?.({}, ctx);
+
+    const event = {
+      type: "tool_result",
+      toolCallId: "vitest-apply",
+      toolName: "bash",
+      input: { command: "anything" },
+      content: [
+        {
+          type: "text" as const,
+          text: [
+            " ✓ visible truncated test detail 1ms",
+            " Test Files  2 passed (2)",
+            "      Tests  3 passed (3)",
+            "   Start at  13:04:01",
+            "   Duration  1.32s (transform 3ms, setup 0ms, import 7ms, tests 4ms)",
+          ]
+            .join("\n")
+            .repeat(30),
+        },
+      ],
+      isError: false,
+      details: { fullOutputPath, preserved: true },
+    };
+    const patch = await handlers.get("tool_result")?.(event, ctx);
+    const compact = (patch as { content: Array<{ text: string }> }).content[0]
+      .text;
+    assert.match(compact, /Vitest passed: 2 test files; 3 tests in 1\.32s\./);
+    assert.match(compact, /retrieve_tool_output/);
+    assert.deepEqual(event.details, { fullOutputPath, preserved: true });
+
+    const database = new Database(databasePath, { readonly: true });
+    assert.deepEqual(
+      database
+        .prepare(
+          `SELECT content, strategy, source, visible_bytes, compact_bytes FROM tool_outputs`,
+        )
+        .get(),
+      {
+        content: raw,
+        strategy: "vitest",
+        source: "full-output-path",
+        visible_bytes: Buffer.byteLength(event.content[0].text, "utf8"),
+        compact_bytes: Buffer.byteLength(compact, "utf8"),
+      },
+    );
+    database.close();
+    await handlers.get("session_shutdown")?.({}, ctx);
+  } finally {
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("explicit Go profile apply stores Pi full output before replacing a visible tail", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-go-verbose-apply-"));
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;

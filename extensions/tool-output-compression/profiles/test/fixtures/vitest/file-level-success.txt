@@ -1,0 +1,9 @@
+ RUN  v3.2.4 /workspace/frontend
+
+ ✓ src/auth.test.ts (2 tests) 18ms
+ ✓ src/math.test.ts (1 test) 0ms
+
+ Test Files  2 passed (2)
+      Tests  3 passed (3)
+   Start at  15:02:53
+   Duration  1.39s (transform 3ms, setup 0ms, import 7ms, tests 18ms)
