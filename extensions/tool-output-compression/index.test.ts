@@ -61,7 +61,7 @@ test("registers settings and observes tool results without patching them", async
       isError: false,
     };
     const before = structuredClone(event);
-    const patch = handlers.get("tool_result")?.(event, ctx);
+    const patch = await handlers.get("tool_result")?.(event, ctx);
     assert.equal(patch, undefined);
     assert.deepEqual(event, before);
 

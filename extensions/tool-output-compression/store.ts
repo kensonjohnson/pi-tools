@@ -34,6 +34,16 @@ export type StoreOutputInput = Omit<StoredToolOutput, "id" | "contentBytes"> & {
   id?: string;
 };
 
+export type StoredOutputReference = {
+  id: string;
+  sessionId: string;
+  toolCallId: string;
+  toolName: string;
+  contentBytes: number;
+  createdAtMs: number;
+  expiresAtMs: number;
+};
+
 export type RetrievedToolOutput = {
   id: string;
   sessionId: string;
@@ -167,6 +177,41 @@ export class ToolOutputStore {
 
       return output;
     });
+  }
+
+  async findReference(
+    sessionId: string,
+    contentHash: string,
+    signal?: AbortSignal,
+  ): Promise<StoredOutputReference | undefined> {
+    throwIfAborted(signal);
+    await this.initialize();
+    throwIfAborted(signal);
+
+    const row = this.dbReady
+      .prepare(
+        `
+          SELECT id, session_id, tool_call_id, tool_name, content_bytes,
+                 created_at_ms, expires_at_ms
+          FROM tool_outputs
+          WHERE session_id = ? AND content_hash = ? AND expires_at_ms > ?
+          ORDER BY created_at_ms ASC, id ASC
+          LIMIT 1
+        `,
+      )
+      .get(sessionId, contentHash, this.now()) as
+      StoredReferenceRow | undefined;
+    if (!row) return undefined;
+
+    return {
+      id: row.id,
+      sessionId: row.session_id,
+      toolCallId: row.tool_call_id,
+      toolName: row.tool_name,
+      contentBytes: row.content_bytes,
+      createdAtMs: row.created_at_ms,
+      expiresAtMs: row.expires_at_ms,
+    };
   }
 
   async retrieve(
@@ -399,6 +444,8 @@ export class ToolOutputStore {
       .run(now).changes;
   }
 }
+
+type StoredReferenceRow = Omit<StoredOutputRow, "content_hash" | "content">;
 
 type StoredOutputRow = {
   id: string;

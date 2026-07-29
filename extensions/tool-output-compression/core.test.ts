@@ -64,6 +64,9 @@ test("observe mode leaves results untouched and records only safe aggregates", (
     500 - ESTIMATED_REUSE_REFERENCE_BYTES,
   );
   assert.deepEqual(Object.keys(metrics.byTool), ["read"]);
+  tracker.recordApplied("read", 500, 100);
+  assert.equal(tracker.snapshot().actualSavedBytes, 400);
+  assert.equal(tracker.snapshot().appliedReuses, 1);
 });
 
 test("ignores errors, unconfigured tools, non-text results, disabled mode, and short repeats", () => {
@@ -140,18 +143,24 @@ test("dashboard prioritizes estimated token savings for configured tools", () =>
       outputBytes: 4_000,
       exactReuses: 1,
       potentialSavedBytes: 1_600,
+      appliedReuses: 0,
+      actualSavedBytes: 0,
       byTool: {
         read: {
           eligibleResults: 2,
           outputBytes: 3_000,
           exactReuses: 1,
           potentialSavedBytes: 1_600,
+          appliedReuses: 0,
+          actualSavedBytes: 0,
         },
         bash: {
           eligibleResults: 1,
           outputBytes: 1_000,
           exactReuses: 0,
           potentialSavedBytes: 0,
+          appliedReuses: 0,
+          actualSavedBytes: 0,
         },
       },
     },
@@ -161,4 +170,34 @@ test("dashboard prioritizes estimated token savings for configured tools", () =>
   assert.match(text, /read\s+~750 tokens\s+~400 tokens\s+53%\s+1/);
   assert.match(text, /bash\s+~250 tokens\s+~0 tokens\s+0\.0%\s+0/);
   assert.doesNotMatch(text, /candidates/i);
+});
+
+test("dashboard reports actual rather than potential savings in apply mode", () => {
+  const text = formatDashboard({
+    enabled: true,
+    mode: "apply",
+    eligibleTools: ["read"],
+    metrics: {
+      eligibleResults: 2,
+      outputBytes: 4_000,
+      exactReuses: 1,
+      potentialSavedBytes: 1_600,
+      appliedReuses: 1,
+      actualSavedBytes: 1_500,
+      byTool: {
+        read: {
+          eligibleResults: 2,
+          outputBytes: 4_000,
+          exactReuses: 1,
+          potentialSavedBytes: 1_600,
+          appliedReuses: 1,
+          actualSavedBytes: 1_500,
+        },
+      },
+    },
+  });
+
+  assert.match(text, /Actual tokens saved\s+~375 tokens \(38%\)/);
+  assert.match(text, /Actual saved/);
+  assert.match(text, /Exact duplicates reused: 1/);
 });

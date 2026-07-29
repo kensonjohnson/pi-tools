@@ -19,6 +19,7 @@ export type DashboardData = {
 
 export function formatDashboard(data: DashboardData): string {
   const mode = data.enabled ? data.mode : "off";
+  const appliesReuse = data.enabled && data.mode === "apply";
   const lines = [
     "Tool Output Compression",
     `Mode: ${mode.toUpperCase()} · Token estimates use UTF-8 bytes ÷ 4`,
@@ -26,12 +27,14 @@ export function formatDashboard(data: DashboardData): string {
     "Current session",
     `  Eligible tool output       ${formatTokens(data.metrics.outputBytes)}`,
     `  Potential tokens saved     ${formatTokens(data.metrics.potentialSavedBytes)} (${formatPercent(percentage(data.metrics.potentialSavedBytes, data.metrics.outputBytes))})`,
-    "  Actual tokens saved        — (exact reuse is not enabled yet)",
+    appliesReuse
+      ? `  Actual tokens saved        ${formatTokens(data.metrics.actualSavedBytes)} (${formatPercent(percentage(data.metrics.actualSavedBytes, data.metrics.outputBytes))})`
+      : "  Actual tokens saved        — (observe mode)",
     "",
     "Configured tools",
-    formatToolHeader(),
+    formatToolHeader(appliesReuse),
     ...data.eligibleTools.map((toolName) =>
-      formatToolRow(toolName, data.metrics.byTool[toolName]),
+      formatToolRow(toolName, data.metrics.byTool[toolName], appliesReuse),
     ),
     "",
     ...formatStorage(data.storage),
@@ -39,8 +42,10 @@ export function formatDashboard(data: DashboardData): string {
     "Data handling",
     data.mode === "observe" || !data.enabled
       ? "  Observe mode persists no raw output."
-      : "  Apply mode remains observational until exact reuse is enabled.",
-    `  Exact reuses are supporting evidence: ${data.metrics.exactReuses}.`,
+      : "  Apply mode stores an original before replacing an exact duplicate.",
+    appliesReuse
+      ? `  Exact duplicates reused: ${data.metrics.appliedReuses}.`
+      : `  Exact reuses are supporting evidence: ${data.metrics.exactReuses}.`,
   ];
 
   return lines.join("\n");
@@ -91,11 +96,11 @@ function formatStorage(storage: StorageStats | undefined): string[] {
   ];
 }
 
-function formatToolHeader(): string {
+function formatToolHeader(appliesReuse: boolean): string {
   return [
     pad("Tool", 18),
     pad("Output", 13),
-    pad("Potential saved", 19),
+    pad(appliesReuse ? "Actual saved" : "Potential saved", 19),
     pad("Reduction", 11),
     "Reuses",
   ].join(" ");
@@ -104,22 +109,26 @@ function formatToolHeader(): string {
 function formatToolRow(
   toolName: string,
   metrics: ToolObservationMetrics | undefined,
+  appliesReuse: boolean,
 ): string {
   const value: ToolObservationMetrics = metrics ?? {
     eligibleResults: 0,
     outputBytes: 0,
     exactReuses: 0,
     potentialSavedBytes: 0,
+    appliedReuses: 0,
+    actualSavedBytes: 0,
   };
+  const savedBytes = appliesReuse
+    ? value.actualSavedBytes
+    : value.potentialSavedBytes;
+  const reuseCount = appliesReuse ? value.appliedReuses : value.exactReuses;
   return [
     pad(toolName, 18),
     pad(formatTokens(value.outputBytes), 13),
-    pad(formatTokens(value.potentialSavedBytes), 19),
-    pad(
-      formatPercent(percentage(value.potentialSavedBytes, value.outputBytes)),
-      11,
-    ),
-    String(value.exactReuses),
+    pad(formatTokens(savedBytes), 19),
+    pad(formatPercent(percentage(savedBytes, value.outputBytes)), 11),
+    String(reuseCount),
   ].join(" ");
 }
 

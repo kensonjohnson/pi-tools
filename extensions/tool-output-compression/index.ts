@@ -14,9 +14,12 @@ import {
   DEFAULT_ELIGIBLE_TOOLS,
   DEFAULT_MODE,
   ObservationTracker,
+  buildReuseReference,
   TOOL_OUTPUT_COMPRESSION_ID,
   parseEligibleTools,
   resolveCompressionMode,
+  reusableSavingsBytes,
+  type ClassifiedTextResult,
   type CompressionSettings,
 } from "./core.ts";
 import {
@@ -55,6 +58,9 @@ let storageSettings: StorageSettings = {
   retrievalMaxBytes: DEFAULT_RETRIEVAL_MAX_BYTES,
 };
 let store: ToolOutputStore | undefined;
+let nextToolSequence = 0;
+const toolSequences = new Map<string, number>();
+const reusableReferences = new Map<string, { id: string; sequence: number }>();
 
 async function loadSettings(ctx: ExtensionContext): Promise<void> {
   const runtime = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);
@@ -126,6 +132,68 @@ function getStore(): ToolOutputStore {
   return store;
 }
 
+async function applyExactReuse(
+  event: { toolCallId: string; toolName: string },
+  ctx: ExtensionContext,
+  output: ClassifiedTextResult,
+): Promise<{ content: Array<{ type: "text"; text: string }> } | undefined> {
+  try {
+    const sequence = toolSequences.get(event.toolCallId) ?? nextToolSequence++;
+    toolSequences.set(event.toolCallId, sequence);
+    const sessionId = ctx.sessionManager.getSessionId();
+    const outputStore = getStore();
+    let reference = reusableReferences.get(output.contentHash);
+
+    if (!reference) {
+      const stored = await outputStore.findReference(
+        sessionId,
+        output.contentHash,
+        ctx.signal,
+      );
+      if (stored) {
+        // A durable entry found after reload/compaction predates this result.
+        reference = { id: stored.id, sequence: -1 };
+        reusableReferences.set(output.contentHash, reference);
+      }
+    }
+
+    if (reference && reference.sequence < sequence) {
+      const compact = buildReuseReference(reference.id, output.outputBytes);
+      const compactBytes = Buffer.byteLength(compact, "utf8");
+      if (reusableSavingsBytes(output.outputBytes, compactBytes) > 0) {
+        tracker.recordApplied(event.toolName, output.outputBytes, compactBytes);
+        return { content: [{ type: "text", text: compact }] };
+      }
+      // The durable original already exists, but a reference would be worse.
+      return undefined;
+    }
+
+    const createdAtMs = Date.now();
+    const stored = await outputStore.store(
+      {
+        sessionId,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        contentHash: output.contentHash,
+        content: output.content,
+        createdAtMs,
+        expiresAtMs:
+          createdAtMs + storageSettings.retentionDays * 24 * 60 * 60 * 1_000,
+      },
+      ctx.signal,
+    );
+    if (!reference || sequence < reference.sequence) {
+      reusableReferences.set(output.contentHash, {
+        id: stored.id,
+        sequence,
+      });
+    }
+  } catch {
+    // Optional compression must fail open: no durable artifact means no patch.
+  }
+  return undefined;
+}
+
 async function dashboardData(): Promise<DashboardData> {
   let storage;
   try {
@@ -160,7 +228,7 @@ export default function (pi: ExtensionAPI) {
         values: ["off", "observe", "apply"],
         label: "Mode",
         description:
-          "Observe is non-mutating. Apply remains observational until exact reuse ships.",
+          "Observe is non-mutating. Apply stores eligible originals and reuses exact duplicates.",
       },
       eligibleTools: {
         type: "string",
@@ -212,6 +280,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     tracker.reset();
+    nextToolSequence = 0;
+    toolSequences.clear();
+    reusableReferences.clear();
     await loadSettings(ctx);
     if (!settings.enabled) {
       pi.setActiveTools(
@@ -225,11 +296,18 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     await store?.close();
     store = undefined;
+    toolSequences.clear();
+    reusableReferences.clear();
   });
 
-  pi.on("tool_result", (event) => {
-    // Observation intentionally returns no patch: every Pi result remains intact.
-    tracker.observe(event, settings);
+  pi.on("tool_execution_start", (event) => {
+    toolSequences.set(event.toolCallId, nextToolSequence++);
+  });
+
+  pi.on("tool_result", async (event, ctx) => {
+    const output = tracker.observe(event, settings);
+    if (!output || settings.mode !== "apply") return;
+    return applyExactReuse(event, ctx, output);
   });
 
   pi.registerCommand("tool-output", {

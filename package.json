@@ -2,6 +2,7 @@
   "name": "pi-tools",
   "version": "1.0.0",
   "description": "Personal pi extensions and skills",
+  "type": "module",
   "keywords": [
     "pi-package"
   ],

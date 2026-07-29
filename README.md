@@ -55,6 +55,18 @@ If you happen to be using a codex subscription, enable **Custom Stats Footer →
 
 The quota source is an undocumented ChatGPT endpoint, so the feature is best-effort. Access tokens and account identifiers are used only in memory and are never written or displayed by the extension.
 
+### `tool-output-compression`
+
+Observes configured text-only tool results and reports RTK-style estimated token savings in `/tool-output`. Token estimates use UTF-8 bytes ÷ 4 and are approximate.
+
+- **observe** (default) never changes a result or persists raw output.
+- **apply** stores the first eligible result in a private SQLite database, then replaces only a later byte-identical result from the same session when a compact retrieval reference is smaller.
+- Errors, image-bearing results, unconfigured tools, storage failures, and cancellation pass through unchanged.
+
+The default eligible tools are `read,bash`; change the comma-separated **Tool Output Compression → Eligible tools** setting in `/pi-tools` to opt in other text tools. Storage defaults to `~/.pi/agent/tool-output-compression.sqlite`, uses WAL and full synchronous durability, and has configurable quota, retention, per-output, and retrieval-chunk limits. Stored output is private to the creating session and can be recovered by the agent with `retrieve_tool_output` when a compression reference provides its id.
+
+Use `/tool-output` for session savings and storage status. `/tool-output prune` removes expired output; `/tool-output vacuum` compacts the SQLite database.
+
 ## Configuration
 
 pi-tools extensions share a versioned JSON configuration system. Defaults are overridden by the global file, then by a trusted project override:
