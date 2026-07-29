@@ -8,7 +8,8 @@
   "scripts": {
     "format": "prettier --write .",
     "test:config": "node --experimental-strip-types --test lib/pi-tools-config.test.ts lib/pi-tools-command.test.ts lib/pi-tools-runtime-settings.test.ts",
-    "test:memory": "node --experimental-strip-types --test extensions/memory/core.test.ts"
+    "test:memory": "node --experimental-strip-types --test extensions/memory/core.test.ts",
+    "test:compression": "node --experimental-strip-types --test extensions/tool-output-compression/*.test.ts"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
