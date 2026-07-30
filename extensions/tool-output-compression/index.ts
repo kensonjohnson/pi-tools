@@ -32,7 +32,7 @@ import {
   type DashboardData,
 } from "./dashboard.ts";
 import { OUTPUT_PROFILES } from "./profiles/registry.ts";
-import type { OutputProfile } from "./profiles/types.ts";
+import type { OutputProfile, ProfileContext } from "./profiles/types.ts";
 import { captureBashRawOutput, probeBashRawOutput } from "./raw-capture.ts";
 import { RETRIEVE_TOOL_OUTPUT_NAME, registerRetrieveTool } from "./retrieve.ts";
 import {
@@ -203,15 +203,21 @@ async function applyExactReuse(
 }
 
 async function applyProfiles(
-  event: { toolCallId: string; toolName: string; details?: unknown },
+  event: {
+    toolCallId: string;
+    toolName: string;
+    details?: unknown;
+    input?: Record<string, unknown>;
+  },
   ctx: ExtensionContext,
   output: ClassifiedTextResult,
 ): Promise<{ content: Array<{ type: "text"; text: string }> } | undefined> {
+  const profileContext = profileContextFor(event);
   let candidates = OUTPUT_PROFILES.filter(
     (profile) =>
       profile.toolNames.includes(event.toolName) &&
       resolveProfileMode(settings, profile.id) !== "off" &&
-      profile.mayMatch(output.content),
+      profile.mayMatch(output.content, profileContext),
   );
 
   // Current profiles are bash profiles. Keep full-output recovery owned by the
@@ -233,7 +239,7 @@ async function applyProfiles(
       );
       if (probe) {
         const recoveredCandidates = probeProfiles.filter((profile) =>
-          profile.mayMatchRecoveredRaw!(probe),
+          profile.mayMatchRecoveredRaw!(probe, profileContext),
         );
         candidates = Array.from(
           new Map(
@@ -255,7 +261,7 @@ async function applyProfiles(
     );
     for (const profile of candidates) {
       const mode = resolveProfileMode(settings, profile.id);
-      const analysis = profile.analyze(raw.content);
+      const analysis = profile.analyze(raw.content, profileContext);
       if (!analysis.applicable) {
         tracker.recordProfileBypass(profile.id, analysis.reason);
         continue;
@@ -321,6 +327,16 @@ async function applyProfiles(
     }
   }
   return undefined;
+}
+
+function profileContextFor(event: {
+  toolName: string;
+  input?: Record<string, unknown>;
+}): ProfileContext {
+  if (event.toolName !== "bash" || typeof event.input?.command !== "string") {
+    return {};
+  }
+  return { bashCommand: event.input.command };
 }
 
 function isSmallerThanVisible(visible: string, compact: string): boolean {

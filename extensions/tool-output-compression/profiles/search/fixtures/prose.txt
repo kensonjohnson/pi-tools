@@ -1,0 +1,2 @@
+Search completed successfully
+src/a.ts:1:needle

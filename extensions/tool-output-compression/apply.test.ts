@@ -482,3 +482,109 @@ test("JSON profile apply recovers a full Pi output after a positive bounded prob
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("search-record profile stores recovered raw output before replacing a visible tail", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-search-records-apply-"));
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+
+  try {
+    const agentDir = process.env.PI_CODING_AGENT_DIR;
+    const databasePath = join(agentDir, "tool-output.sqlite");
+    const fullOutputPath = join(root, "search-full.txt");
+    const raw = Array.from(
+      { length: 500 },
+      (_, index) => `src/search.ts:${index + 1}:needle ${index}`,
+    ).join("\n");
+    const visible = "Pi native truncated tail without search records\n".repeat(
+      300,
+    );
+    await mkdir(agentDir, { recursive: true });
+    await writeFile(fullOutputPath, raw, "utf8");
+    await writeFile(
+      join(agentDir, "pi-tools.json"),
+      JSON.stringify({
+        version: 1,
+        extensions: {
+          "tool-output-compression": {
+            mode: "apply",
+            eligibleTools: "bash",
+            profiles: { search: { records: { mode: "apply" } } },
+            storage: { path: databasePath },
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    const { default: extension } = await import("./index.ts");
+    const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+    const pi = {
+      events: {
+        emit() {},
+        on() {
+          return () => {};
+        },
+      },
+      on(name: string, handler: (event: any, ctx: any) => unknown) {
+        handlers.set(name, handler);
+      },
+      registerTool() {},
+      registerCommand() {},
+      getActiveTools: () => ["bash", "retrieve_tool_output"],
+      setActiveTools() {},
+    };
+    extension(pi as unknown as ExtensionAPI);
+    const ctx = {
+      cwd: root,
+      isProjectTrusted: () => false,
+      mode: "print",
+      signal: undefined,
+      sessionManager: { getSessionId: () => "session-search" },
+      ui: { notify() {} },
+    };
+    await handlers.get("session_start")?.({}, ctx);
+
+    const event = {
+      type: "tool_result",
+      toolCallId: "search-apply",
+      toolName: "bash",
+      input: { command: "rg -n needle src" },
+      content: [{ type: "text" as const, text: visible }],
+      isError: false,
+      details: { fullOutputPath, preserved: true },
+    };
+    const patch = await handlers.get("tool_result")?.(event, ctx);
+    const compact = (patch as { content: Array<{ text: string }> }).content[0]
+      .text;
+    assert.match(compact, /Grouped exact search records/);
+    assert.match(compact, /• src\/search\.ts/);
+    assert.match(compact, /retrieve_tool_output/);
+    assert.ok(
+      Buffer.byteLength(compact, "utf8") < Buffer.byteLength(visible, "utf8"),
+    );
+    assert.deepEqual(event.details, { fullOutputPath, preserved: true });
+
+    const database = new Database(databasePath, { readonly: true });
+    assert.deepEqual(
+      database
+        .prepare(
+          `SELECT content, strategy, source, visible_bytes, compact_bytes FROM tool_outputs`,
+        )
+        .get(),
+      {
+        content: raw,
+        strategy: "search-records",
+        source: "full-output-path",
+        visible_bytes: Buffer.byteLength(visible, "utf8"),
+        compact_bytes: Buffer.byteLength(compact, "utf8"),
+      },
+    );
+    database.close();
+    await handlers.get("session_shutdown")?.({}, ctx);
+  } finally {
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});

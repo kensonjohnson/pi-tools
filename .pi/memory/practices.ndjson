@@ -1,0 +1,2 @@
+{"content":"ROADMAP.md contains durable product milestones only and must not link to session context or approval-state planning details.","id":"019faf43-205e-7338-a67f-b69fb9ea045b","created":"2026-07-29T19:03:59.838Z"}
+{"content":"Lexical JSON fixtures use .txt inputs because Prettier normalizes .json numeric spellings and would invalidate token-preservation cases.","id":"019fb08d-0dca-7181-ac56-fc828f7734d4","created":"2026-07-30T01:04:21.963Z"}

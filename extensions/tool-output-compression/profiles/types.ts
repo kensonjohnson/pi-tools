@@ -10,6 +10,11 @@ export type ProfileRenderOptions = {
   rawSource: "visible" | "full-output-path";
 };
 
+/** Optional tool-call evidence shared by result-side profiles. */
+export type ProfileContext = {
+  bashCommand?: string;
+};
+
 export type ProfileCandidate = {
   applicable: true;
   rawBytes: number;
@@ -25,8 +30,11 @@ export type OutputProfile = {
   settingPath: string;
   label: string;
   toolNames: readonly string[];
-  mayMatch(visibleContent: string): boolean;
+  mayMatch(visibleContent: string, context?: ProfileContext): boolean;
   /** Optional bounded full-output probe for profiles that recover Pi tails. */
-  mayMatchRecoveredRaw?(probe: RawOutputProbe): boolean;
-  analyze(rawContent: string): ProfileAnalysis;
+  mayMatchRecoveredRaw?(
+    probe: RawOutputProbe,
+    context?: ProfileContext,
+  ): boolean;
+  analyze(rawContent: string, context?: ProfileContext): ProfileAnalysis;
 };

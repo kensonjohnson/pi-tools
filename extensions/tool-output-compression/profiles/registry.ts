@@ -1,3 +1,4 @@
+import { searchRecordsProfile } from "./search/records.ts";
 import { jsonProfile } from "./structured/json.ts";
 import { goTestProfile } from "./test/go.ts";
 import { vitestProfile } from "./test/vitest.ts";
@@ -7,6 +8,7 @@ export const OUTPUT_PROFILES: readonly OutputProfile[] = [
   goTestProfile,
   vitestProfile,
   jsonProfile,
+  searchRecordsProfile,
 ];
 
 export function profileById(id: string): OutputProfile | undefined {

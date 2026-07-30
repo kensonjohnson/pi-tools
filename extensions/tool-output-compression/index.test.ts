@@ -68,6 +68,14 @@ test("registers settings and observes tool results without patching them", async
       description:
         "Observe candidates without persistence; Apply stores raw output before replacing a verified result.",
     });
+    assert.deepEqual(definition.fields["profiles.search.records.mode"], {
+      type: "enum",
+      default: "observe",
+      values: ["off", "observe", "apply"],
+      label: "rg/grep search records profile",
+      description:
+        "Observe candidates without persistence; Apply stores raw output before replacing a verified result.",
+    });
 
     const notifications: string[] = [];
     const ctx = {
@@ -117,6 +125,25 @@ test("registers settings and observes tool results without patching them", async
     assert.equal(await handlers.get("tool_result")?.(verbose, ctx), undefined);
     assert.deepEqual(verbose, verboseBefore);
 
+    const searchObserve = {
+      toolCallId: "search-observe",
+      toolName: "bash",
+      input: { command: "rg -n needle src" },
+      content: [
+        {
+          type: "text" as const,
+          text: "src/core.ts:7:needle\nsrc/core.ts:8:another needle\n",
+        },
+      ],
+      isError: false,
+    };
+    const searchBefore = structuredClone(searchObserve);
+    assert.equal(
+      await handlers.get("tool_result")?.(searchObserve, ctx),
+      undefined,
+    );
+    assert.deepEqual(searchObserve, searchBefore);
+
     const fullJsonPath = join(root, "json-full.txt");
     const fullJson = [
       "{",
@@ -156,6 +183,10 @@ test("registers settings and observes tool results without patching them", async
     assert.match(
       notifications[0] ?? "",
       /JSON\/JSONL \(OBSERVE\) · 1 candidates/,
+    );
+    assert.match(
+      notifications[0] ?? "",
+      /rg\/grep search records \(OBSERVE\) · 1 candidates/,
     );
     const database = new Database(
       join(root, "agent", "tool-output-compression.sqlite"),
