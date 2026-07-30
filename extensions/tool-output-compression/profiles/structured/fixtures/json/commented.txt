@@ -1,0 +1,4 @@
+{
+  // comments are not JSON
+  "id": 42
+}

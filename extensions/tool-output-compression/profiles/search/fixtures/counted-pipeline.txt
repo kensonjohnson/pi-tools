@@ -1,0 +1,4 @@
+   1 docs/guide.md:10:needle
+   1 docs/guide.md:11:needle
+   2 src/search.ts:4:needle
+   2 src/search.ts:5:needle

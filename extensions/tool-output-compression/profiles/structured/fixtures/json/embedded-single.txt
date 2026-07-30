@@ -1,0 +1,6 @@
+request completed
+{
+  "id": 42,
+  "status": "ok"
+}
+next command follows

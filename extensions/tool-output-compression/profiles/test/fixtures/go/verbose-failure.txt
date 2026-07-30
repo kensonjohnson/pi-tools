@@ -1,0 +1,5 @@
+=== RUN   TestBroken
+--- FAIL: TestBroken (0.00s)
+    example_test.go:10: expected true
+FAIL
+FAIL    example/internal/one 0.010s

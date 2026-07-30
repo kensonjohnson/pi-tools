@@ -1,0 +1,12 @@
+pnpm vitest run
+
+ RUN  v4.1.10 /workspace/frontend
+
+ ✓ src/auth.test.ts > auth > reports an error without failing 1ms
+ ✓ src/auth.test.ts > auth > handles a failure response 0ms
+ ✓ src/math.test.ts > math > adds values 2.5ms
+
+ Test Files  2 passed (2)
+      Tests  3 passed (3)
+   Start at  13:04:01
+   Duration  1.32s (transform 3ms, setup 0ms, import 7ms, tests 4ms)

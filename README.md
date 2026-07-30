@@ -55,6 +55,23 @@ If you happen to be using a codex subscription, enable **Custom Stats Footer →
 
 The quota source is an undocumented ChatGPT endpoint, so the feature is best-effort. Access tokens and account identifiers are used only in memory and are never written or displayed by the extension.
 
+### `tool-output-compression`
+
+Observes configured text-only tool results and reports RTK-style estimated token savings in `/tool-output`. Token estimates use UTF-8 bytes ÷ 4 and are approximate.
+
+- **observe** (default) never changes a result or persists raw output.
+- **apply** stores the first eligible result in a private SQLite database, then replaces only a later byte-identical result from the same session when a compact retrieval reference is smaller.
+- **Go package profile** is separately `observe` by default. It recognizes successful, complete normal or `-v` Go test output from `bash`, reports potential package-summary savings, and persists no raw output in observe mode. Set both the extension mode and **Go package profile** to `apply` to store the complete successful raw stream before replacing package summaries (and, for verbose runs, runner/log detail) with tested/cached/no-test totals and a retrieval reference.
+- **Vitest profile** is separately `observe` by default. It accepts only a complete standalone successful default- or verbose-reporter run: a `RUN v…` header, one unmixed contiguous pass-line variant, agreeing file/test totals, and the `Start at`/`Duration` summary. It preserves an optional shell preamble and replaces the recognized Vitest region with file/test totals, duration, and a retrieval reference. Console output, snapshots, failures, post-summary banners, reporter variants, and composite Go/Vitest streams pass through unchanged.
+- **JSON/JSONL profile** is separately `observe` by default. It accepts complete JSON objects/arrays, strict JSONL records, or one or more independently verified JSON object/array blocks that begin on an otherwise indented line; it preserves all surrounding mixed-output text exactly. It removes only whitespace outside JSON strings, preserving duplicate keys, ordering, number and escape spelling, and Unicode text. For recovered Pi-truncated raw output, it emits complete minified content when it fits; otherwise it may emit a clearly marked incomplete minified tail with a retrieval reference. Inline/same-line JSON snippets, primitives, comments, malformed JSON, errors, and nontext output pass through unchanged.
+- **`rg`/`grep` search-record profile** is separately `observe` by default. It accepts successful `bash` output only when a safe shell-segment parser finds an executed `rg` or `grep` command and every output line contains exactly one unambiguous `:<decimal>:` delimiter. It factors adjacent equal opaque prefixes into tagged groups while preserving every prefix, line token, suffix, and source order; prefixes are not assumed to be paths. ANSI/NUL output, headings, context, malformed/ambiguous records, uncertain shell syntax, errors, and nontext output pass through unchanged. Recovered Pi output is replaced only when the complete grouped rendering fits the visible-byte gate.
+- Enable profiles independently with `profiles.test.go.mode`, `profiles.test.vitest.mode`, `profiles.structured.json.mode`, or `profiles.search.records.mode`; profile apply requires the extension mode and that profile mode to both be `apply`.
+- Errors, image-bearing results, unconfigured tools, malformed/failed profile runs, storage failures, and cancellation pass through unchanged.
+
+The default eligible tools are `read,bash`; change the comma-separated **Tool Output Compression → Eligible tools** setting in `/pi-tools` to opt in other text tools. Storage defaults to `~/.pi/agent/tool-output-compression.sqlite`, uses WAL and full synchronous durability, and exposes a raw-storage budget in MiB plus retention. Stored output is private to the creating session and can be recovered by the agent with `retrieve_tool_output` when a compression reference provides its id.
+
+Use `/tool-output` for session savings, profile candidates/bypasses, and storage status. `/tool-output prune` removes expired output; `/tool-output vacuum` compacts the SQLite database. Profile compactness is compared against Pi's visible result (including a truncated tail), not against the recovered raw stream, so it never expands model context. JSON raw recovery begins with bounded binary head/tail probing and captures the complete artifact only after a positive JSON shape signal. Raw retrieval remains session-scoped through `retrieve_tool_output`.
+
 ## Configuration
 
 pi-tools extensions share a versioned JSON configuration system. Defaults are overridden by the global file, then by a trusted project override:

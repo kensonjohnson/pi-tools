@@ -1,0 +1,4 @@
+src/core.ts:7:needle in source
+src/core.ts:8:another needle
+src/core.ts:12:third needle
+README.md:3:needle in documentation

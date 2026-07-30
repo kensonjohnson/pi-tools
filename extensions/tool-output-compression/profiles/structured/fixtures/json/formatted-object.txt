@@ -1,0 +1,9 @@
+{
+  "id": 42,
+  "message": "hello world",
+  "escaped": "quote: \"; slash: \\; newline: \n; unicode-space: \u0020",
+  "number": 1.00,
+  "negativeZero": -0,
+  "scientific": 1e+3,
+  "unicode": "café"
+}

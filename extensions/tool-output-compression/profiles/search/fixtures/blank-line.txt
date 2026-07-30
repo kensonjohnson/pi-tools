@@ -1,0 +1,3 @@
+src/a.ts:1:needle
+
+src/a.ts:2:needle

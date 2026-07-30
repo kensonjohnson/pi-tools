@@ -1,0 +1,7 @@
+=== RUN   TestOne
+--- PASS: TestOne (0.00s)
+PASS
+ok      example/internal/one (cached)
+
+ RUN  v1.0.0 /workspace
+ ✓ web.test.ts (1)

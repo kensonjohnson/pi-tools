@@ -1,0 +1,4 @@
+src/a.ts:1:needle
+src/a.ts:2:needle
+src/b.ts:4:needle
+src/a.ts:9:needle
