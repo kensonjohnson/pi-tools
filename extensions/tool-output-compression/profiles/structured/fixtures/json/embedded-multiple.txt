@@ -1,0 +1,11 @@
+first payload:
+{
+  "id": 1,
+  "state": "ready"
+}
+progress: 50%
+[
+  { "id": 2 },
+  { "id": 3 }
+]
+finished

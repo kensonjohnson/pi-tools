@@ -1,0 +1,3 @@
+ { "id" : 1, "message" : "first record" }
+[ 2, 3, { "nested" : true } ]
+{"id":3,"escaped":"\u0020 stays escaped"}

@@ -1,0 +1,11 @@
+{
+  "root": {
+    "branch": [
+      {
+        "child": {
+          "leaf": [ 0, { "enabled": true } ]
+        }
+      }
+    ]
+  }
+}

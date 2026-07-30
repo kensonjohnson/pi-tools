@@ -60,6 +60,14 @@ test("registers settings and observes tool results without patching them", async
       description:
         "Observe candidates without persistence; Apply stores raw output before replacing a verified result.",
     });
+    assert.deepEqual(definition.fields["profiles.structured.json.mode"], {
+      type: "enum",
+      default: "observe",
+      values: ["off", "observe", "apply"],
+      label: "JSON/JSONL profile",
+      description:
+        "Observe candidates without persistence; Apply stores raw output before replacing a verified result.",
+    });
 
     const notifications: string[] = [];
     const ctx = {
@@ -109,12 +117,46 @@ test("registers settings and observes tool results without patching them", async
     assert.equal(await handlers.get("tool_result")?.(verbose, ctx), undefined);
     assert.deepEqual(verbose, verboseBefore);
 
+    const fullJsonPath = join(root, "json-full.txt");
+    const fullJson = [
+      "{",
+      '  "items": [',
+      ...Array.from(
+        { length: 50 },
+        (_, index) => `    { "index": ${index}, "message": "item ${index}" },`,
+      ),
+      '    { "index": 50, "message": "item 50" }',
+      "  ]",
+      "}",
+    ].join("\n");
+    await writeFile(fullJsonPath, fullJson, "utf8");
+    const jsonObserve = {
+      toolCallId: "json-observe",
+      toolName: "bash",
+      content: [
+        {
+          type: "text" as const,
+          text: "Pi native truncated tail without JSON markers\n".repeat(30),
+        },
+      ],
+      isError: false,
+      details: { fullOutputPath: fullJsonPath },
+    };
+    assert.equal(
+      await handlers.get("tool_result")?.(jsonObserve, ctx),
+      undefined,
+    );
+
     await commands.get("tool-output")?.handler("", ctx);
     assert.equal(notifications.length, 1);
     assert.match(notifications[0] ?? "", /Eligible tool output/);
     assert.match(notifications[0] ?? "", /Go test \(OBSERVE\)/);
     assert.match(notifications[0] ?? "", /Go test \(OBSERVE\) · 1 candidates/);
     assert.match(notifications[0] ?? "", /Vitest \(OBSERVE\) · 0 candidates/);
+    assert.match(
+      notifications[0] ?? "",
+      /JSON\/JSONL \(OBSERVE\) · 1 candidates/,
+    );
     const database = new Database(
       join(root, "agent", "tool-output-compression.sqlite"),
       { readonly: true },

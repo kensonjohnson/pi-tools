@@ -33,7 +33,7 @@ import {
 } from "./dashboard.ts";
 import { OUTPUT_PROFILES } from "./profiles/registry.ts";
 import type { OutputProfile } from "./profiles/types.ts";
-import { captureBashRawOutput } from "./raw-capture.ts";
+import { captureBashRawOutput, probeBashRawOutput } from "./raw-capture.ts";
 import { RETRIEVE_TOOL_OUTPUT_NAME, registerRetrieveTool } from "./retrieve.ts";
 import {
   DEFAULT_MAX_OUTPUT_BYTES,
@@ -52,6 +52,7 @@ const RETRIEVAL_TOOL_NAMES = [RETRIEVE_TOOL_OUTPUT_NAME] as const;
 const PROFILE_REFERENCE_ID_PLACEHOLDER = "0".repeat(36);
 const MEBIBYTE = 1_024 * 1_024;
 const DEFAULT_STORAGE_MAX_MIB = DEFAULT_STORAGE_MAX_BYTES / MEBIBYTE;
+const RAW_OUTPUT_PROBE_BYTES = 8 * 1_024;
 
 const tracker = new ObservationTracker();
 let settings: CompressionSettings = {
@@ -206,18 +207,46 @@ async function applyProfiles(
   ctx: ExtensionContext,
   output: ClassifiedTextResult,
 ): Promise<{ content: Array<{ type: "text"; text: string }> } | undefined> {
-  const candidates = OUTPUT_PROFILES.filter(
+  let candidates = OUTPUT_PROFILES.filter(
     (profile) =>
       profile.toolNames.includes(event.toolName) &&
       resolveProfileMode(settings, profile.id) !== "off" &&
       profile.mayMatch(output.content),
   );
-  if (candidates.length === 0) return undefined;
 
   // Current profiles are bash profiles. Keep full-output recovery owned by the
   // engine so every future bash grammar shares its cancellation/size rules.
   if (event.toolName !== "bash") return undefined;
   try {
+    const probeProfiles = OUTPUT_PROFILES.filter(
+      (profile) =>
+        profile.toolNames.includes(event.toolName) &&
+        resolveProfileMode(settings, profile.id) !== "off" &&
+        profile.mayMatchRecoveredRaw !== undefined,
+    );
+    if (probeProfiles.length > 0) {
+      const probe = await probeBashRawOutput(
+        event.details,
+        storageSettings.maxOutputBytes,
+        RAW_OUTPUT_PROBE_BYTES,
+        ctx.signal,
+      );
+      if (probe) {
+        const recoveredCandidates = probeProfiles.filter((profile) =>
+          profile.mayMatchRecoveredRaw!(probe),
+        );
+        candidates = Array.from(
+          new Map(
+            [...candidates, ...recoveredCandidates].map((profile) => [
+              profile.id,
+              profile,
+            ]),
+          ).values(),
+        );
+      }
+    }
+    if (candidates.length === 0) return undefined;
+
     const raw = await captureBashRawOutput(
       event.details,
       output.content,
@@ -232,8 +261,13 @@ async function applyProfiles(
         continue;
       }
 
+      const renderOptions = {
+        visibleBytes: output.outputBytes,
+        rawSource: raw.source,
+      } as const;
       const compactCandidate = analysis.render(
         PROFILE_REFERENCE_ID_PLACEHOLDER,
+        renderOptions,
       );
       const compactBytes = Buffer.byteLength(compactCandidate, "utf8");
       tracker.recordProfileCandidate(profile.id, {
@@ -271,7 +305,7 @@ async function applyProfiles(
         },
         ctx.signal,
       );
-      const compact = analysis.render(stored.id);
+      const compact = analysis.render(stored.id, renderOptions);
       if (!isSmallerThanVisible(output.content, compact)) return undefined;
 
       tracker.recordProfileApplied(

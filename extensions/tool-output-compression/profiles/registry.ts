@@ -1,3 +1,4 @@
+import { jsonProfile } from "./structured/json.ts";
 import { goTestProfile } from "./test/go.ts";
 import { vitestProfile } from "./test/vitest.ts";
 import type { OutputProfile } from "./types.ts";
@@ -5,6 +6,7 @@ import type { OutputProfile } from "./types.ts";
 export const OUTPUT_PROFILES: readonly OutputProfile[] = [
   goTestProfile,
   vitestProfile,
+  jsonProfile,
 ];
 
 export function profileById(id: string): OutputProfile | undefined {

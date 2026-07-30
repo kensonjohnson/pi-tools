@@ -122,6 +122,13 @@ test("resolves generic profile modes under the global safety mode", () => {
     ),
     "off",
   );
+  assert.equal(
+    resolveProfileMode(
+      { ...observeSettings, mode: "apply", profileModes: { json: "off" } },
+      "json",
+    ),
+    "off",
+  );
 });
 
 test("uses configured tools and RTK-style token estimates", () => {

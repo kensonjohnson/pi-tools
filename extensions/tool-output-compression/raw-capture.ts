@@ -1,4 +1,4 @@
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, open, readFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 
 export type RawOutputSource = "visible" | "full-output-path";
@@ -6,6 +6,13 @@ export type RawOutputSource = "visible" | "full-output-path";
 export type CapturedRawOutput = {
   content: string;
   source: RawOutputSource;
+};
+
+/** Bounded binary evidence for deciding whether full raw capture is worthwhile. */
+export type RawOutputProbe = {
+  byteLength: number;
+  head: Buffer;
+  tail: Buffer;
 };
 
 export class RawOutputCaptureError extends Error {
@@ -58,6 +65,66 @@ export async function captureBashRawOutput(
       });
     }
     throw new RawOutputCaptureError("Could not read Pi full output.", {
+      cause: error,
+    });
+  }
+}
+
+/**
+ * Reads only the beginning and end of Pi's full-output artifact. Probe bytes
+ * remain binary so an arbitrary chunk boundary can never introduce malformed
+ * UTF-8 into a later parser decision.
+ */
+export async function probeBashRawOutput(
+  details: unknown,
+  maxBytes: number,
+  probeBytes: number,
+  signal?: AbortSignal,
+): Promise<RawOutputProbe | undefined> {
+  throwIfAborted(signal);
+  if (!Number.isSafeInteger(probeBytes) || probeBytes <= 0) {
+    throw new RawOutputCaptureError("Raw-output probe size is invalid.");
+  }
+  const fullOutputPath = getFullOutputPath(details);
+  if (!fullOutputPath) return undefined;
+
+  try {
+    const file = await lstat(fullOutputPath);
+    if (!file.isFile() || file.isSymbolicLink()) {
+      throw new RawOutputCaptureError("Pi full output is not a regular file.");
+    }
+    if (file.size > maxBytes) {
+      throw new RawOutputCaptureError(
+        `Pi full output is ${file.size} bytes, above the configured per-output limit.`,
+      );
+    }
+
+    const handle = await open(fullOutputPath, "r");
+    try {
+      const length = Math.min(probeBytes, file.size);
+      const head = Buffer.alloc(length);
+      const tail = Buffer.alloc(length);
+      const [headResult, tailResult] = await Promise.all([
+        handle.read(head, 0, length, 0),
+        handle.read(tail, 0, length, Math.max(0, file.size - length)),
+      ]);
+      throwIfAborted(signal);
+      return {
+        byteLength: file.size,
+        head: head.subarray(0, headResult.bytesRead),
+        tail: tail.subarray(0, tailResult.bytesRead),
+      };
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if (error instanceof RawOutputCaptureError) throw error;
+    if (signal?.aborted) {
+      throw new RawOutputCaptureError("Pi full-output probe was cancelled.", {
+        cause: error,
+      });
+    }
+    throw new RawOutputCaptureError("Could not probe Pi full output.", {
       cause: error,
     });
   }
