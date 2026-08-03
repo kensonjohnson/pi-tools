@@ -1,0 +1,25 @@
+name: Code search
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  native-worker:
+    name: Native worker (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      # The test suite needs no dev-only package, so this one clean production
+      # install both validates packaging dependencies and exercises native code.
+      - run: npm ci --omit=dev
+      - run: npm run test:code-search
+      - run: npm run verify:package

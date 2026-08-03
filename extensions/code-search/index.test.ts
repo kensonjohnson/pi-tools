@@ -9,14 +9,20 @@ import { CODE_SEARCH_SETTINGS, CODE_SEARCH_TOOL_NAMES } from "./settings.ts";
 test("trust-gates code-search settings and active tools", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-tools-code-search-"));
   const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  let shutdown: (() => unknown) | undefined;
   process.env.PI_CODING_AGENT_DIR = join(root, "agent");
 
   try {
     const { default: extension } = await import("./index.ts");
     const handlers = new Map<string, (event: unknown, ctx: any) => unknown>();
+    shutdown = () => handlers.get("session_shutdown")?.({}, {});
     const tools = new Map<
       string,
       { execute: (...args: any[]) => Promise<any> }
+    >();
+    const commands = new Map<
+      string,
+      { handler: (args: string, ctx: any) => Promise<void> }
     >();
     const settingsHandlers = new Map<string, (event: unknown) => void>();
     const definitions: unknown[] = [];
@@ -39,7 +45,12 @@ test("trust-gates code-search settings and active tools", async () => {
         tools.set(tool.name, tool);
         active.push(tool.name);
       },
-      registerCommand() {},
+      registerCommand(
+        name: string,
+        command: { handler: (args: string, ctx: any) => Promise<void> },
+      ) {
+        commands.set(name, command);
+      },
       getActiveTools: () => active,
       setActiveTools(toolNames: string[]) {
         active = toolNames;
@@ -86,6 +97,15 @@ test("trust-gates code-search settings and active tools", async () => {
       "other_extension_tool",
       ...CODE_SEARCH_TOOL_NAMES,
     ]);
+    const notices: string[] = [];
+    const commandContext = {
+      ui: { notify: (message: string) => notices.push(message) },
+    };
+    await commands.get("code-search")!.handler("", commandContext);
+    await commands.get("code-search")!.handler("prune", commandContext);
+    assert.match(notices[0], /Code Search/);
+    assert.match(notices[0], /Aggregate-only local metrics/);
+    assert.match(notices[1], /Pruned \d+ expired code-search metric rows?/);
 
     await writeFile(
       projectConfig,
@@ -114,7 +134,9 @@ test("trust-gates code-search settings and active tools", async () => {
       { cwd, isProjectTrusted: () => true },
     );
     assert.deepEqual(active, ["read", "other_extension_tool"]);
+    await handlers.get("session_shutdown")?.({}, {});
   } finally {
+    await shutdown?.();
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
     await rm(root, { recursive: true, force: true });
