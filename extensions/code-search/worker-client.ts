@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import {
   CODE_SEARCH_PROTOCOL_VERSION,
+  type CodeSearchLocatedSymbol,
   type CodeSearchSymbol,
   type CodeSearchWorkerRequest,
   type CodeSearchWorkerResponse,
@@ -87,6 +88,7 @@ export class CodeSearchWorkerClient {
     limit: number;
     path?: string;
     kind?: string;
+    fuzzy?: boolean;
     signal?: AbortSignal;
   }): Promise<CodeSearchSymbol[]> {
     const { signal, ...request } = options;
@@ -106,6 +108,17 @@ export class CodeSearchWorkerClient {
       { path },
       signal,
     )) as CodeSearchSymbol[];
+  }
+
+  async symbolsByIds(
+    ids: string[],
+    signal?: AbortSignal,
+  ): Promise<CodeSearchLocatedSymbol[]> {
+    return (await this.request(
+      "symbolsByIds",
+      { ids },
+      signal,
+    )) as CodeSearchLocatedSymbol[];
   }
 
   async close(): Promise<void> {

@@ -11,6 +11,7 @@ import {
   CODE_SEARCH_PROTOCOL_VERSION,
   type CodeSearchCoverage,
   type CodeSearchFile,
+  type CodeSearchLocatedSymbol,
   type CodeSearchSymbol,
   type CodeSearchWorkerRequest,
   type CodeSearchWorkerResponse,
@@ -650,12 +651,18 @@ function symbolsForQuery(
   limit: number,
   path?: string,
   kind?: string,
+  fuzzy = false,
 ): CodeSearchSymbol[] {
-  const clauses = [
-    "(name LIKE ? ESCAPE '\\' OR qualified_name LIKE ? ESCAPE '\\')",
-  ];
-  const escaped = `%${query.replace(/[\\%_]/g, "\\$&")}%`;
-  const parameters: Array<string | number> = [escaped, escaped];
+  const resultLimit = Math.max(1, Math.min(100, Math.floor(limit)));
+  const clauses: string[] = [];
+  const parameters: string[] = [];
+  if (!fuzzy) {
+    clauses.push(
+      "(name LIKE ? ESCAPE '\\' OR qualified_name LIKE ? ESCAPE '\\')",
+    );
+    const escaped = `%${query.replace(/[\\%_]/g, "\\$&")}%`;
+    parameters.push(escaped, escaped);
+  }
   if (path) {
     clauses.push("path = ?");
     parameters.push(path);
@@ -664,26 +671,64 @@ function symbolsForQuery(
     clauses.push("kind = ?");
     parameters.push(kind);
   }
-  parameters.push(Math.max(1, Math.min(100, Math.floor(limit))));
   const rows = requireDatabase()
     .prepare(
       `
       SELECT id, path, language, name, qualified_name, kind, parent_id,
              start_byte, end_byte, start_line, start_column, end_line, end_column,
              parse_has_error
-      FROM symbols WHERE ${clauses.join(" AND ")}
-      ORDER BY CASE WHEN name = ? THEN 0 WHEN qualified_name = ? THEN 1 ELSE 2 END,
-               length(qualified_name), path, start_byte
+      FROM symbols WHERE ${clauses.length ? clauses.join(" AND ") : "1"}
+      ORDER BY length(qualified_name), path, start_byte
       LIMIT ?
     `,
     )
-    .all(
-      ...parameters.slice(0, -1),
-      query,
-      query,
-      parameters.at(-1),
-    ) as SymbolRow[];
-  return rows.map(symbolRow);
+    .all(...parameters, fuzzy ? 1_000 : resultLimit) as SymbolRow[];
+  if (!fuzzy) {
+    return rows
+      .sort((left, right) => lexicalOrder(left, right, query))
+      .map(symbolRow);
+  }
+  return rows
+    .map((row) => ({ row, score: fuzzyScore(query, row.qualified_name) }))
+    .filter((candidate) => candidate.score >= 0)
+    .sort(
+      (left, right) =>
+        right.score - left.score || lexicalOrder(left.row, right.row, query),
+    )
+    .slice(0, resultLimit)
+    .map((candidate) => symbolRow(candidate.row));
+}
+
+function lexicalOrder(
+  left: SymbolRow,
+  right: SymbolRow,
+  query: string,
+): number {
+  const leftRank =
+    left.name === query ? 0 : left.qualified_name === query ? 1 : 2;
+  const rightRank =
+    right.name === query ? 0 : right.qualified_name === query ? 1 : 2;
+  return (
+    leftRank - rightRank ||
+    left.qualified_name.length - right.qualified_name.length ||
+    (left.path < right.path ? -1 : left.path > right.path ? 1 : 0) ||
+    left.start_byte - right.start_byte
+  );
+}
+
+function fuzzyScore(query: string, candidate: string): number {
+  const needle = query.replace(/[^a-z0-9]/gi, "").toLowerCase();
+  const haystack = candidate.replace(/[^a-z0-9]/gi, "").toLowerCase();
+  if (!needle) return -1;
+  let cursor = 0;
+  let gap = 0;
+  for (const character of needle) {
+    const found = haystack.indexOf(character, cursor);
+    if (found < 0) return -1;
+    gap += found - cursor;
+    cursor = found + 1;
+  }
+  return needle.length * 100 - gap - (haystack.length - needle.length);
 }
 
 type SymbolRow = {
@@ -719,6 +764,45 @@ function symbolRow(row: SymbolRow): CodeSearchSymbol {
     endLine: row.end_line,
     endColumn: row.end_column,
     parseHasError: row.parse_has_error === 1,
+  };
+}
+
+function symbolsByIds(ids: string[]): CodeSearchLocatedSymbol[] {
+  const uniqueIds = [...new Set(ids)].slice(0, 100);
+  if (uniqueIds.length === 0) return [];
+  const placeholders = uniqueIds.map(() => "?").join(", ");
+  const rows = requireDatabase()
+    .prepare(
+      `
+      SELECT s.id, s.path, s.language, s.name, s.qualified_name, s.kind, s.parent_id,
+             s.start_byte, s.end_byte, s.start_line, s.start_column, s.end_line,
+             s.end_column, s.parse_has_error, f.content_hash, f.size_bytes,
+             f.mtime_ms, f.line_count, f.indexed_at_ms
+      FROM symbols s
+      JOIN indexed_files f ON f.path = s.path
+      WHERE s.id IN (${placeholders})
+    `,
+    )
+    .all(...uniqueIds) as LocatedSymbolRow[];
+  return rows.map(locatedSymbolRow);
+}
+
+type LocatedSymbolRow = SymbolRow & {
+  content_hash: string;
+  size_bytes: number;
+  mtime_ms: number;
+  line_count: number;
+  indexed_at_ms: number;
+};
+
+function locatedSymbolRow(row: LocatedSymbolRow): CodeSearchLocatedSymbol {
+  return {
+    ...symbolRow(row),
+    contentHash: row.content_hash,
+    sizeBytes: row.size_bytes,
+    mtimeMs: row.mtime_ms,
+    lineCount: row.line_count,
+    indexedAtMs: row.indexed_at_ms,
   };
 }
 
@@ -803,7 +887,12 @@ function scheduleWatchRefresh(): void {
 
 async function handle(
   request: Exclude<CodeSearchWorkerRequest, { type: "cancel" }>,
-): Promise<CodeSearchWorkerStatus | CodeSearchSymbol[] | { closed: true }> {
+): Promise<
+  | CodeSearchWorkerStatus
+  | CodeSearchSymbol[]
+  | CodeSearchLocatedSymbol[]
+  | { closed: true }
+> {
   if (request.type === "initialize") {
     ensureStore(request.storagePath, request.root);
     hasCompletedRefresh = false;
@@ -834,11 +923,16 @@ async function handle(
       request.limit,
       request.path,
       request.kind,
+      request.fuzzy,
     );
   }
   if (request.type === "fileSymbols") {
     checkCancelled(request.id);
     return fileSymbols(request.path);
+  }
+  if (request.type === "symbolsByIds") {
+    checkCancelled(request.id);
+    return symbolsByIds(request.ids);
   }
   if (request.type === "close") {
     watchOptions = undefined;

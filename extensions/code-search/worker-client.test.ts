@@ -193,6 +193,29 @@ test("worker extracts AST symbols and spans for every supported language", async
     );
     assert.equal(types[4]?.parentId, types[3]?.id);
     assert.equal(types[5]?.parentId, types[3]?.id);
+    const located = await worker.symbolsByIds([
+      types[3]!.id,
+      "missing-symbol-id",
+    ]);
+    assert.deepEqual(
+      located.map((symbol) => symbol.id),
+      [types[3]!.id],
+    );
+    assert.equal(located[0]?.contentHash.length, 64);
+    assert.equal(
+      located[0]?.sizeBytes,
+      Buffer.byteLength(await readFile(join(root, "types.ts"))),
+    );
+    assert.deepEqual(
+      (
+        await worker.searchSymbols({
+          query: "Srvc",
+          fuzzy: true,
+          limit: 10,
+        })
+      ).map((symbol) => symbol.name),
+      ["Service"],
+    );
     assert.deepEqual(
       (await worker.fileSymbols("view.tsx")).map((symbol) => [
         symbol.name,

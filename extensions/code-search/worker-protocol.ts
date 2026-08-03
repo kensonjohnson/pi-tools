@@ -1,4 +1,4 @@
-export const CODE_SEARCH_PROTOCOL_VERSION = 2;
+export const CODE_SEARCH_PROTOCOL_VERSION = 4;
 
 export type CodeSearchCoverage = {
   indexedFiles: number;
@@ -47,6 +47,12 @@ export type CodeSearchFile = {
   indexedAtMs: number;
 };
 
+export type CodeSearchLocatedSymbol = CodeSearchSymbol &
+  Pick<
+    CodeSearchFile,
+    "contentHash" | "sizeBytes" | "mtimeMs" | "lineCount" | "indexedAtMs"
+  >;
+
 export type CodeSearchWorkerRequest =
   | {
       version: typeof CODE_SEARCH_PROTOCOL_VERSION;
@@ -85,12 +91,19 @@ export type CodeSearchWorkerRequest =
       limit: number;
       path?: string;
       kind?: string;
+      fuzzy?: boolean;
     }
   | {
       version: typeof CODE_SEARCH_PROTOCOL_VERSION;
       id: string;
       type: "fileSymbols";
       path: string;
+    }
+  | {
+      version: typeof CODE_SEARCH_PROTOCOL_VERSION;
+      id: string;
+      type: "symbolsByIds";
+      ids: string[];
     }
   | {
       version: typeof CODE_SEARCH_PROTOCOL_VERSION;
@@ -108,7 +121,11 @@ export type CodeSearchWorkerResponse =
       version: typeof CODE_SEARCH_PROTOCOL_VERSION;
       id: string;
       ok: true;
-      result: CodeSearchWorkerStatus | CodeSearchSymbol[] | { closed: true };
+      result:
+        | CodeSearchWorkerStatus
+        | CodeSearchSymbol[]
+        | CodeSearchLocatedSymbol[]
+        | { closed: true };
     }
   | {
       version: typeof CODE_SEARCH_PROTOCOL_VERSION;

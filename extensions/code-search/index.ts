@@ -2,7 +2,6 @@ import {
   CONFIG_DIR_NAME,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
 import { join } from "node:path";
 import {
   getSettingValue,
@@ -17,6 +16,10 @@ import {
   resolveCodeSearchMode,
   type CodeSearchMode,
 } from "./settings.ts";
+import {
+  registerCodeSearchTools,
+  type CodeSearchToolRuntime,
+} from "./tools.ts";
 
 function removeCodeSearchTools(pi: ExtensionAPI): void {
   const codeSearchTools = new Set<string>(CODE_SEARCH_TOOL_NAMES);
@@ -31,72 +34,47 @@ function addCodeSearchTools(pi: ExtensionAPI): void {
   ]);
 }
 
-function unavailableResult(mode: CodeSearchMode) {
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text:
-          mode === "observe"
-            ? "Code search is in observe mode; set code-search.mode to apply to expose retrieval tools."
-            : "Code search runtime is not available.",
-      },
-    ],
-    details: { mode },
-    isError: true,
-  };
-}
-
 export default function (pi: ExtensionAPI) {
   let mode: CodeSearchMode = "off";
-  let worker: CodeSearchWorkerClient | undefined;
+  let runtime: CodeSearchToolRuntime | undefined;
 
   async function stopWorker(): Promise<void> {
-    const current = worker;
-    worker = undefined;
-    await current?.close();
+    const current = runtime;
+    runtime = undefined;
+    await current?.worker.close();
   }
 
   function startWorker(
-    cwd: string,
-    additionalIgnores: string,
+    next: CodeSearchToolRuntime,
     watchEnabled: boolean,
   ): void {
-    const current = new CodeSearchWorkerClient();
-    worker = current;
-    void current
+    runtime = next;
+    void next.worker
       .initialize(
-        join(cwd, CONFIG_DIR_NAME, "code-search", "index.sqlite"),
-        cwd,
+        join(next.root, CONFIG_DIR_NAME, "code-search", "index.sqlite"),
+        next.root,
       )
-      .then(() => current.refresh({ root: cwd, additionalIgnores }))
       .then(() =>
-        current.watch({ root: cwd, additionalIgnores, enabled: watchEnabled }),
+        next.worker.refresh({
+          root: next.root,
+          additionalIgnores: next.additionalIgnores,
+        }),
+      )
+      .then(() =>
+        next.worker.watch({
+          root: next.root,
+          additionalIgnores: next.additionalIgnores,
+          enabled: watchEnabled,
+        }),
       )
       .catch(async () => {
-        if (worker === current) worker = undefined;
-        await current.close();
+        if (runtime === next) runtime = undefined;
+        await next.worker.close();
       });
   }
 
   publishExtensionSettings(pi.events, CODE_SEARCH_SETTINGS);
-
-  for (const [name, label] of [
-    ["code_search", "Code Search"],
-    ["code_outline", "Code Outline"],
-    ["code_get", "Get Code"],
-    ["code_context", "Code Context"],
-  ] as const) {
-    pi.registerTool({
-      name,
-      label,
-      description: "AST-aware local code navigation (initializing).",
-      parameters: Type.Object({}),
-      async execute() {
-        return unavailableResult(mode);
-      },
-    });
-  }
+  registerCodeSearchTools(pi, () => (mode === "apply" ? runtime : undefined));
 
   pi.on("session_start", async (_event, ctx) => {
     await stopWorker();
@@ -115,21 +93,60 @@ export default function (pi: ExtensionAPI) {
     );
     if (mode === "apply") addCodeSearchTools(pi);
     else removeCodeSearchTools(pi);
-    if (mode !== "off") {
-      startWorker(
-        ctx.cwd,
-        String(
+    if (mode === "off") return;
+
+    startWorker(
+      {
+        root: ctx.cwd,
+        additionalIgnores: String(
           getSettingValue(
             settings,
             CODE_SEARCH_EXTENSION_ID,
             "index.additionalIgnores",
           ),
         ),
-        Boolean(
-          getSettingValue(settings, CODE_SEARCH_EXTENSION_ID, "index.watch"),
+        outputStyle:
+          getSettingValue(
+            settings,
+            CODE_SEARCH_EXTENSION_ID,
+            "output.style",
+          ) === "structured"
+            ? "structured"
+            : "compact",
+        searchMaxResults: Number(
+          getSettingValue(
+            settings,
+            CODE_SEARCH_EXTENSION_ID,
+            "search.maxResults",
+          ),
         ),
-      );
-    }
+        searchTokenBudget: Number(
+          getSettingValue(
+            settings,
+            CODE_SEARCH_EXTENSION_ID,
+            "search.tokenBudget",
+          ),
+        ),
+        retrievalTokenBudget: Number(
+          getSettingValue(
+            settings,
+            CODE_SEARCH_EXTENSION_ID,
+            "retrieval.tokenBudget",
+          ),
+        ),
+        contextTokenBudget: Number(
+          getSettingValue(
+            settings,
+            CODE_SEARCH_EXTENSION_ID,
+            "context.tokenBudget",
+          ),
+        ),
+        worker: new CodeSearchWorkerClient(),
+      },
+      Boolean(
+        getSettingValue(settings, CODE_SEARCH_EXTENSION_ID, "index.watch"),
+      ),
+    );
   });
 
   pi.on("session_shutdown", async () => {

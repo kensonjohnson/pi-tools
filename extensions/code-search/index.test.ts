@@ -14,7 +14,10 @@ test("trust-gates code-search settings and active tools", async () => {
   try {
     const { default: extension } = await import("./index.ts");
     const handlers = new Map<string, (event: unknown, ctx: any) => unknown>();
-    const tools = new Map<string, { execute: () => Promise<any> }>();
+    const tools = new Map<
+      string,
+      { execute: (...args: any[]) => Promise<any> }
+    >();
     const settingsHandlers = new Map<string, (event: unknown) => void>();
     const definitions: unknown[] = [];
     let active = ["read", "other_extension_tool"];
@@ -54,7 +57,14 @@ test("trust-gates code-search settings and active tools", async () => {
     );
     assert.deepEqual(active, ["read", "other_extension_tool"]);
     await assert.rejects(access(join(cwd, ".pi")));
-    assert.equal((await tools.get("code_search")!.execute()).isError, true);
+    assert.equal(
+      (
+        await tools.get("code_search")!.execute("", {}, undefined, undefined, {
+          isProjectTrusted: () => false,
+        })
+      ).isError,
+      true,
+    );
 
     const projectConfig = join(cwd, ".pi", "pi-tools.json");
     await mkdir(join(cwd, ".pi"), { recursive: true });
