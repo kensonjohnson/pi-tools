@@ -65,7 +65,10 @@ export default function (pi: ExtensionAPI) {
     const current = new CodeSearchWorkerClient();
     worker = current;
     void current
-      .initialize(join(cwd, CONFIG_DIR_NAME, "code-search", "index.sqlite"))
+      .initialize(
+        join(cwd, CONFIG_DIR_NAME, "code-search", "index.sqlite"),
+        cwd,
+      )
       .then(() => current.refresh({ root: cwd, additionalIgnores }))
       .then(() =>
         current.watch({ root: cwd, additionalIgnores, enabled: watchEnabled }),

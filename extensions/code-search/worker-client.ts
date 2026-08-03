@@ -55,8 +55,11 @@ export class CodeSearchWorkerClient {
     });
   }
 
-  async initialize(storagePath: string): Promise<CodeSearchWorkerStatus> {
-    return this.requestStatus("initialize", { storagePath });
+  async initialize(
+    storagePath: string,
+    root: string,
+  ): Promise<CodeSearchWorkerStatus> {
+    return this.requestStatus("initialize", { storagePath, root });
   }
 
   async status(): Promise<CodeSearchWorkerStatus> {

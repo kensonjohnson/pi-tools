@@ -1,4 +1,4 @@
-export const CODE_SEARCH_PROTOCOL_VERSION = 1;
+export const CODE_SEARCH_PROTOCOL_VERSION = 2;
 
 export type CodeSearchCoverage = {
   indexedFiles: number;
@@ -9,9 +9,13 @@ export type CodeSearchCoverage = {
   skippedUnreadable: number;
 };
 
+export type CodeSearchIndexFreshness =
+  "fresh" | "refreshing" | "partial" | "degraded";
+
 export type CodeSearchWorkerStatus = {
   ready: boolean;
   watching: boolean;
+  freshness: CodeSearchIndexFreshness;
   coverage: CodeSearchCoverage;
 };
 
@@ -49,6 +53,7 @@ export type CodeSearchWorkerRequest =
       id: string;
       type: "initialize";
       storagePath: string;
+      root: string;
     }
   | {
       version: typeof CODE_SEARCH_PROTOCOL_VERSION;

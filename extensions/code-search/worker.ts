@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync } from "node:fs";
 import { watch, type FSWatcher } from "node:fs";
 import { lstat, readFile, readdir } from "node:fs/promises";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { parentPort } from "node:worker_threads";
 import Database from "better-sqlite3";
 import ignore from "ignore";
@@ -69,6 +69,10 @@ type WatchOptions = {
 };
 
 let database: Database.Database | undefined;
+let projectRoot: string | undefined;
+let hasCompletedRefresh = false;
+let refreshInProgress = false;
+let lastRefreshError: string | undefined;
 let requestChain = Promise.resolve();
 const cancelled = new Set<string>();
 const languageCache = new Map<LanguageName, Promise<unknown>>();
@@ -113,7 +117,20 @@ function emptyCoverage(): CodeSearchCoverage {
   };
 }
 
-function ensureStore(storagePath: string): void {
+function ensureStore(storagePath: string, root: string): void {
+  const normalizedRoot = resolve(root);
+  const expectedStoragePath = join(
+    normalizedRoot,
+    ".pi",
+    "code-search",
+    "index.sqlite",
+  );
+  if (resolve(storagePath) !== expectedStoragePath) {
+    throw new Error(
+      "Code-search storage must be under the current project root.",
+    );
+  }
+  projectRoot = normalizedRoot;
   mkdirSync(dirname(storagePath), { recursive: true, mode: 0o700 });
   database = new Database(storagePath);
   database.pragma("busy_timeout = 2000");
@@ -166,6 +183,15 @@ function ensureStore(storagePath: string): void {
   secureStorageFile(`${storagePath}-shm`);
 }
 
+function requireProjectRoot(root: string): string {
+  if (!projectRoot || resolve(root) !== projectRoot) {
+    throw new Error(
+      "Code-search requests are limited to the current project root.",
+    );
+  }
+  return projectRoot;
+}
+
 function status(): CodeSearchWorkerStatus {
   const row = database
     ?.prepare("SELECT * FROM index_coverage WHERE id = 1")
@@ -179,20 +205,38 @@ function status(): CodeSearchWorkerStatus {
         skipped_unreadable: number;
       }
     | undefined;
+  const coverage = row
+    ? {
+        indexedFiles: row.indexed_files,
+        skippedIgnored: row.skipped_ignored,
+        skippedSymlink: row.skipped_symlink,
+        skippedBinary: row.skipped_binary,
+        skippedOversize: row.skipped_oversize,
+        skippedUnreadable: row.skipped_unreadable,
+      }
+    : emptyCoverage();
   return {
     ready: Boolean(database),
     watching: watchers.length > 0,
-    coverage: row
-      ? {
-          indexedFiles: row.indexed_files,
-          skippedIgnored: row.skipped_ignored,
-          skippedSymlink: row.skipped_symlink,
-          skippedBinary: row.skipped_binary,
-          skippedOversize: row.skipped_oversize,
-          skippedUnreadable: row.skipped_unreadable,
-        }
-      : emptyCoverage(),
+    freshness: freshness(coverage),
+    coverage,
   };
+}
+
+function freshness(
+  coverage: CodeSearchCoverage,
+): CodeSearchWorkerStatus["freshness"] {
+  if (refreshInProgress) return "refreshing";
+  if (lastRefreshError) return "degraded";
+  if (!hasCompletedRefresh) return "refreshing";
+  if (
+    coverage.skippedBinary > 0 ||
+    coverage.skippedOversize > 0 ||
+    coverage.skippedUnreadable > 0
+  ) {
+    return "partial";
+  }
+  return "fresh";
 }
 
 async function addIgnoreFrame(
@@ -279,7 +323,7 @@ async function languageFor(language: LanguageName): Promise<unknown> {
 async function discover(
   request: Extract<CodeSearchWorkerRequest, { type: "refresh" | "validate" }>,
 ): Promise<DiscoveryResult> {
-  const root = request.root;
+  const root = requireProjectRoot(request.root);
   const configured = configuredIgnore(request.additionalIgnores);
   const knownFiles = new Map<string, IndexedRow>();
   for (const row of requireDatabase()
@@ -387,13 +431,15 @@ async function discover(
 async function refresh(
   request: Extract<CodeSearchWorkerRequest, { type: "refresh" | "validate" }>,
 ): Promise<CodeSearchWorkerStatus> {
-  const discovered = await discover(request);
-  checkCancelled(request.id);
-  const now = Date.now();
-  const db = requireDatabase();
-  db.exec("BEGIN IMMEDIATE");
+  refreshInProgress = true;
   try {
-    const upsertFile = db.prepare(`
+    const discovered = await discover(request);
+    checkCancelled(request.id);
+    const now = Date.now();
+    const db = requireDatabase();
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const upsertFile = db.prepare(`
       INSERT INTO indexed_files (
         path, language, content_hash, size_bytes, mtime_ms, line_count,
         parse_has_error, indexed_at_ms
@@ -407,51 +453,51 @@ async function refresh(
         parse_has_error = excluded.parse_has_error,
         indexed_at_ms = excluded.indexed_at_ms
     `);
-    const deleteSymbols = db.prepare("DELETE FROM symbols WHERE path = ?");
-    const insertSymbol = db.prepare(`
+      const deleteSymbols = db.prepare("DELETE FROM symbols WHERE path = ?");
+      const insertSymbol = db.prepare(`
       INSERT INTO symbols (
         id, path, language, name, qualified_name, kind, parent_id,
         start_byte, end_byte, start_line, start_column, end_line, end_column,
         parse_has_error
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    for (const file of discovered.files) {
-      upsertFile.run(
-        file.path,
-        file.language,
-        file.contentHash,
-        file.sizeBytes,
-        file.mtimeMs,
-        file.lineCount,
-        file.parseHasError ? 1 : 0,
-        now,
-      );
-      const symbols = discovered.symbolsByPath.get(file.path);
-      if (!symbols) continue;
-      deleteSymbols.run(file.path);
-      for (const symbol of symbols) {
-        const id = stableSymbolId(file.path, symbol);
-        insertSymbol.run(
-          id,
+      for (const file of discovered.files) {
+        upsertFile.run(
           file.path,
           file.language,
-          symbol.name,
-          symbol.qualifiedName,
-          symbol.kind,
-          symbol.parentId ?? null,
-          symbol.startByte,
-          symbol.endByte,
-          symbol.startLine,
-          symbol.startColumn,
-          symbol.endLine,
-          symbol.endColumn,
+          file.contentHash,
+          file.sizeBytes,
+          file.mtimeMs,
+          file.lineCount,
           file.parseHasError ? 1 : 0,
+          now,
         );
+        const symbols = discovered.symbolsByPath.get(file.path);
+        if (!symbols) continue;
+        deleteSymbols.run(file.path);
+        for (const symbol of symbols) {
+          const id = stableSymbolId(file.path, symbol);
+          insertSymbol.run(
+            id,
+            file.path,
+            file.language,
+            symbol.name,
+            symbol.qualifiedName,
+            symbol.kind,
+            symbol.parentId ?? null,
+            symbol.startByte,
+            symbol.endByte,
+            symbol.startLine,
+            symbol.startColumn,
+            symbol.endLine,
+            symbol.endColumn,
+            file.parseHasError ? 1 : 0,
+          );
+        }
       }
-    }
-    db.prepare("DELETE FROM indexed_files WHERE indexed_at_ms != ?").run(now);
-    db.prepare(
-      `
+      db.prepare("DELETE FROM indexed_files WHERE indexed_at_ms != ?").run(now);
+      db.prepare(
+        `
       INSERT INTO index_coverage VALUES (1, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         indexed_files = excluded.indexed_files,
@@ -462,30 +508,41 @@ async function refresh(
         skipped_unreadable = excluded.skipped_unreadable,
         updated_at_ms = excluded.updated_at_ms
     `,
-    ).run(
-      discovered.files.length,
-      discovered.coverage.skippedIgnored,
-      discovered.coverage.skippedSymlink,
-      discovered.coverage.skippedBinary,
-      discovered.coverage.skippedOversize,
-      discovered.coverage.skippedUnreadable,
-      now,
-    );
-    db.exec("COMMIT");
+      ).run(
+        discovered.files.length,
+        discovered.coverage.skippedIgnored,
+        discovered.coverage.skippedSymlink,
+        discovered.coverage.skippedBinary,
+        discovered.coverage.skippedOversize,
+        discovered.coverage.skippedUnreadable,
+        now,
+      );
+      db.exec("COMMIT");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // SQLite may already have rolled the failed transaction back.
+      }
+      throw error;
+    }
+    watchedDirectories = discovered.watchDirectories;
+    if (watchOptions) rebuildWatchers(watchedDirectories);
+    secureStorageFile(db.name);
+    secureStorageFile(`${db.name}-wal`);
+    secureStorageFile(`${db.name}-shm`);
+    hasCompletedRefresh = true;
+    lastRefreshError = undefined;
+    refreshInProgress = false;
+    return status();
   } catch (error) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // SQLite may already have rolled the failed transaction back.
+    if (!(error instanceof Error) || error.message !== "Request cancelled") {
+      lastRefreshError = error instanceof Error ? error.message : String(error);
     }
     throw error;
+  } finally {
+    refreshInProgress = false;
   }
-  watchedDirectories = discovered.watchDirectories;
-  if (watchOptions) rebuildWatchers(watchedDirectories);
-  secureStorageFile(db.name);
-  secureStorageFile(`${db.name}-wal`);
-  secureStorageFile(`${db.name}-shm`);
-  return status();
 }
 
 function extractSymbols(
@@ -748,17 +805,21 @@ async function handle(
   request: Exclude<CodeSearchWorkerRequest, { type: "cancel" }>,
 ): Promise<CodeSearchWorkerStatus | CodeSearchSymbol[] | { closed: true }> {
   if (request.type === "initialize") {
-    ensureStore(request.storagePath);
+    ensureStore(request.storagePath, request.root);
+    hasCompletedRefresh = false;
+    refreshInProgress = false;
+    lastRefreshError = undefined;
     return status();
   }
   if (request.type === "status") return status();
   if (request.type === "refresh" || request.type === "validate")
     return refresh(request);
   if (request.type === "watch") {
+    const root = requireProjectRoot(request.root);
     clearWatchers();
     watchOptions = request.enabled
       ? {
-          root: request.root,
+          root,
           additionalIgnores: request.additionalIgnores,
           maxFileBytes: request.maxFileBytes,
         }
@@ -785,6 +846,10 @@ async function handle(
     clearWatchers();
     database?.close();
     database = undefined;
+    projectRoot = undefined;
+    hasCompletedRefresh = false;
+    refreshInProgress = false;
+    lastRefreshError = undefined;
     return { closed: true };
   }
   throw new Error(

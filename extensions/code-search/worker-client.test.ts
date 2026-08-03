@@ -48,6 +48,7 @@ test("worker indexes metadata and symbols without persisting source bodies", asy
       `function visible() { return "${secret}"; }\n`,
     );
     await writeFile(join(root, "ignored.js"), "function ignored() {}\n");
+    await writeFile(join(root, "binary.js"), Buffer.from([0, 1, 2]));
     await writeFile(join(root, "broken.py"), "def incomplete(:\n");
     await writeFile(join(root, "nested", ".gitignore"), "!allowed.js\n");
     await writeFile(
@@ -68,7 +69,18 @@ test("worker indexes metadata and symbols without persisting source bodies", asy
     );
     await symlink(join(root, "kept.js"), join(root, "linked.js"));
 
-    await worker.initialize(databasePath);
+    await assert.rejects(
+      worker.initialize(join(root, "outside.sqlite"), root),
+      /storage.*project root/i,
+    );
+    assert.equal(
+      (await worker.initialize(databasePath, root)).freshness,
+      "refreshing",
+    );
+    await assert.rejects(
+      worker.validate({ root: join(root, "nested"), additionalIgnores: "" }),
+      /current project root/i,
+    );
     for (const invalidIgnore of [
       "!kept.js",
       "/kept.js",
@@ -88,6 +100,8 @@ test("worker indexes metadata and symbols without persisting source bodies", asy
     assert.equal(first.coverage.indexedFiles, 3);
     assert.equal(first.coverage.skippedIgnored, 4);
     assert.equal(first.coverage.skippedSymlink, 1);
+    assert.equal(first.coverage.skippedBinary, 1);
+    assert.equal(first.freshness, "partial");
 
     const visible = await worker.searchSymbols({ query: "visible", limit: 10 });
     assert.equal(visible.length, 1);
@@ -161,7 +175,7 @@ test("worker extracts AST symbols and spans for every supported language", async
         "package module\ntype Person struct {}\nconst X = 1\nvar Y = 2\nfunc Top() {}\n",
       ),
     ]);
-    await worker.initialize(databasePath);
+    await worker.initialize(databasePath, root);
     await worker.refresh({ root, additionalIgnores: "" });
 
     const types = await worker.fileSymbols("types.ts");
@@ -225,7 +239,7 @@ test("worker records malformed parse status and cancellation leaves no partial r
   const worker = new CodeSearchWorkerClient();
   try {
     await writeFile(join(root, "broken.py"), "def incomplete(:\n");
-    await worker.initialize(databasePath);
+    await worker.initialize(databasePath, root);
     await worker.refresh({ root, additionalIgnores: "" });
 
     const db = new Database(databasePath, { readonly: true });
@@ -282,7 +296,7 @@ test("optional watcher can be disabled and is cleaned up with the worker", async
       join(root, "watched.go"),
       "package watched\nfunc Run() {}\n",
     );
-    await worker.initialize(databasePath);
+    await worker.initialize(databasePath, root);
     await worker.refresh({ root, additionalIgnores: "" });
     const watching = await worker.watch({
       root,
