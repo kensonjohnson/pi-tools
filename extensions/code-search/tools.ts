@@ -145,11 +145,19 @@ export function registerCodeSearchTools(
           params.ids,
           signal,
         );
-        const remaining = {
-          bytes: budgetBytes(params.tokenBudget ?? runtime.contextTokenBudget),
-        };
-        const sections: string[] = [];
         const omitted: string[] = [];
+        const parentSymbols = await ancestors(runtime, symbols, signal);
+        const parentSources = await readVerifiedSources(runtime, parentSymbols);
+        if (parentSymbols.length && !parentSources) {
+          omitted.push(
+            "containing headers: source changed during verification",
+          );
+        }
+        const header = evidence("Context", status);
+        const response = new BudgetedResponse(
+          header,
+          budgetBytes(params.tokenBudget ?? runtime.contextTokenBudget),
+        );
         for (const id of params.ids) {
           const symbol = symbols.find((candidate) => candidate.id === id);
           const source = symbol ? sources.get(symbol.path) : undefined;
@@ -157,31 +165,43 @@ export function registerCodeSearchTools(
             omitted.push(`${id}: not indexed after validation`);
             continue;
           }
-          if (remaining.bytes <= 0) {
+          const result = response.addSource(symbol, source);
+          if (result === "omitted")
             omitted.push(`${symbol.qualifiedName}: budget exhausted`);
-            continue;
-          }
-          const slice = sliceUtf8(
-            source.subarray(symbol.startByte, symbol.endByte),
-            remaining.bytes,
-          );
-          remaining.bytes -= slice.bytes;
-          sections.push(sourceSection(symbol, slice));
-          if (slice.truncated)
+          if (result === "truncated")
             omitted.push(`${symbol.qualifiedName}: truncated`);
         }
-        const header = evidence("Context", status);
+        for (const statement of importStatements(sources.values())) {
+          if (!response.add(`Import\n${statement}`)) {
+            omitted.push("imports: budget exhausted");
+            break;
+          }
+        }
+        if (parentSources) {
+          for (const parent of parentSymbols) {
+            const source = parentSources.get(parent.path);
+            if (!source) continue;
+            if (
+              !response.add(
+                `Containing header\n${declarationHeader(parent, source)}`,
+              )
+            ) {
+              omitted.push("containing headers: budget exhausted");
+              break;
+            }
+          }
+        }
         const notices = omitted.length
-          ? `\nOmitted: ${omitted.join("; ")}`
+          ? `\n\nOmitted: ${omitted.join("; ")}`
           : "";
         return {
           content: [
             {
               type: "text" as const,
-              text: `${header}\n\n${sections.join("\n\n")}${notices}`,
+              text: `${response.text()}${notices}`,
             },
           ],
-          details: { status, returned: sections.length, omitted },
+          details: { status, returned: response.sections, omitted },
         };
       } catch (error) {
         return failure(error);
@@ -228,6 +248,138 @@ async function liveSymbols(
   if (!sources)
     throw new Error("Source changed during validation; retry the request.");
   return { status, symbols, sources };
+}
+
+async function ancestors(
+  runtime: CodeSearchToolRuntime,
+  selected: CodeSearchLocatedSymbol[],
+  signal: AbortSignal | undefined,
+): Promise<CodeSearchLocatedSymbol[]> {
+  const selectedIds = new Set(selected.map((symbol) => symbol.id));
+  const seen = new Set(selectedIds);
+  const result: CodeSearchLocatedSymbol[] = [];
+  let pending = selected.flatMap((symbol) =>
+    symbol.parentId ? [symbol.parentId] : [],
+  );
+  for (let depth = 0; pending.length && depth < 20; depth++) {
+    const ids = [...new Set(pending)].filter((id) => !seen.has(id));
+    if (!ids.length) break;
+    ids.forEach((id) => seen.add(id));
+    const found = await runtime.worker.symbolsByIds(ids, signal);
+    result.push(...found);
+    pending = found.flatMap((symbol) =>
+      symbol.parentId && !selectedIds.has(symbol.parentId)
+        ? [symbol.parentId]
+        : [],
+    );
+  }
+  return result;
+}
+
+class BudgetedResponse {
+  readonly #parts: string[] = [];
+  #bytes: number;
+  readonly #header: string;
+  readonly #limit: number;
+
+  constructor(header: string, limit: number) {
+    this.#header = header;
+    this.#limit = limit;
+    this.#bytes = Buffer.byteLength(this.#header);
+  }
+
+  get sections(): number {
+    return this.#parts.length;
+  }
+
+  add(content: string): boolean {
+    const separator = this.#parts.length ? "\n\n" : "\n\n";
+    const bytes = Buffer.byteLength(separator) + Buffer.byteLength(content);
+    if (this.#bytes + bytes > this.#limit) return false;
+    this.#parts.push(content);
+    this.#bytes += bytes;
+    return true;
+  }
+
+  addSource(
+    symbol: CodeSearchSymbol,
+    source: Buffer,
+  ): "full" | "truncated" | "omitted" {
+    const separatorBytes = Buffer.byteLength("\n\n");
+    const label = sourceLabel(symbol);
+    const labelBytes = Buffer.byteLength(label);
+    if (this.#bytes + separatorBytes + labelBytes >= this.#limit) {
+      return "omitted";
+    }
+    let slice = sliceUtf8(
+      source.subarray(symbol.startByte, symbol.endByte),
+      Math.max(
+        0,
+        this.#limit - this.#bytes - separatorBytes - labelBytes - 128,
+      ),
+    );
+    let content = `${label}${slice.content}${slice.truncated ? truncationNotice(symbol, slice) : ""}`;
+    while (
+      this.#bytes + separatorBytes + Buffer.byteLength(content) > this.#limit &&
+      slice.bytes > 0
+    ) {
+      slice = sliceUtf8(
+        source.subarray(symbol.startByte, symbol.endByte),
+        slice.bytes - 1,
+      );
+      content = `${label}${slice.content}${slice.truncated ? truncationNotice(symbol, slice) : ""}`;
+    }
+    if (!this.add(content)) return "omitted";
+    return slice.truncated ? "truncated" : "full";
+  }
+
+  text(): string {
+    return `${this.#header}${this.#parts.length ? `\n\n${this.#parts.join("\n\n")}` : ""}`;
+  }
+}
+
+function importStatements(sources: Iterable<Buffer>): string[] {
+  const statements = new Set<string>();
+  for (const source of sources) {
+    const text = source.toString("utf8");
+    const patterns = [
+      /^\s*import(?:[\s\S]*?\bfrom\s*)?["'][^"'\n]+["']\s*;?\s*$/gm,
+      /^\s*(?:from\s+[^\n]+\s+import\s+[^\n]+|import\s+[^\n]+)\s*$/gm,
+      /^\s*import\s*\([\s\S]*?^\s*\)\s*$/gm,
+    ];
+    for (const pattern of patterns) {
+      for (const match of text.matchAll(pattern)) {
+        const statement = match[0].trim();
+        if (statement) statements.add(statement);
+      }
+    }
+  }
+  return [...statements].sort();
+}
+
+function declarationHeader(symbol: CodeSearchSymbol, source: Buffer): string {
+  const declaration = sliceUtf8(
+    source.subarray(symbol.startByte, symbol.endByte),
+    1_024,
+  ).content;
+  const firstLine = declaration.split(/\r?\n/, 1)[0] ?? "";
+  const end = firstLine.search(/[{:]/);
+  const signature = (
+    end >= 0 ? firstLine.slice(0, end + 1) : firstLine
+  ).trimEnd();
+  return `${symbol.kind} ${symbol.qualifiedName} — ${symbol.path}:${symbol.startLine}\n${signature}`;
+}
+
+function sourceLabel(symbol: CodeSearchSymbol): string {
+  const range = `${symbol.startLine}:${symbol.startColumn}-${symbol.endLine}:${symbol.endColumn}`;
+  return `${symbol.kind} ${symbol.qualifiedName} — ${symbol.path}:${range}\n\n`;
+}
+
+function truncationNotice(
+  symbol: CodeSearchSymbol,
+  slice: SourceSlice,
+): string {
+  return `\n[Truncated at ${slice.bytes} bytes; selected span is ${symbol.endByte - symbol.startByte} bytes.]`;
 }
 
 async function readVerifiedSources(
@@ -318,11 +470,7 @@ function sourceResult(
 }
 
 function sourceSection(symbol: CodeSearchSymbol, slice: SourceSlice): string {
-  const range = `${symbol.startLine}:${symbol.startColumn}-${symbol.endLine}:${symbol.endColumn}`;
-  const notice = slice.truncated
-    ? `\n[Truncated at ${slice.bytes} bytes; selected span is ${symbol.endByte - symbol.startByte} bytes.]`
-    : "";
-  return `${symbol.kind} ${symbol.qualifiedName} — ${symbol.path}:${range}\n\n${slice.content}${notice}`;
+  return `${sourceLabel(symbol)}${slice.content}${slice.truncated ? truncationNotice(symbol, slice) : ""}`;
 }
 
 function evidence(title: string, status: CodeSearchWorkerStatus): string {

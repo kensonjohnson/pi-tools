@@ -22,7 +22,7 @@ test("code tools validate symbols and read source only for get/context", async (
   try {
     await writeFile(
       join(root, "sample.ts"),
-      `export function greeting() { return "${sourceSecret}"; }\n`,
+      `import { helper } from "./helper.ts";\nexport class Greeter {\n  greeting() { return "${sourceSecret}"; }\n}\n`,
     );
     await worker.initialize(databasePath, root);
     await worker.refresh({ root, additionalIgnores: "" });
@@ -66,7 +66,7 @@ test("code tools validate symbols and read source only for get/context", async (
     )[0]!;
     await writeFile(
       join(root, "sample.ts"),
-      'export function greeting() { return "CURRENT_LIVE_SOURCE"; }\n',
+      'import { helper } from "./helper.ts";\nexport class Greeter {\n  greeting() { return "CURRENT_LIVE_SOURCE"; }\n}\n',
     );
     const get = await tools
       .get("code_get")!
@@ -78,6 +78,14 @@ test("code tools validate symbols and read source only for get/context", async (
       .get("code_context")!
       .execute("", { ids: [symbol.id] }, undefined, undefined, context);
     assert.match(codeContext.content[0].text, /CURRENT_LIVE_SOURCE/);
+    assert.match(
+      codeContext.content[0].text,
+      /import \{ helper \} from "\.\/helper\.ts"/,
+    );
+    assert.match(
+      codeContext.content[0].text,
+      /Containing header\nclass Greeter/,
+    );
   } finally {
     await worker.close();
     await rm(root, { recursive: true, force: true });
