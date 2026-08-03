@@ -13,6 +13,11 @@ import {
   type LiteralTextMatch,
   type LiteralTextSearchResult,
 } from "./literal-search.ts";
+import type {
+  CodeSearchMetricEvent,
+  CodeSearchMetricMode,
+  CodeSearchMetricsStore,
+} from "./metrics.ts";
 import { CodeSearchWorkerClient } from "./worker-client.ts";
 
 const MAX_RESULT_BYTES = 48 * 1024;
@@ -27,6 +32,8 @@ export type CodeSearchToolRuntime = {
   searchTokenBudget: number;
   retrievalTokenBudget: number;
   contextTokenBudget: number;
+  mode: CodeSearchMetricMode;
+  metrics?: Pick<CodeSearchMetricsStore, "record">;
   worker: CodeSearchWorkerClient;
 };
 
@@ -62,6 +69,7 @@ export function registerCodeSearchTools(
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const runtime = usableRuntime(getRuntime(), ctx.isProjectTrusted());
       if (!runtime) return unavailable();
+      const startedAt = performance.now();
       try {
         const status = await validate(runtime, signal);
         const symbols = await runtime.worker.searchSymbols({
@@ -89,7 +97,7 @@ export function registerCodeSearchTools(
               signal,
             })
           : undefined;
-        return discoveryResult(
+        const result = discoveryResult(
           "Search",
           symbols,
           status,
@@ -97,6 +105,15 @@ export function registerCodeSearchTools(
           params.tokenBudget ?? runtime.searchTokenBudget,
           text,
         );
+        recordDelivery(
+          runtime,
+          "code_search",
+          status,
+          symbols.length,
+          result,
+          performance.now() - startedAt,
+        );
+        return result;
       } catch (error) {
         return failure(error);
       }
@@ -117,16 +134,26 @@ export function registerCodeSearchTools(
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const runtime = usableRuntime(getRuntime(), ctx.isProjectTrusted());
       if (!runtime) return unavailable();
+      const startedAt = performance.now();
       try {
         const status = await validate(runtime, signal);
         const symbols = await runtime.worker.fileSymbols(params.path, signal);
-        return discoveryResult(
+        const result = discoveryResult(
           "Outline",
           symbols,
           status,
           runtime.outputStyle,
           params.tokenBudget ?? runtime.searchTokenBudget,
         );
+        recordDelivery(
+          runtime,
+          "code_outline",
+          status,
+          symbols.length,
+          result,
+          performance.now() - startedAt,
+        );
+        return result;
       } catch (error) {
         return failure(error);
       }
@@ -146,6 +173,7 @@ export function registerCodeSearchTools(
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const runtime = usableRuntime(getRuntime(), ctx.isProjectTrusted());
       if (!runtime) return unavailable();
+      const startedAt = performance.now();
       try {
         const { status, symbols, sources } = await liveSymbols(
           runtime,
@@ -155,13 +183,22 @@ export function registerCodeSearchTools(
         const symbol = symbols[0];
         const source = symbol ? sources.get(symbol.path) : undefined;
         if (!symbol || !source) return notFound(params.id, status);
-        return sourceResult(
+        const result = sourceResult(
           "Code",
           symbol,
           source,
           status,
           params.tokenBudget ?? runtime.retrievalTokenBudget,
         );
+        recordDelivery(
+          runtime,
+          "code_get",
+          status,
+          1,
+          result,
+          performance.now() - startedAt,
+        );
+        return result;
       } catch (error) {
         return failure(error);
       }
@@ -185,6 +222,7 @@ export function registerCodeSearchTools(
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const runtime = usableRuntime(getRuntime(), ctx.isProjectTrusted());
       if (!runtime) return unavailable();
+      const startedAt = performance.now();
       try {
         const { status, symbols, sources } = await liveSymbols(
           runtime,
@@ -246,14 +284,46 @@ export function registerCodeSearchTools(
           }
         }
         response.addOmissionNotice(omitted);
-        return {
+        const result = {
           content: [{ type: "text" as const, text: response.text() }],
           details: { status, returned: response.sections, omitted },
         };
+        recordDelivery(
+          runtime,
+          "code_context",
+          status,
+          symbols.length,
+          result,
+          performance.now() - startedAt,
+        );
+        return result;
       } catch (error) {
         return failure(error);
       }
     },
+  });
+}
+
+function recordDelivery(
+  runtime: CodeSearchToolRuntime,
+  event: Extract<
+    CodeSearchMetricEvent,
+    "code_search" | "code_outline" | "code_get" | "code_context"
+  >,
+  status: CodeSearchWorkerStatus,
+  resultCount: number,
+  result: { content: readonly { text: string }[] },
+  durationMs: number,
+): void {
+  const text = result.content.map((item) => item.text).join("\n");
+  runtime.metrics?.record({
+    mode: runtime.mode,
+    event,
+    durationMs,
+    resultCount,
+    emittedBytes: Buffer.byteLength(text, "utf8"),
+    budgetLimited: /(?:Omitted:|Truncated at|Results omitted)/.test(text),
+    freshness: status.freshness,
   });
 }
 
@@ -268,11 +338,19 @@ async function validate(
   runtime: CodeSearchToolRuntime,
   signal: AbortSignal | undefined,
 ): Promise<CodeSearchWorkerStatus> {
-  return runtime.worker.validate({
+  const startedAt = performance.now();
+  const status = await runtime.worker.validate({
     root: runtime.root,
     additionalIgnores: runtime.additionalIgnores,
     signal,
   });
+  runtime.metrics?.record({
+    mode: runtime.mode,
+    event: "validation",
+    durationMs: performance.now() - startedAt,
+    freshness: status.freshness,
+  });
+  return status;
 }
 
 async function liveSymbols(

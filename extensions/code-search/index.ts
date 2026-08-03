@@ -8,6 +8,8 @@ import {
   publishExtensionSettings,
 } from "../../lib/pi-tools-config.ts";
 import { getRuntimeSettings } from "../../lib/pi-tools-runtime-settings.ts";
+import { formatCodeSearchDashboard } from "./dashboard.ts";
+import { CodeSearchMetricsStore } from "./metrics.ts";
 import { CodeSearchWorkerClient } from "./worker-client.ts";
 import {
   CODE_SEARCH_EXTENSION_ID,
@@ -37,11 +39,13 @@ function addCodeSearchTools(pi: ExtensionAPI): void {
 export default function (pi: ExtensionAPI) {
   let mode: CodeSearchMode = "off";
   let runtime: CodeSearchToolRuntime | undefined;
+  let retentionDays = 90;
 
   async function stopWorker(): Promise<void> {
     const current = runtime;
     runtime = undefined;
     await current?.worker.close();
+    current?.metrics?.close();
   }
 
   function startWorker(
@@ -60,16 +64,22 @@ export default function (pi: ExtensionAPI) {
           additionalIgnores: next.additionalIgnores,
         }),
       )
-      .then(() =>
-        next.worker.watch({
+      .then((status) => {
+        next.metrics?.record({
+          mode: next.mode,
+          event: "session",
+          freshness: status.freshness,
+        });
+        return next.worker.watch({
           root: next.root,
           additionalIgnores: next.additionalIgnores,
           enabled: watchEnabled,
-        }),
-      )
+        });
+      })
       .catch(async () => {
         if (runtime === next) runtime = undefined;
         await next.worker.close();
+        next.metrics?.close();
       });
   }
 
@@ -95,6 +105,13 @@ export default function (pi: ExtensionAPI) {
     else removeCodeSearchTools(pi);
     if (mode === "off") return;
 
+    retentionDays = Number(
+      getSettingValue(
+        settings,
+        CODE_SEARCH_EXTENSION_ID,
+        "metrics.retentionDays",
+      ),
+    );
     startWorker(
       {
         root: ctx.cwd,
@@ -141,6 +158,17 @@ export default function (pi: ExtensionAPI) {
             "context.tokenBudget",
           ),
         ),
+        mode,
+        metrics: new CodeSearchMetricsStore({
+          path: join(ctx.cwd, CONFIG_DIR_NAME, "code-search", "metrics.sqlite"),
+          retentionDays: Number(
+            getSettingValue(
+              settings,
+              CODE_SEARCH_EXTENSION_ID,
+              "metrics.retentionDays",
+            ),
+          ),
+        }),
         worker: new CodeSearchWorkerClient(),
       },
       Boolean(
@@ -151,5 +179,39 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     await stopWorker();
+  });
+
+  pi.registerCommand("code-search", {
+    description: "Show and maintain local code-search metrics",
+    handler: async (args, ctx) => {
+      const action = args.trim().toLowerCase();
+      if (action && action !== "prune") {
+        ctx.ui.notify("Usage: /code-search [prune]", "warning");
+        return;
+      }
+      if (action === "prune") {
+        const removed = runtime?.metrics?.prune() ?? 0;
+        ctx.ui.notify(
+          `Pruned ${removed} expired code-search metric row${removed === 1 ? "" : "s"}.`,
+          "info",
+        );
+        return;
+      }
+      let status;
+      try {
+        status = await runtime?.worker.status();
+      } catch {
+        // A dashboard must remain useful if the index is still starting.
+      }
+      ctx.ui.notify(
+        formatCodeSearchDashboard({
+          mode,
+          retentionDays,
+          rows: runtime?.metrics?.rows() ?? [],
+          status,
+        }),
+        "info",
+      );
+    },
   });
 }

@@ -39,6 +39,7 @@ test("trust-gates code-search settings and active tools", async () => {
         tools.set(tool.name, tool);
         active.push(tool.name);
       },
+      registerCommand() {},
       getActiveTools: () => active,
       setActiveTools(toolNames: string[]) {
         active = toolNames;
