@@ -1,4 +1,4 @@
-export const CODE_SEARCH_PROTOCOL_VERSION = 4;
+export const CODE_SEARCH_PROTOCOL_VERSION = 6;
 
 export type CodeSearchCoverage = {
   indexedFiles: number;
@@ -7,6 +7,7 @@ export type CodeSearchCoverage = {
   skippedBinary: number;
   skippedOversize: number;
   skippedUnreadable: number;
+  parseErrors: number;
 };
 
 export type CodeSearchIndexFreshness =
@@ -86,6 +87,14 @@ export type CodeSearchWorkerRequest =
   | {
       version: typeof CODE_SEARCH_PROTOCOL_VERSION;
       id: string;
+      type: "eligibleTextPaths";
+      root: string;
+      additionalIgnores: string;
+      maxFileBytes?: number;
+    }
+  | {
+      version: typeof CODE_SEARCH_PROTOCOL_VERSION;
+      id: string;
       type: "searchSymbols";
       query: string;
       limit: number;
@@ -125,6 +134,7 @@ export type CodeSearchWorkerResponse =
         | CodeSearchWorkerStatus
         | CodeSearchSymbol[]
         | CodeSearchLocatedSymbol[]
+        | string[]
         | { closed: true };
     }
   | {

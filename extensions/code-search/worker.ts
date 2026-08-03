@@ -59,6 +59,7 @@ type IndexedRow = {
 type WatchDirectory = { directory: string; frames: IgnoreFrame[] };
 type DiscoveryResult = {
   files: CodeSearchFile[];
+  eligibleTextPaths: string[];
   symbolsByPath: Map<string, ExtractedSymbol[]>;
   coverage: CodeSearchCoverage;
   watchDirectories: WatchDirectory[];
@@ -115,6 +116,7 @@ function emptyCoverage(): CodeSearchCoverage {
     skippedBinary: 0,
     skippedOversize: 0,
     skippedUnreadable: 0,
+    parseErrors: 0,
   };
 }
 
@@ -214,6 +216,14 @@ function status(): CodeSearchWorkerStatus {
         skippedBinary: row.skipped_binary,
         skippedOversize: row.skipped_oversize,
         skippedUnreadable: row.skipped_unreadable,
+        parseErrors:
+          (
+            database
+              ?.prepare(
+                "SELECT COUNT(*) AS count FROM indexed_files WHERE parse_has_error = 1",
+              )
+              .get() as { count: number } | undefined
+          )?.count ?? 0,
       }
     : emptyCoverage();
   return {
@@ -233,7 +243,8 @@ function freshness(
   if (
     coverage.skippedBinary > 0 ||
     coverage.skippedOversize > 0 ||
-    coverage.skippedUnreadable > 0
+    coverage.skippedUnreadable > 0 ||
+    coverage.parseErrors > 0
   ) {
     return "partial";
   }
@@ -322,7 +333,11 @@ async function languageFor(language: LanguageName): Promise<unknown> {
 }
 
 async function discover(
-  request: Extract<CodeSearchWorkerRequest, { type: "refresh" | "validate" }>,
+  request: Extract<
+    CodeSearchWorkerRequest,
+    { type: "refresh" | "validate" | "eligibleTextPaths" }
+  >,
+  collectTextPaths = false,
 ): Promise<DiscoveryResult> {
   const root = requireProjectRoot(request.root);
   const configured = configuredIgnore(request.additionalIgnores);
@@ -334,6 +349,7 @@ async function discover(
   }
   const result: DiscoveryResult = {
     files: [],
+    eligibleTextPaths: [],
     symbolsByPath: new Map(),
     coverage: emptyCoverage(),
     watchDirectories: [],
@@ -382,7 +398,8 @@ async function discover(
         continue;
       }
       const language = LANGUAGE_BY_EXTENSION[fileExtension(entry)];
-      if (!fileStatus.isFile() || !language) continue;
+      if (!fileStatus.isFile()) continue;
+      if (!language && !collectTextPaths) continue;
       if (fileStatus.size > (request.maxFileBytes ?? MAX_FILE_BYTES)) {
         result.coverage.skippedOversize++;
         continue;
@@ -398,6 +415,8 @@ async function discover(
         result.coverage.skippedBinary++;
         continue;
       }
+      if (collectTextPaths) result.eligibleTextPaths.push(path);
+      if (!language) continue;
       const contentHash = createHash("sha256").update(source).digest("hex");
       const known = knownFiles.get(path);
       const unchanged = known?.content_hash === contentHash;
@@ -413,6 +432,7 @@ async function discover(
           extractSymbols(rootNode, text, language, path),
         );
       }
+      if (parseHasError) result.coverage.parseErrors++;
       result.files.push({
         path,
         language,
@@ -891,6 +911,7 @@ async function handle(
   | CodeSearchWorkerStatus
   | CodeSearchSymbol[]
   | CodeSearchLocatedSymbol[]
+  | string[]
   | { closed: true }
 > {
   if (request.type === "initialize") {
@@ -915,6 +936,10 @@ async function handle(
       : undefined;
     if (watchOptions) rebuildWatchers(watchedDirectories);
     return status();
+  }
+  if (request.type === "eligibleTextPaths") {
+    checkCancelled(request.id);
+    return (await discover(request, true)).eligibleTextPaths;
   }
   if (request.type === "searchSymbols") {
     checkCancelled(request.id);

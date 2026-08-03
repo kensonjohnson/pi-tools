@@ -83,6 +83,19 @@ export class CodeSearchWorkerClient {
     return this.requestStatus("watch", options);
   }
 
+  async eligibleTextPaths(options: {
+    root: string;
+    additionalIgnores: string;
+    maxFileBytes?: number;
+    signal?: AbortSignal;
+  }): Promise<string[]> {
+    return (await this.request(
+      "eligibleTextPaths",
+      options,
+      options.signal,
+    )) as string[];
+  }
+
   async searchSymbols(options: {
     query: string;
     limit: number;

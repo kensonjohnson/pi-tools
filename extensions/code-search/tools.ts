@@ -8,6 +8,11 @@ import type {
   CodeSearchSymbol,
   CodeSearchWorkerStatus,
 } from "./worker-protocol.ts";
+import {
+  searchLiteralText,
+  type LiteralTextMatch,
+  type LiteralTextSearchResult,
+} from "./literal-search.ts";
 import { CodeSearchWorkerClient } from "./worker-client.ts";
 
 const MAX_RESULT_BYTES = 48 * 1024;
@@ -44,6 +49,15 @@ export function registerCodeSearchTools(
         }),
       ),
       maxResults: Type.Optional(Type.Integer({ minimum: 1, maximum: 100 })),
+      tokenBudget: Type.Optional(
+        Type.Integer({ minimum: 128, maximum: 8_000 }),
+      ),
+      text: Type.Optional(
+        Type.Boolean({
+          description:
+            "Explicitly run transient fixed-string text fallback without returning source text.",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const runtime = usableRuntime(getRuntime(), ctx.isProjectTrusted());
@@ -58,7 +72,31 @@ export function registerCodeSearchTools(
           limit: params.maxResults ?? runtime.searchMaxResults,
           signal,
         });
-        return discoveryResult("Search", symbols, status, runtime.outputStyle);
+        const text = params.text
+          ? await searchLiteralText({
+              root: runtime.root,
+              paths: await runtime.worker.eligibleTextPaths({
+                root: runtime.root,
+                additionalIgnores: runtime.additionalIgnores,
+                signal,
+              }),
+              query: params.query,
+              limit: Math.max(
+                1,
+                (params.maxResults ?? runtime.searchMaxResults) -
+                  symbols.length,
+              ),
+              signal,
+            })
+          : undefined;
+        return discoveryResult(
+          "Search",
+          symbols,
+          status,
+          runtime.outputStyle,
+          params.tokenBudget ?? runtime.searchTokenBudget,
+          text,
+        );
       } catch (error) {
         return failure(error);
       }
@@ -72,6 +110,9 @@ export function registerCodeSearchTools(
       "Show source-free indexed symbols for one current-project file.",
     parameters: Type.Object({
       path: Type.String({ minLength: 1, maxLength: 1_024 }),
+      tokenBudget: Type.Optional(
+        Type.Integer({ minimum: 128, maximum: 8_000 }),
+      ),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const runtime = usableRuntime(getRuntime(), ctx.isProjectTrusted());
@@ -79,7 +120,13 @@ export function registerCodeSearchTools(
       try {
         const status = await validate(runtime, signal);
         const symbols = await runtime.worker.fileSymbols(params.path, signal);
-        return discoveryResult("Outline", symbols, status, runtime.outputStyle);
+        return discoveryResult(
+          "Outline",
+          symbols,
+          status,
+          runtime.outputStyle,
+          params.tokenBudget ?? runtime.searchTokenBudget,
+        );
       } catch (error) {
         return failure(error);
       }
@@ -108,14 +155,13 @@ export function registerCodeSearchTools(
         const symbol = symbols[0];
         const source = symbol ? sources.get(symbol.path) : undefined;
         if (!symbol || !source) return notFound(params.id, status);
-        const limitBytes = budgetBytes(
+        return sourceResult(
+          "Code",
+          symbol,
+          source,
+          status,
           params.tokenBudget ?? runtime.retrievalTokenBudget,
         );
-        const slice = sliceUtf8(
-          source.subarray(symbol.startByte, symbol.endByte),
-          limitBytes,
-        );
-        return sourceResult("Code", symbol, slice, status);
       } catch (error) {
         return failure(error);
       }
@@ -158,26 +204,34 @@ export function registerCodeSearchTools(
           header,
           budgetBytes(params.tokenBudget ?? runtime.contextTokenBudget),
         );
+        let targetOmitted = false;
         for (const id of params.ids) {
           const symbol = symbols.find((candidate) => candidate.id === id);
           const source = symbol ? sources.get(symbol.path) : undefined;
           if (!symbol || !source) {
+            targetOmitted = true;
             omitted.push(`${id}: not indexed after validation`);
             continue;
           }
           const result = response.addSource(symbol, source);
-          if (result === "omitted")
+          if (result === "omitted") {
+            targetOmitted = true;
             omitted.push(`${symbol.qualifiedName}: budget exhausted`);
+          }
           if (result === "truncated")
             omitted.push(`${symbol.qualifiedName}: truncated`);
         }
-        for (const statement of importStatements(sources.values())) {
-          if (!response.add(`Import\n${statement}`)) {
-            omitted.push("imports: budget exhausted");
-            break;
+        if (!targetOmitted) {
+          for (const statement of importStatements(sources.values())) {
+            if (!response.add(`Import\n${statement}`)) {
+              omitted.push("imports: budget exhausted");
+              break;
+            }
           }
+        } else {
+          omitted.push("imports: selected target budget priority");
         }
-        if (parentSources) {
+        if (parentSources && !targetOmitted) {
           for (const parent of parentSymbols) {
             const source = parentSources.get(parent.path);
             if (!source) continue;
@@ -191,16 +245,9 @@ export function registerCodeSearchTools(
             }
           }
         }
-        const notices = omitted.length
-          ? `\n\nOmitted: ${omitted.join("; ")}`
-          : "";
+        response.addOmissionNotice(omitted);
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: `${response.text()}${notices}`,
-            },
-          ],
+          content: [{ type: "text" as const, text: response.text() }],
           details: { status, returned: response.sections, omitted },
         };
       } catch (error) {
@@ -301,6 +348,12 @@ class BudgetedResponse {
     return true;
   }
 
+  addOmissionNotice(omitted: string[]): void {
+    if (!omitted.length) return;
+    if (this.add(`Omitted: ${omitted.join("; ")}`)) return;
+    this.add(`Omitted: ${omitted.length}; target budget priority.`);
+  }
+
   addSource(
     symbol: CodeSearchSymbol,
     source: Buffer,
@@ -372,7 +425,7 @@ function declarationHeader(symbol: CodeSearchSymbol, source: Buffer): string {
 
 function sourceLabel(symbol: CodeSearchSymbol): string {
   const range = `${symbol.startLine}:${symbol.startColumn}-${symbol.endLine}:${symbol.endColumn}`;
-  return `${symbol.kind} ${symbol.qualifiedName} — ${symbol.path}:${range}\n\n`;
+  return `${symbol.kind} ${symbol.qualifiedName} — ${symbol.path}:${range}${symbol.parseHasError ? " [parse-error]" : ""}\n\n`;
 }
 
 function truncationNotice(
@@ -425,24 +478,80 @@ function discoveryResult(
   symbols: CodeSearchSymbol[],
   status: CodeSearchWorkerStatus,
   style: OutputStyle,
+  tokenBudget: number,
+  text?: LiteralTextSearchResult,
 ) {
   const header = evidence(title, status);
-  if (!symbols.length) {
+  if (!symbols.length && !text?.matches.length) {
+    const fallback = text?.unavailable
+      ? `\nText fallback unavailable: ${text.unavailable}`
+      : "";
     return {
       content: [
         {
           type: "text" as const,
-          text: `${header}\nNo matching indexed symbols.`,
+          text: `${header}\nNo matching indexed symbols.${fallback}`,
         },
       ],
-      details: { status, results: [] },
+      details: { status, results: [], textMatches: text?.matches ?? [] },
     };
   }
-  const rows = symbols.map((symbol) => formatSymbol(symbol, style));
+  const entries: Array<CodeSearchSymbol | LiteralTextMatch> = [
+    ...symbols,
+    ...(text?.matches ?? []),
+  ];
+  const limit = budgetBytes(tokenBudget);
+  const rows: string[] = [];
+  let bytes = Buffer.byteLength(header);
+  for (const entry of entries) {
+    const row =
+      "id" in entry
+        ? formatSymbol(entry, style)
+        : formatTextMatch(entry, style);
+    // Keep room for an explicit notice: a budget must never silently change
+    // the discovered set.
+    if (bytes + Buffer.byteLength("\n\n") + Buffer.byteLength(row) + 96 > limit)
+      break;
+    rows.push(row);
+    bytes += Buffer.byteLength("\n\n") + Buffer.byteLength(row);
+  }
+  const omitted = entries.length - rows.length;
+  const notices = [
+    omitted
+      ? `Results omitted: ${omitted}; token budget exhausted.`
+      : undefined,
+    text?.limited
+      ? "Text matches omitted: result/output limit reached."
+      : undefined,
+    text?.unavailable
+      ? `Text fallback unavailable: ${text.unavailable}`
+      : undefined,
+  ].filter((notice): notice is string => Boolean(notice));
+  const notice = notices.length ? `\n\n${notices.join("\n")}` : "";
   return {
-    content: [{ type: "text" as const, text: `${header}\n${rows.join("\n")}` }],
-    details: { status, results: symbols },
+    content: [
+      {
+        type: "text" as const,
+        text: `${header}\n\n${rows.join("\n\n")}${notice}`,
+      },
+    ],
+    details: {
+      status,
+      results: symbols.slice(0, Math.min(symbols.length, rows.length)),
+      textMatches: text?.matches ?? [],
+      omitted,
+      textFallback: text
+        ? { limited: text.limited, unavailable: text.unavailable }
+        : undefined,
+    },
   };
+}
+
+function formatTextMatch(match: LiteralTextMatch, style: OutputStyle): string {
+  const range = `${match.line}:${match.startColumn}-${match.line}:${match.endColumn}`;
+  return style === "structured"
+    ? `match: literal-text\npath: ${match.path}\nrange: ${range}\n`
+    : `literal-text — ${match.path}:${range}`;
 }
 
 function formatSymbol(symbol: CodeSearchSymbol, style: OutputStyle): string {
@@ -455,17 +564,22 @@ function formatSymbol(symbol: CodeSearchSymbol, style: OutputStyle): string {
 function sourceResult(
   title: string,
   symbol: CodeSearchSymbol,
-  slice: SourceSlice,
+  source: Buffer,
   status: CodeSearchWorkerStatus,
+  tokenBudget: number,
 ) {
+  const response = new BudgetedResponse(
+    evidence(title, status),
+    budgetBytes(tokenBudget),
+  );
+  const result = response.addSource(symbol, source);
+  const notice =
+    result === "omitted"
+      ? "\n\nOmitted: selected symbol header exceeds the token budget."
+      : "";
   return {
-    content: [
-      {
-        type: "text" as const,
-        text: `${evidence(title, status)}\n\n${sourceSection(symbol, slice)}`,
-      },
-    ],
-    details: { status, id: symbol.id, truncated: slice.truncated },
+    content: [{ type: "text" as const, text: `${response.text()}${notice}` }],
+    details: { status, id: symbol.id, truncated: result === "truncated" },
   };
 }
 
@@ -475,12 +589,15 @@ function sourceSection(symbol: CodeSearchSymbol, slice: SourceSlice): string {
 
 function evidence(title: string, status: CodeSearchWorkerStatus): string {
   const coverage = status.coverage;
-  return `${title}: ${status.freshness}; indexed ${coverage.indexedFiles}; skipped ignored ${coverage.skippedIgnored}, symlink ${coverage.skippedSymlink}, binary ${coverage.skippedBinary}, oversize ${coverage.skippedOversize}, unreadable ${coverage.skippedUnreadable}.`;
+  return `${title}: ${status.freshness}; indexed ${coverage.indexedFiles}; AST parse errors ${coverage.parseErrors}; skipped ignored ${coverage.skippedIgnored}, symlink ${coverage.skippedSymlink}, binary ${coverage.skippedBinary}, oversize ${coverage.skippedOversize}, unreadable ${coverage.skippedUnreadable}.`;
 }
 
 type SourceSlice = { content: string; bytes: number; truncated: boolean };
 
 function sliceUtf8(source: Buffer, maxBytes: number): SourceSlice {
+  if (maxBytes <= 0) {
+    return { content: "", bytes: 0, truncated: source.length > 0 };
+  }
   let end = Math.min(source.length, maxBytes, MAX_RESULT_BYTES);
   while (end > 0 && end < source.length && isContinuationByte(source[end]!))
     end--;
