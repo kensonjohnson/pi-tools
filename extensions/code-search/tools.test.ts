@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CodeSearchWorkerClient } from "./worker-client.ts";
@@ -12,6 +12,8 @@ import {
 
 test("code tools validate metadata-only discovery and transient literal fallback", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-tools-code-search-tools-"));
+  const rgBin = await mkdtemp(join(tmpdir(), "pi-tools-fake-rg-"));
+  const originalPath = process.env.PATH;
   const databasePath = join(root, ".pi", "code-search", "index.sqlite");
   const worker = new CodeSearchWorkerClient();
   const tools = new Map<
@@ -20,6 +22,8 @@ test("code tools validate metadata-only discovery and transient literal fallback
   >();
   const sourceSecret = "UNIQUE_LIVE_SOURCE_MUST_NOT_APPEAR_IN_DISCOVERY";
   try {
+    await writeFakeRg(join(rgBin, "rg"));
+    process.env.PATH = `${rgBin}${delimiter}${originalPath ?? ""}`;
     await mkdir(join(root, "docs"));
     await writeFile(join(root, ".gitignore"), "ignored.txt\n");
     await writeFile(
@@ -219,7 +223,34 @@ test("code tools validate metadata-only discovery and transient literal fallback
     );
     assert.ok(Buffer.byteLength(targetFirstContext.content[0].text) <= 1_024);
   } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
     await worker.close();
     await rm(root, { recursive: true, force: true });
+    await rm(rgBin, { recursive: true, force: true });
   }
 });
+
+async function writeFakeRg(path: string): Promise<void> {
+  await writeFile(
+    path,
+    `#!/usr/bin/env node
+const marker = process.argv.indexOf("--");
+const query = process.argv[marker + 1];
+for (const path of process.argv.slice(marker + 2)) {
+  const source = await (await import("node:fs/promises")).readFile(path, "utf8");
+  for (const [index, line] of source.split(/\\r?\\n/).entries()) {
+    const submatches = [];
+    for (let start = line.indexOf(query); start >= 0; start = line.indexOf(query, start + query.length)) {
+      submatches.push({ start, end: start + query.length });
+    }
+    if (submatches.length) {
+      console.log(JSON.stringify({ type: "match", data: { path: { text: path }, line_number: index + 1, submatches } }));
+    }
+  }
+}
+`,
+    "utf8",
+  );
+  await chmod(path, 0o755);
+}
