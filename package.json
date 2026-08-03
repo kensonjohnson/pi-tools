@@ -10,16 +10,24 @@
     "format": "prettier --write .",
     "test:config": "node --experimental-strip-types --test lib/pi-tools-config.test.ts lib/pi-tools-command.test.ts lib/pi-tools-runtime-settings.test.ts",
     "test:memory": "node --experimental-strip-types --test extensions/memory/core.test.ts",
-    "test:compression": "node --experimental-strip-types --test $(find extensions/tool-output-compression -name '*.test.ts' -print)"
+    "test:compression": "node --experimental-strip-types --test $(find extensions/tool-output-compression -name '*.test.ts' -print)",
+    "test:code-search": "node --experimental-strip-types --test $(find extensions/code-search -name '*.test.ts' -print)",
+    "verify:package": "npm pack --dry-run"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "@mozilla/readability": "^0.6.0",
     "@types/better-sqlite3": "^7.6.13",
     "better-sqlite3": "^12.9.0",
+    "ignore": "7.0.6",
     "jsdom": "^29.1.0",
     "puppeteer-core": "^24.42.0",
     "sqlite-vec": "^0.1.9",
+    "tree-sitter": "0.21.1",
+    "tree-sitter-go": "0.21.2",
+    "tree-sitter-javascript": "0.23.1",
+    "tree-sitter-python": "0.21.0",
+    "tree-sitter-typescript": "0.23.2",
     "turndown": "^7.2.4",
     "turndown-plugin-gfm": "^1.0.2",
     "uuid": "^14.0.0"
