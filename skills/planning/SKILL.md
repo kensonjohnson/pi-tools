@@ -164,7 +164,7 @@ Use this for any work expected to span sessions or that benefits from explicit s
 3. **Map breadth before depth.** Surface the major decision areas, constraints, investigations, and likely implementation seams. Do not produce a phase plan yet.
 4. **Classify each discovered item.** Create a ticket only when its objective/question can be stated precisely now. Record the rest under Not yet specified; it is fog, not an incomplete ticket.
 5. **Create and wire tickets.** Write all initial ticket files, then add `blocked_by` edges after their numbers are known. Tickets with no unfinished blockers are the initial frontier.
-6. **Stop after charting.** Present the map and frontier. Do not silently begin resolving a discovery ticket in the same charting pass.
+6. **Handoff from discovery.** Present the map, frontier, and any remaining fog. When enough uncertainty is resolved to draft concrete implementation slices, explicitly say that discovery is complete for the next slice and ask to begin delivery planning; if the user has already authorized that next stage, proceed. Do not silently begin resolving a discovery ticket in the same charting pass.
 
 ### Delivery-planning mode: route is clear
 
@@ -172,7 +172,13 @@ Use this for any work expected to span sessions or that benefits from explicit s
 2. **Explore implementation facts.** Read the relevant code and docs, identify seams, prefactoring, tests, and real constraints.
 3. **Draft implementation tickets.** Create bounded, independently verifiable slices with concrete approach, acceptance criteria, verification, and only genuine blockers.
 4. **Review the graph with the user.** Check ticket granularity, dependency edges, scope, and anything still uncertain. Create discovery tickets only for unresolved questions that materially block implementation.
-5. **Publish the map and tickets.** Wire dependencies, identify the frontier, and stop. Do not silently begin the first ticket in the planning pass.
+5. **Publish the map and tickets.** Wire dependencies and identify the frontier. Perform the explicit handoff to implementation below; do not silently begin the first ticket in the planning pass.
+
+### Stage handoffs
+
+Discovery → delivery planning occurs when the destination and scope are settled and enough discovery has been resolved to describe a concrete next implementation slice. Not every in-scope uncertainty must be resolved: unresolved items may remain fog or blockers for later slices. State the transition explicitly: “Discovery is complete for the next slice; I can now draft the implementation tickets.” Ask to proceed unless the user has already authorized delivery planning.
+
+Delivery planning → implementation occurs when the map is current and a frontier implementation ticket has a bounded outcome, concrete approach, relevant areas, acceptance criteria, verification, and no unfinished blockers. State the transition explicitly: “Planning is complete. [Ticket title] is ready to implement. Shall I begin it?” If the user approves—or their request already explicitly authorizes implementation—claim that ticket as `active` and begin. The planning stop prevents unreviewed, silent implementation; it must not become an idle dead end.
 
 For a small but explicitly planned effort, create one implementation ticket rather than reverting to an untracked checklist. For an obviously one-shot request, work directly unless the user asks to plan it.
 
@@ -212,7 +218,7 @@ When a repository has `tmp/SESSION_CONTEXT.md`, `docs/SESSION_CONTEXT.md`, or a 
 
 ## Guardrails
 
-- Planning is collaborative: ask user-owned decisions one at a time and offer a recommendation where useful.
+- Planning is collaborative: ask user-owned decisions one at a time and offer a recommendation where useful. After recording an answer, immediately advance to the next unblocked user decision; if none remains, summarize the frontier and ask whether to begin execution. Do not end a planning turn solely after recording an answer unless the user asked to pause.
 - Facts belong in research or code exploration; do not turn easily discoverable facts into user questions.
 - Do not create a ticket merely because work is anticipated. Precision, not certainty, is the threshold.
 - Do not implement work blocked by an unresolved decision without explicit user direction.
