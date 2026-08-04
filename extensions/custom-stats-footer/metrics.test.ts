@@ -21,6 +21,12 @@ function response(
   };
 }
 
+test("uses the default Performance clock with its receiver intact", () => {
+  const meter = new ResponseTpsMeter();
+
+  assert.doesNotThrow(() => meter.start());
+});
+
 test("measures one response without counting a later tool gap", () => {
   let now = 0;
   const meter = new ResponseTpsMeter(() => now);
