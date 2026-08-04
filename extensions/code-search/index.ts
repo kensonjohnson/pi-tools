@@ -2,8 +2,10 @@ import {
   CONFIG_DIR_NAME,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import {
+  getEffectiveSettings,
   getSettingValue,
   publishExtensionSettings,
 } from "../../lib/pi-tools-config.ts";
@@ -34,6 +36,13 @@ function addCodeSearchTools(pi: ExtensionAPI): void {
   pi.setActiveTools([
     ...new Set([...pi.getActiveTools(), ...CODE_SEARCH_TOOL_NAMES]),
   ]);
+}
+
+function globalMetricsPath(): string {
+  return join(
+    process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"),
+    "code-search-metrics.sqlite",
+  );
 }
 
 export default function (pi: ExtensionAPI) {
@@ -105,9 +114,16 @@ export default function (pi: ExtensionAPI) {
     else removeCodeSearchTools(pi);
     if (mode === "off") return;
 
+    // Metrics aggregate extension-wide usage, so their retention must use the
+    // global setting rather than a trusted-project override.
+    const globalSettings = await getEffectiveSettings({
+      cwd: ctx.cwd,
+      projectTrusted: false,
+      configDirName: CONFIG_DIR_NAME,
+    });
     retentionDays = Number(
       getSettingValue(
-        settings,
+        globalSettings,
         CODE_SEARCH_EXTENSION_ID,
         "metrics.retentionDays",
       ),
@@ -160,14 +176,8 @@ export default function (pi: ExtensionAPI) {
         ),
         mode,
         metrics: new CodeSearchMetricsStore({
-          path: join(ctx.cwd, CONFIG_DIR_NAME, "code-search", "metrics.sqlite"),
-          retentionDays: Number(
-            getSettingValue(
-              settings,
-              CODE_SEARCH_EXTENSION_ID,
-              "metrics.retentionDays",
-            ),
-          ),
+          path: globalMetricsPath(),
+          retentionDays,
         }),
         worker: new CodeSearchWorkerClient(),
       },
