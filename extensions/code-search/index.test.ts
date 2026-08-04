@@ -69,6 +69,7 @@ test("trust-gates code-search settings and active tools", async () => {
     );
     assert.deepEqual(active, ["read", "other_extension_tool"]);
     await assert.rejects(access(join(cwd, ".pi")));
+    await assert.rejects(access(join(root, "agent", "code-search-metrics.sqlite")));
     assert.equal(
       (
         await tools.get("code_search")!.execute("", {}, undefined, undefined, {
@@ -84,7 +85,9 @@ test("trust-gates code-search settings and active tools", async () => {
       projectConfig,
       JSON.stringify({
         version: 1,
-        extensions: { "code-search": { mode: "apply" } },
+        extensions: {
+          "code-search": { mode: "apply", "metrics.retentionDays": 1 },
+        },
       }),
       "utf8",
     );
@@ -97,6 +100,8 @@ test("trust-gates code-search settings and active tools", async () => {
       "other_extension_tool",
       ...CODE_SEARCH_TOOL_NAMES,
     ]);
+    await access(join(root, "agent", "code-search-metrics.sqlite"));
+    await assert.rejects(access(join(cwd, ".pi", "code-search", "metrics.sqlite")));
     const notices: string[] = [];
     const commandContext = {
       ui: { notify: (message: string) => notices.push(message) },
@@ -105,6 +110,7 @@ test("trust-gates code-search settings and active tools", async () => {
     await commands.get("code-search")!.handler("prune", commandContext);
     assert.match(notices[0], /Code Search/);
     assert.match(notices[0], /Aggregate-only local metrics/);
+    assert.match(notices[0], /90-day retention/);
     assert.match(notices[1], /Pruned \d+ expired code-search metric rows?/);
 
     await writeFile(

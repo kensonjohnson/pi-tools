@@ -1,0 +1,5 @@
+# Derived local code-search index and aggregate metrics.
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm

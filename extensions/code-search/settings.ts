@@ -81,7 +81,9 @@ export const CODE_SEARCH_SETTINGS: ExtensionSettingsDefinition = {
       default: 90,
       minimum: 1,
       maximum: 3_650,
-      label: "Metrics retention (days)",
+      label: "Global metrics retention (days)",
+      description:
+        "Applies to extension-wide aggregate metrics in Pi's agent directory; configure at global scope.",
     },
   },
   toolNames: CODE_SEARCH_TOOL_NAMES,
