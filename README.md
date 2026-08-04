@@ -49,7 +49,7 @@ Connects to Brave Browser on `localhost:9222`.
 
 ### `custom-stats-footer`
 
-Replaces Pi's default footer with context usage and last/average tokens per second.
+Replaces Pi's default footer with context usage and last/average response tokens per second. TPS is measured from each assistant response's stream start to finish and therefore excludes time spent executing tools; the average is weighted by response tokens and stream duration.
 
 If you happen to be using a codex subscription, enable **Custom Stats Footer → codexQuota.enabled** in `/pi-tools` to see your remaining weekly quota. This uses your existing `openai-codex` ChatGPT subscription login, refreshes every five minutes, and stores its settings in the shared `~/.pi/agent/pi-tools.json` file.
 

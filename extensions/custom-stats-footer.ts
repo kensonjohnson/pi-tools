@@ -15,14 +15,15 @@ import {
   updateSetting,
 } from "../lib/pi-tools-config.ts";
 import { getRuntimeSettings } from "../lib/pi-tools-runtime-settings.ts";
+import { ResponseTpsMeter } from "./custom-stats-footer/metrics.ts";
 
 /**
  * Custom Default Footer Extension with TPS
  *
  * Shows:
  * - Context usage: "51k/256k (19%)"
- * - Last TPS: tokens per second from the most recent request
- * - Average TPS: running average across all requests
+ * - Last response TPS: tokens per second from the most recent assistant response
+ * - Average response TPS: token-weighted across assistant responses
  */
 
 function formatTokens(count: number): string {
@@ -157,11 +158,8 @@ function formatResetDuration(resetAtMs: number): string {
   return `${Math.max(1, minutes)}m`;
 }
 
-// Module-level state to track TPS across agent runs
-let agentStartMs: number | null = null;
-let lastTps: number | null = null;
-let totalTpsSum = 0;
-let tpsCount = 0;
+// Module-level state to track TPS across assistant responses.
+const responseTpsMeter = new ResponseTpsMeter();
 let footerEnabled = true;
 let quotaSettings: QuotaSettings = { ...DEFAULT_QUOTA_SETTINGS };
 let codexQuota: CodexQuota | undefined;
@@ -262,34 +260,18 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // Track agent timing for TPS calculation
-  pi.on("agent_start", () => {
-    if (!footerEnabled) return;
-    agentStartMs = Date.now();
+  // Pi ends the assistant message before executing any tool calls, so this
+  // response-scoped interval cannot include tool wall-clock time.
+  pi.on("message_start", (event) => {
+    if (footerEnabled && isAssistantMessage(event.message)) {
+      responseTpsMeter.start();
+    }
   });
 
-  pi.on("agent_end", (event, _ctx) => {
-    if (!footerEnabled || agentStartMs === null) return;
-
-    const elapsedMs = Date.now() - agentStartMs;
-    agentStartMs = null;
-
-    if (elapsedMs <= 0) return;
-
-    let output = 0;
-    for (const message of event.messages) {
-      if (!isAssistantMessage(message)) continue;
-      output += message.usage.output || 0;
+  pi.on("message_end", (event) => {
+    if (footerEnabled && isAssistantMessage(event.message)) {
+      responseTpsMeter.finish(event.message);
     }
-
-    if (output <= 0) return;
-
-    const elapsedSeconds = elapsedMs / 1000;
-    const tps = output / elapsedSeconds;
-
-    lastTps = tps;
-    totalTpsSum += tps;
-    tpsCount++;
   });
 
   const stopQuotaUpdates = () => {
@@ -438,10 +420,10 @@ export default function (pi: ExtensionAPI) {
             statsParts.push(coloredContext);
           }
 
-          // TPS display: "109 tps | 109 avg"
-          if (lastTps !== null) {
-            const avgTps = tpsCount > 0 ? totalTpsSum / tpsCount : 0;
-            const tpsStr = `${lastTps.toFixed(0)} tps | ${avgTps.toFixed(0)} avg`;
+          // TPS display: "109 response tps | 109 avg"
+          const { lastTps, averageTps } = responseTpsMeter.snapshot();
+          if (lastTps !== null && averageTps !== null) {
+            const tpsStr = `${lastTps.toFixed(0)} response tps | ${averageTps.toFixed(0)} avg`;
             statsParts.push(tpsStr);
           }
 
@@ -546,6 +528,7 @@ export default function (pi: ExtensionAPI) {
 
   // Set up custom footer and begin quota polling only after a user has opted in.
   pi.on("session_start", async (_event, ctx) => {
+    responseTpsMeter.reset();
     await migrateLegacyQuotaSettings(ctx);
     await loadFooterSettings(ctx);
     if (!footerEnabled) {
