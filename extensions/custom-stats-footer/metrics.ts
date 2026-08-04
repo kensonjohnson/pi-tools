@@ -14,7 +14,7 @@ export class ResponseTpsMeter {
   #totalDurationMs = 0;
   #now: () => number;
 
-  constructor(now: () => number = performance.now) {
+  constructor(now: () => number = () => performance.now()) {
     this.#now = now;
   }
 
