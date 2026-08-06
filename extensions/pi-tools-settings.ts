@@ -179,10 +179,9 @@ function createSettingItem(
   return item;
 }
 
-function createSettingsItems(
+function createRootSettingsItems(
   registeredFields: RegisteredField[],
   settings: EffectiveSettings,
-  theme: Theme,
   scope: WritableConfigScope,
   projectTrusted: boolean,
 ): SettingItem[] {
@@ -203,24 +202,36 @@ function createSettingsItems(
       (field) => field.definition.id === definition.id,
     );
     const enabled = fields.find((field) => field.field === "enabled");
-    if (enabled) {
-      items.push(createSettingItem(enabled, settings, theme, definition.label));
-    }
-
-    const children = enabled
-      ? fields.filter((field) => field !== enabled)
-      : fields;
-    children.forEach((field, index) => {
-      const branch = index === children.length - 1 ? "└─" : "├─";
-      const fieldLabel = field.setting.label ?? field.field;
-      const label = enabled
-        ? `${branch} ${fieldLabel}`
-        : `${definition.label} › ${fieldLabel}`;
-      items.push(createSettingItem(field, settings, theme, label));
+    const description = [
+      definition.description,
+      `${fields.length} setting${fields.length === 1 ? "" : "s"}`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    items.push({
+      id: definition.id,
+      label: definition.label,
+      description,
+      currentValue: enabled
+        ? `enabled: ${formatValue(
+            getSettingValue(settings, definition.id, enabled.field),
+          )}`
+        : `${fields.length} settings`,
     });
   }
 
   return items;
+}
+
+function createExtensionSettingsItems(
+  extensionId: string,
+  registeredFields: RegisteredField[],
+  settings: EffectiveSettings,
+  theme: Theme,
+): SettingItem[] {
+  return registeredFields
+    .filter((field) => field.definition.id === extensionId)
+    .map((field) => createSettingItem(field, settings, theme));
 }
 
 function getDefaultScope(
@@ -290,24 +301,137 @@ async function openSettingsUI(
           setting,
         })),
       );
-    const items = createSettingsItems(
+    const rootItems = createRootSettingsItems(
       registeredFields,
       settings,
-      theme,
       scope,
       ctx.isProjectTrusted(),
     );
-
     let editingTextValue = false;
-    for (const item of items) {
-      if (!item.submenu) continue;
-      const openSubmenu = item.submenu;
-      item.submenu = (currentValue, closeSubmenu) => {
-        editingTextValue = true;
-        return openSubmenu(currentValue, (selectedValue) => {
-          editingTextValue = false;
-          closeSubmenu(selectedValue);
+    let settingsList: SettingsList;
+
+    const saveField = (
+      id: string,
+      input: string,
+      onSaved?: (registered: RegisteredField, value: SettingValue) => void,
+    ) => {
+      if (savePromise) return;
+
+      const separator = id.indexOf(".");
+      const registered =
+        separator > 0
+          ? getRegisteredField(id.slice(0, separator), id.slice(separator + 1))
+          : undefined;
+      if (!registered) {
+        ctx.ui.notify(`Unknown pi-tools setting '${id}'.`, "error");
+        return;
+      }
+
+      const value = parseSettingInput(registered.setting, input);
+      if (value === undefined) {
+        ctx.ui.notify(
+          `Invalid value for ${registered.definition.id}.${registered.field}.`,
+          "warning",
+        );
+        return;
+      }
+
+      const pendingSave = saveSetting(ctx, scope, registered, value)
+        .then(() => {
+          settingsChanged = true;
+          onSaved?.(registered, value);
+        })
+        .catch((error) => {
+          ctx.ui.notify(
+            error instanceof Error
+              ? `Could not save setting: ${error.message}`
+              : "Could not save setting.",
+            "error",
+          );
         });
+      savePromise = pendingSave;
+      void pendingSave.finally(() => {
+        if (savePromise === pendingSave) savePromise = undefined;
+      });
+    };
+
+    for (const item of rootItems) {
+      if (item.id === SCOPE_ITEM_ID) continue;
+      const definition = managerSettingsRegistry.get(item.id);
+      if (!definition) continue;
+      item.submenu = (_currentValue, closeSubmenu) => {
+        const detailItems = createExtensionSettingsItems(
+          definition.id,
+          registeredFields,
+          settings,
+          theme,
+        );
+        for (const detailItem of detailItems) {
+          if (!detailItem.submenu) continue;
+          const openTextSubmenu = detailItem.submenu;
+          detailItem.submenu = (currentValue, closeTextSubmenu) => {
+            editingTextValue = true;
+            return openTextSubmenu(currentValue, (selectedValue) => {
+              editingTextValue = false;
+              closeTextSubmenu(selectedValue);
+            });
+          };
+        }
+
+        const detailContainer = new Container();
+        detailContainer.addChild(
+          new Text(
+            theme.fg(
+              "accent",
+              theme.bold(`Pi-tools Settings — ${definition.label}`),
+            ),
+            1,
+            1,
+          ),
+        );
+        detailContainer.addChild(
+          new Text(theme.fg("dim", `Write scope: ${scope}`), 1, 0),
+        );
+        const detailSettingsList = new SettingsList(
+          detailItems,
+          Math.min(detailItems.length + 2, 15),
+          {
+            ...getSettingsListTheme(),
+            hint: () =>
+              theme.fg(
+                "dim",
+                "  j/k or ↑/↓ to move · Enter/Space to change · Esc to return",
+              ),
+          },
+          (id, input) => {
+            saveField(id, input, (registered, value) => {
+              if (registered.field !== "enabled") return;
+              settingsList.updateValue(
+                registered.definition.id,
+                `enabled: ${formatValue(value)}`,
+              );
+              tui.requestRender();
+            });
+          },
+          () => {
+            editingTextValue = false;
+            closeSubmenu();
+            tui.requestRender();
+          },
+          { enableSearch: false },
+        );
+        detailContainer.addChild(detailSettingsList);
+        return {
+          render(width: number): string[] {
+            return detailContainer.render(width);
+          },
+          invalidate(): void {
+            detailContainer.invalidate();
+          },
+          handleInput(data: string): void {
+            detailSettingsList.handleInput(data);
+          },
+        };
       };
     }
 
@@ -335,64 +459,22 @@ async function openSettingsUI(
       );
     }
 
-    const settingsList = new SettingsList(
-      items,
-      Math.min(items.length + 2, 15),
+    settingsList = new SettingsList(
+      rootItems,
+      Math.min(rootItems.length + 2, 15),
       {
         ...getSettingsListTheme(),
         hint: () =>
           theme.fg(
             "dim",
-            "  j/k or ↑/↓ to move · Enter/Space to change · Esc to apply changes",
+            "  j/k or ↑/↓ to move · Enter/Space to open · Esc to apply changes",
           ),
       },
       (id, input) => {
-        if (id === SCOPE_ITEM_ID) {
-          scope = input as WritableConfigScope;
-          settingsList.updateValue(SCOPE_ITEM_ID, scope);
-          tui.requestRender();
-          return;
-        }
-        if (savePromise) return;
-
-        const separator = id.indexOf(".");
-        const registered =
-          separator > 0
-            ? getRegisteredField(
-                id.slice(0, separator),
-                id.slice(separator + 1),
-              )
-            : undefined;
-        if (!registered) {
-          ctx.ui.notify(`Unknown pi-tools setting '${id}'.`, "error");
-          return;
-        }
-
-        const value = parseSettingInput(registered.setting, input);
-        if (value === undefined) {
-          ctx.ui.notify(
-            `Invalid value for ${registered.definition.id}.${registered.field}.`,
-            "warning",
-          );
-          return;
-        }
-
-        const pendingSave = saveSetting(ctx, scope, registered, value)
-          .then(() => {
-            settingsChanged = true;
-          })
-          .catch((error) => {
-            ctx.ui.notify(
-              error instanceof Error
-                ? `Could not save setting: ${error.message}`
-                : "Could not save setting.",
-              "error",
-            );
-          });
-        savePromise = pendingSave;
-        void pendingSave.finally(() => {
-          if (savePromise === pendingSave) savePromise = undefined;
-        });
+        if (id !== SCOPE_ITEM_ID) return;
+        scope = input as WritableConfigScope;
+        settingsList.updateValue(SCOPE_ITEM_ID, scope);
+        tui.requestRender();
       },
       () => done(undefined),
       { enableSearch: false },

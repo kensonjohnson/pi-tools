@@ -121,14 +121,70 @@ test("animates only running workstreams and disposes its spinner timer", () => {
     scheduler,
   );
 
+  const frames = [
+    "⠁",
+    "⠂",
+    "⠄",
+    "⡀",
+    "⡈",
+    "⡐",
+    "⡠",
+    "⣀",
+    "⣁",
+    "⣂",
+    "⣄",
+    "⣌",
+    "⣔",
+    "⣤",
+    "⣥",
+    "⣦",
+    "⣮",
+    "⣶",
+    "⣷",
+    "⣿",
+    "⡿",
+    "⠿",
+    "⢟",
+    "⠟",
+    "⡛",
+    "⠛",
+    "⠫",
+    "⢋",
+    "⠋",
+    "⠍",
+    "⡉",
+    "⠉",
+    "⠑",
+    "⠡",
+    "⢁",
+  ];
+
   assert.equal(timers.size, 1);
-  assert.match(widget.render(240)[1] ?? "", /^⠋ task active objective/);
-  assert.doesNotMatch(widget.render(240)[2] ?? "", /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/);
-  assert.doesNotMatch(widget.render(240)[3] ?? "", /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/);
+  assert.equal(
+    widget.render(240)[1],
+    `${frames[0]} task active objective · running`,
+  );
+  assert.equal(widget.render(240)[2], "task paused objective · paused");
+  assert.equal(
+    widget.render(240)[3],
+    "task inbox objective · settled · inbox pending",
+  );
+
+  for (const frame of frames.slice(1)) {
+    timers.get(1)?.();
+    assert.equal(
+      widget.render(240)[1],
+      `${frame} task active objective · running`,
+    );
+  }
+  assert.equal(renders, frames.length - 1);
 
   timers.get(1)?.();
-  assert.equal(renders, 1);
-  assert.match(widget.render(240)[1] ?? "", /^⠙ task active objective/);
+  assert.equal(renders, frames.length);
+  assert.equal(
+    widget.render(240)[1],
+    `${frames[0]} task active objective · running`,
+  );
 
   widget.dispose();
   assert.deepEqual(cleared, [1]);
