@@ -12,15 +12,48 @@ import {
   SUBAGENT_SETTINGS,
   SUBAGENT_TOOL_NAMES,
 } from "./settings.ts";
+import {
+  renderTaskTimelineEntry,
+  TaskWorkstreamService,
+} from "./task-workstreams.ts";
+import { registerTaskWorkstreamTools } from "./task-tools.ts";
+import { WorkstreamSupervisor } from "./supervisor.ts";
 
 export default function (pi: ExtensionAPI) {
+  let supervisor: WorkstreamSupervisor | undefined;
+  let tasks: TaskWorkstreamService | undefined;
+
   publishExtensionSettings(pi.events, SUBAGENT_SETTINGS);
+  registerTaskWorkstreamTools(pi, () => tasks);
+  pi.registerEntryRenderer(
+    "pi-tools:subagent-task-timeline",
+    renderTaskTimelineEntry,
+  );
 
   pi.on("session_start", async (_event, ctx) => {
-    removeDisabledTools(
-      pi,
-      SUBAGENT_TOOL_NAMES,
-      await isExtensionEnabled(ctx, CONFIG_DIR_NAME, SUBAGENTS_EXTENSION_ID),
-    );
+    const enabled =
+      ctx.isProjectTrusted() &&
+      (await isExtensionEnabled(ctx, CONFIG_DIR_NAME, SUBAGENTS_EXTENSION_ID));
+    removeDisabledTools(pi, SUBAGENT_TOOL_NAMES, enabled);
+    supervisor = undefined;
+    tasks = undefined;
+    if (!enabled) return;
+
+    supervisor = new WorkstreamSupervisor({
+      cwd: ctx.cwd,
+      onEvent: () => {
+        // Routine state remains in the widget and durable journal; only task
+        // completion policy may send a bounded main-agent handoff.
+        void tasks?.refreshWidget(ctx);
+      },
+    });
+    tasks = new TaskWorkstreamService(pi, supervisor, ctx.cwd);
+    await tasks.refreshWidget(ctx);
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    tasks?.clearWidget(ctx);
+    supervisor = undefined;
+    tasks = undefined;
   });
 }

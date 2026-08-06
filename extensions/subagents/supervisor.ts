@@ -30,6 +30,7 @@ export type WorkstreamStatus =
   | "running"
   | "settled"
   | "blocked"
+  | "needs_decision"
   | "failed"
   | "paused"
   | "cancelled";
@@ -61,6 +62,8 @@ export type WorkstreamEvent = {
     | "tool_finished"
     | "settled"
     | "blocked"
+    | "needs_decision"
+    | "follow_up"
     | "failed"
     | "paused";
   status: WorkstreamStatus;
@@ -70,6 +73,7 @@ export type WorkstreamEvent = {
 export type WorkerSession = Pick<
   AgentSession,
   | "sessionFile"
+  | "messages"
   | "subscribe"
   | "prompt"
   | "steer"
@@ -89,12 +93,23 @@ export type WorkerSessionFactory = (
   options: WorkerSessionFactoryOptions,
 ) => Promise<WorkerSession>;
 
+export type WorkstreamCompletion = {
+  status?: Extract<WorkstreamStatus, "settled" | "blocked" | "needs_decision">;
+  detail?: string;
+};
+
+export type WorkstreamCompletionHandler = (input: {
+  manifest: WorkstreamManifest;
+  session: WorkerSession;
+}) => Promise<WorkstreamCompletion | void> | WorkstreamCompletion | void;
+
 export type WorkstreamSupervisorOptions = {
   cwd: string;
   rootDirectory?: string;
   createSession?: WorkerSessionFactory;
   observeGit?: (cwd: string) => Promise<GitObservation>;
   onEvent?: (event: WorkstreamEvent) => void;
+  onCompletion?: WorkstreamCompletionHandler;
 };
 
 export type LaunchWorkstreamInput = {
@@ -149,6 +164,7 @@ export class WorkstreamSupervisor {
   private readonly createSession: WorkerSessionFactory;
   private readonly observeGit: (cwd: string) => Promise<GitObservation>;
   private readonly onEvent?: (event: WorkstreamEvent) => void;
+  private onCompletion?: WorkstreamCompletionHandler;
   private readonly sessions = new Map<string, WorkerSession>();
   private readonly activeWorkstreams = new Set<string>();
   private readonly runs = new Map<string, Promise<void>>();
@@ -162,6 +178,11 @@ export class WorkstreamSupervisor {
     this.createSession = options.createSession ?? createPiWorkerSession;
     this.observeGit = options.observeGit ?? observeGit;
     this.onEvent = options.onEvent;
+    this.onCompletion = options.onCompletion;
+  }
+
+  setCompletionHandler(handler: WorkstreamCompletionHandler | undefined): void {
+    this.onCompletion = handler;
   }
 
   async launch(input: LaunchWorkstreamInput): Promise<WorkstreamManifest> {
@@ -217,21 +238,7 @@ export class WorkstreamSupervisor {
       session.sessionFile,
     );
 
-    const run = Promise.resolve()
-      .then(() => session.prompt(input.brief))
-      .then(() => this.settleIfRunning(id))
-      .catch((error) => this.failIfRunning(id, error));
-    this.runs.set(id, run);
-    void run.then(
-      () => {
-        this.runs.delete(id);
-        this.activeWorkstreams.delete(id);
-      },
-      () => {
-        this.runs.delete(id);
-        this.activeWorkstreams.delete(id);
-      },
-    );
+    this.startRun(id, session, input.brief);
     return running;
   }
 
@@ -257,6 +264,42 @@ export class WorkstreamSupervisor {
 
   async markBlocked(id: string, reason: string): Promise<WorkstreamManifest> {
     return this.transition(id, "blocked", "blocked", reason);
+  }
+
+  async markNeedsDecision(
+    id: string,
+    reason: string,
+  ): Promise<WorkstreamManifest> {
+    return this.transition(id, "needs_decision", "needs_decision", reason);
+  }
+
+  async followUp(id: string, prompt: string): Promise<WorkstreamManifest> {
+    const session = this.sessions.get(id);
+    if (!session) {
+      throw new Error(
+        `Task worker '${id}' is unavailable in this Pi session; it cannot receive a focused follow-up.`,
+      );
+    }
+    const manifest = await this.requireManifest(id);
+    if (this.activeWorkstreams.has(id)) {
+      await session.followUp(prompt);
+      await this.recordRoutineEvent(
+        id,
+        "follow_up",
+        "Focused follow-up queued.",
+      );
+      return this.requireManifest(id);
+    }
+
+    this.activeWorkstreams.add(id);
+    const running = await this.transition(
+      id,
+      "running",
+      "started",
+      "Focused follow-up started.",
+    );
+    this.startRun(id, session, prompt);
+    return running;
   }
 
   async pause(
@@ -297,6 +340,24 @@ export class WorkstreamSupervisor {
     return this.activeWorkstreams.size;
   }
 
+  private startRun(id: string, session: WorkerSession, prompt: string): void {
+    const run = Promise.resolve()
+      .then(() => session.prompt(prompt))
+      .then(() => this.settleIfRunning(id))
+      .catch((error) => this.failIfRunning(id, error));
+    this.runs.set(id, run);
+    void run.then(
+      () => {
+        this.runs.delete(id);
+        this.activeWorkstreams.delete(id);
+      },
+      () => {
+        this.runs.delete(id);
+        this.activeWorkstreams.delete(id);
+      },
+    );
+  }
+
   private handleSessionEvent(id: string, event: AgentSessionEvent): void {
     let eventType: WorkstreamEvent["type"] | undefined;
     let journal: string | undefined;
@@ -313,8 +374,32 @@ export class WorkstreamSupervisor {
 
   private async settleIfRunning(id: string): Promise<void> {
     const manifest = await this.readManifest(id);
-    if (!manifest || manifest.status !== "running") return;
-    await this.transition(id, "settled", "settled", "Worker session settled.");
+    const session = this.sessions.get(id);
+    if (!manifest || !session || manifest.status !== "running") return;
+
+    let completion: WorkstreamCompletion | void;
+    try {
+      completion = await this.onCompletion?.({ manifest, session });
+    } catch (error) {
+      // A parent-side presentation failure must not restart or fail completed
+      // worker execution. The durable worker session and journal remain intact.
+      completion = {
+        detail: `Completion handoff failed: ${errorMessage(error)}`,
+      };
+    }
+    const status = completion?.status ?? "settled";
+    const eventType =
+      status === "blocked"
+        ? "blocked"
+        : status === "needs_decision"
+          ? "needs_decision"
+          : "settled";
+    await this.transition(
+      id,
+      status,
+      eventType,
+      completion?.detail ?? "Worker session settled.",
+    );
   }
 
   private async failIfRunning(id: string, error: unknown): Promise<void> {
@@ -364,7 +449,7 @@ export class WorkstreamSupervisor {
 
   private async recordRoutineEvent(
     id: string,
-    eventType: "tool_started" | "tool_finished",
+    eventType: "tool_started" | "tool_finished" | "follow_up",
     detail: string,
   ): Promise<void> {
     await this.enqueue(id, async () => {

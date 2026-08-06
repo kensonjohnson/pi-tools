@@ -168,6 +168,8 @@ test("removes future launch and control tools when disabled", async () => {
     const handlers = new Map<string, (event: unknown, ctx: any) => unknown>();
     const eventHandlers = new Map<string, (value: unknown) => void>();
     const definitions: unknown[] = [];
+    const registeredTools: unknown[] = [];
+    const entryRenderers: unknown[] = [];
     let active = ["read", ...SUBAGENT_TOOL_NAMES];
     const pi = {
       events: {
@@ -183,6 +185,12 @@ test("removes future launch and control tools when disabled", async () => {
       on(name: string, handler: (event: unknown, ctx: any) => unknown) {
         handlers.set(name, handler);
       },
+      registerTool(tool: unknown) {
+        registeredTools.push(tool);
+      },
+      registerEntryRenderer(type: string, renderer: unknown) {
+        entryRenderers.push({ type, renderer });
+      },
       getActiveTools: () => active,
       setActiveTools(toolNames: string[]) {
         active = toolNames;
@@ -196,5 +204,10 @@ test("removes future launch and control tools when disabled", async () => {
     );
     assert.deepEqual(active, ["read"]);
     assert.deepEqual(definitions, [SUBAGENT_SETTINGS]);
+    assert.equal(registeredTools.length, 3);
+    assert.deepEqual(
+      entryRenderers.map((entry: any) => entry.type),
+      ["pi-tools:subagent-task-timeline"],
+    );
   });
 });
