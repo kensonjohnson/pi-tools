@@ -80,13 +80,6 @@ export function registerTaskWorkstreamTools(
     description:
       "Explicitly launch one persistent task worker with a focused objective, scope, and minimal relevant context. The worker runs independently; do not delegate routine work merely because capacity exists.",
     parameters: TaskLaunchParameters,
-    renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", `Task: ${taskLaunchTitle(args.objective)}`),
-        0,
-        0,
-      );
-    },
     renderResult(_result, _options, theme, context) {
       return new Text(
         theme.fg("success", `Task: ${taskLaunchTitle(context.args.objective)}`),

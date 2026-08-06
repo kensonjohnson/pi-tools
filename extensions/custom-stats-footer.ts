@@ -16,6 +16,7 @@ import {
 } from "../lib/pi-tools-config.ts";
 import { getRuntimeSettings } from "../lib/pi-tools-runtime-settings.ts";
 import { ResponseTpsMeter } from "./custom-stats-footer/metrics.ts";
+import { getCodexQuotaColor } from "./custom-stats-footer/quota-color.ts";
 
 /**
  * Custom Default Footer Extension with TPS
@@ -447,13 +448,16 @@ export default function (pi: ExtensionAPI) {
                   ? fullQuota
                   : compactQuota;
 
-              if (codexQuota.remainingPercent < 20) {
-                statsParts.push(theme.fg("error", quotaText));
-              } else if (codexQuota.remainingPercent <= 50) {
-                statsParts.push(theme.fg("warning", quotaText));
-              } else {
-                statsParts.push(theme.fg("success", quotaText));
-              }
+              statsParts.push(
+                theme.fg(
+                  getCodexQuotaColor(
+                    codexQuota.remainingPercent,
+                    codexQuota.resetAtMs,
+                    Date.now(),
+                  ),
+                  quotaText,
+                ),
+              );
             } else if (quotaUnavailable) {
               statsParts.push(theme.fg("warning", "Codex unavailable"));
             }

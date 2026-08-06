@@ -246,6 +246,170 @@ test("queues durable completion inbox records only after settlement and acknowle
   });
 });
 
+test("interrupts an active main-session wait and replays captured user inputs FIFO", async () => {
+  await withTemporaryConfig(async ({ cwd, agentDir }) => {
+    await writeJson(join(agentDir, CONFIG_FILE_NAME), {
+      version: 1,
+      extensions: {
+        [SUBAGENTS_EXTENSION_ID]: { enabled: true, delegationMode: "manual" },
+      },
+    });
+    const { default: extension } = await import("./index.ts");
+    const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+    const replayed: unknown[] = [];
+    const pi = {
+      events: {
+        emit() {},
+        on() {
+          return () => {};
+        },
+      },
+      on(name: string, handler: (event: any, ctx: any) => unknown) {
+        handlers.set(name, handler);
+      },
+      registerTool() {},
+      registerEntryRenderer() {},
+      getActiveTools: () => SUBAGENT_TOOL_NAMES,
+      setActiveTools() {},
+      sendMessage() {},
+      sendUserMessage(content: unknown) {
+        replayed.push(content);
+      },
+      appendEntry() {},
+    };
+    let idle = false;
+    let aborts = 0;
+    const ctx = {
+      cwd,
+      isProjectTrusted: () => true,
+      isIdle: () => idle,
+      abort() {
+        aborts++;
+      },
+      ui: { setWidget() {} },
+    };
+    extension(pi as unknown as ExtensionAPI);
+    await handlers.get("session_start")?.({}, ctx);
+
+    handlers.get("tool_execution_start")?.(
+      { toolCallId: "wait-1", toolName: "subagent_wait", args: {} },
+      ctx,
+    );
+    const image = { type: "image", data: "preserved", mimeType: "image/png" };
+    assert.deepEqual(
+      await handlers.get("input")?.(
+        {
+          text: "First user message",
+          images: [image],
+          source: "interactive",
+          streamingBehavior: "steer",
+        },
+        ctx,
+      ),
+      { action: "handled" },
+    );
+    assert.deepEqual(
+      await handlers.get("input")?.(
+        {
+          text: "Second user message",
+          source: "rpc",
+          streamingBehavior: "followUp",
+        },
+        ctx,
+      ),
+      { action: "handled" },
+    );
+    assert.equal(aborts, 2);
+
+    assert.equal(
+      await handlers.get("input")?.(
+        {
+          text: "Extension replay must not recurse",
+          source: "extension",
+          streamingBehavior: "steer",
+        },
+        ctx,
+      ),
+      undefined,
+    );
+    const workerCtx = {
+      ...ctx,
+      sessionManager: {
+        getSessionDir: () => join(cwd, "tmp", "subagents", "worker", "session"),
+      },
+    };
+    assert.equal(
+      await handlers.get("input")?.(
+        {
+          text: "SDK worker input must not interrupt",
+          source: "interactive",
+          streamingBehavior: "steer",
+        },
+        workerCtx,
+      ),
+      undefined,
+    );
+    assert.equal(aborts, 2);
+
+    handlers.get("tool_execution_end")?.(
+      {
+        toolCallId: "wait-1",
+        toolName: "subagent_wait",
+        result: {},
+        isError: true,
+      },
+      ctx,
+    );
+    assert.deepEqual(
+      await handlers.get("input")?.(
+        {
+          text: "Third user message after the wait tool ended",
+          source: "interactive",
+          streamingBehavior: "steer",
+        },
+        ctx,
+      ),
+      { action: "handled" },
+    );
+    assert.equal(aborts, 3);
+
+    idle = true;
+    await handlers.get("agent_settled")?.({}, ctx);
+    assert.deepEqual(replayed, [
+      [{ type: "text", text: "First user message" }, image],
+    ]);
+    await handlers.get("agent_settled")?.({}, ctx);
+    assert.deepEqual(replayed, [
+      [{ type: "text", text: "First user message" }, image],
+      "Second user message",
+    ]);
+    await handlers.get("agent_settled")?.({}, ctx);
+    assert.deepEqual(replayed, [
+      [{ type: "text", text: "First user message" }, image],
+      "Second user message",
+      "Third user message after the wait tool ended",
+    ]);
+
+    idle = false;
+    handlers.get("tool_execution_start")?.(
+      { toolCallId: "wait-2", toolName: "subagent_wait", args: {} },
+      ctx,
+    );
+    await handlers.get("input")?.(
+      {
+        text: "Do not replay after shutdown",
+        source: "interactive",
+        streamingBehavior: "steer",
+      },
+      ctx,
+    );
+    await handlers.get("session_shutdown")?.({}, ctx);
+    idle = true;
+    await handlers.get("agent_settled")?.({}, ctx);
+    assert.equal(replayed.length, 3);
+  });
+});
+
 test("removes future launch and control tools when disabled", async () => {
   await withTemporaryConfig(async ({ cwd, agentDir }) => {
     await writeJson(join(agentDir, CONFIG_FILE_NAME), {

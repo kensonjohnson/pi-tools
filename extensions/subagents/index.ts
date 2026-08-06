@@ -3,6 +3,8 @@ import {
   CONFIG_DIR_NAME,
   type ExtensionAPI,
   type ExtensionContext,
+  type ImageContent,
+  type InputEvent,
 } from "@earendil-works/pi-coding-agent";
 import { publishExtensionSettings } from "../../lib/pi-tools-config.ts";
 import {
@@ -33,6 +35,11 @@ import {
 import { WorkstreamSupervisor } from "./supervisor.ts";
 import { registerSubagentWaitTool, SubagentWaitService } from "./wait-tools.ts";
 
+type DeferredUserInput = {
+  text: string;
+  images?: ImageContent[];
+};
+
 const PROACTIVE_DELEGATION_GUIDANCE = `
 ## Proactive subagent delegation
 
@@ -55,6 +62,12 @@ export default function (pi: ExtensionAPI) {
   let inboxDelivery: CompletionInboxDelivery | undefined;
   let wait: SubagentWaitService | undefined;
   let delegationMode: "manual" | "proactive" = "manual";
+  let sessionActive = false;
+  // Keep intercepting through abort unwinding after the wait tool itself ends.
+  let waitAbortPending = false;
+  const activeWaitToolCallIds = new Set<string>();
+  // One replay per settled turn preserves interactive/RPC input order.
+  const deferredUserInputs: DeferredUserInput[] = [];
 
   publishExtensionSettings(pi.events, SUBAGENT_SETTINGS);
   registerTaskWorkstreamTools(pi, () => tasks);
@@ -74,6 +87,10 @@ export default function (pi: ExtensionAPI) {
   );
 
   pi.on("session_start", async (_event, ctx) => {
+    sessionActive = false;
+    waitAbortPending = false;
+    activeWaitToolCallIds.clear();
+    deferredUserInputs.length = 0;
     const workerSession = isSubagentWorkerSession(ctx);
     const enabled =
       !workerSession &&
@@ -88,6 +105,7 @@ export default function (pi: ExtensionAPI) {
     wait = undefined;
     delegationMode = "manual";
     if (!enabled) return;
+    sessionActive = true;
     delegationMode = await resolveSubagentDelegationMode(ctx);
 
     supervisor = new WorkstreamSupervisor({
@@ -114,10 +132,54 @@ export default function (pi: ExtensionAPI) {
     await tasks.refreshWidget(ctx);
   });
 
+  pi.on("tool_execution_start", (event, ctx) => {
+    if (
+      sessionActive &&
+      !isSubagentWorkerSession(ctx) &&
+      event.toolName === "subagent_wait"
+    ) {
+      activeWaitToolCallIds.add(event.toolCallId);
+    }
+  });
+
+  pi.on("tool_execution_end", (event, ctx) => {
+    if (!isSubagentWorkerSession(ctx)) {
+      activeWaitToolCallIds.delete(event.toolCallId);
+    }
+  });
+
+  pi.on("input", (event, ctx) => {
+    if (
+      !shouldInterruptWait(
+        event,
+        ctx,
+        sessionActive,
+        waitAbortPending,
+        activeWaitToolCallIds,
+      )
+    ) {
+      return;
+    }
+    deferredUserInputs.push({
+      text: event.text,
+      images: event.images ? [...event.images] : undefined,
+    });
+    waitAbortPending = true;
+    ctx.abort();
+    return { action: "handled" };
+  });
+
   pi.on("agent_settled", async (_event, ctx) => {
-    if (!inboxDelivery || isSubagentWorkerSession(ctx)) return;
-    await inboxDelivery.schedule();
+    if (!sessionActive || isSubagentWorkerSession(ctx)) return;
+    waitAbortPending = false;
+    await inboxDelivery?.schedule();
     await tasks?.refreshWidget(ctx);
+    replayNextDeferredUserInput(
+      pi,
+      ctx,
+      deferredUserInputs,
+      () => sessionActive,
+    );
   });
 
   pi.on("message_end", async (event, ctx) => {
@@ -141,6 +203,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    sessionActive = false;
+    waitAbortPending = false;
+    activeWaitToolCallIds.clear();
+    deferredUserInputs.length = 0;
     await supervisor?.shutdown();
     tasks?.clearWidget(ctx);
     supervisor = undefined;
@@ -151,6 +217,40 @@ export default function (pi: ExtensionAPI) {
     wait = undefined;
     delegationMode = "manual";
   });
+}
+
+function shouldInterruptWait(
+  event: InputEvent,
+  ctx: ExtensionContext,
+  sessionActive: boolean,
+  waitAbortPending: boolean,
+  activeWaitToolCallIds: ReadonlySet<string>,
+): boolean {
+  return (
+    sessionActive &&
+    (activeWaitToolCallIds.size > 0 || waitAbortPending) &&
+    (event.source === "interactive" || event.source === "rpc") &&
+    event.streamingBehavior !== undefined &&
+    !ctx.isIdle() &&
+    !isSubagentWorkerSession(ctx)
+  );
+}
+
+function replayNextDeferredUserInput(
+  pi: Pick<ExtensionAPI, "sendUserMessage">,
+  ctx: Pick<ExtensionContext, "isIdle">,
+  deferredUserInputs: DeferredUserInput[],
+  isSessionActive: () => boolean,
+): void {
+  if (!isSessionActive() || deferredUserInputs.length === 0 || !ctx.isIdle()) {
+    return;
+  }
+  const input = deferredUserInputs.shift();
+  if (!input) return;
+  const content = input.images?.length
+    ? [{ type: "text" as const, text: input.text }, ...input.images]
+    : input.text;
+  pi.sendUserMessage(content);
 }
 
 export function isSubagentWorkerSession(

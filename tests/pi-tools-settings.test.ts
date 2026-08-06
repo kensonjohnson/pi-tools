@@ -9,7 +9,7 @@ import {
   SETTINGS_DEFINITION_EVENT,
   SETTINGS_DEFINITION_REQUEST_EVENT,
 } from "../lib/pi-tools-config.ts";
-import extension from "./pi-tools-settings.ts";
+import extension from "../extensions/pi-tools-settings.ts";
 
 initTheme();
 
