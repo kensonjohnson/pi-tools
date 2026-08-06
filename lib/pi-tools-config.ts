@@ -29,6 +29,7 @@ export type NumberSettingDefinition = SettingMetadata & {
   default: number;
   minimum?: number;
   maximum?: number;
+  integer?: boolean;
 };
 
 export type StringSettingDefinition = SettingMetadata & {
@@ -405,6 +406,7 @@ function isValidSettingValue(
       return (
         typeof value === "number" &&
         Number.isFinite(value) &&
+        (!definition.integer || Number.isInteger(value)) &&
         (definition.minimum === undefined || value >= definition.minimum) &&
         (definition.maximum === undefined || value <= definition.maximum)
       );
