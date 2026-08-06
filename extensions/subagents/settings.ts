@@ -15,6 +15,7 @@ export const SUBAGENT_TOOL_NAMES = [
 ] as const;
 
 export type SubagentWorkstreamKind = "task" | "research";
+export type SubagentDelegationMode = "manual" | "proactive";
 
 export const SUBAGENT_SETTINGS: ExtensionSettingsDefinition = {
   id: SUBAGENTS_EXTENSION_ID,
@@ -27,6 +28,14 @@ export const SUBAGENT_SETTINGS: ExtensionSettingsDefinition = {
       default: true,
       label: "Enabled",
       description: "Allows explicit task-worker and research-job launches.",
+    },
+    delegationMode: {
+      type: "enum",
+      default: "proactive",
+      values: ["manual", "proactive"],
+      label: "Delegation mode",
+      description:
+        "Proactive lets the main agent independently delegate useful bounded work; manual requires an explicit delegation request.",
     },
     maxConcurrentWorkers: {
       type: "number",

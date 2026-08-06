@@ -56,6 +56,10 @@ class FakeWorkerSession {
     return Promise.resolve();
   }
 
+  emit(event: AgentSessionEvent): void {
+    for (const listener of this.listeners) listener(event);
+  }
+
   dispose(): void {}
 
   settle(run = this.runs.length - 1): void {
@@ -89,6 +93,7 @@ test("retains task detail locally and emits one bounded handoff per completed pe
   const session = new FakeWorkerSession(join(root, "worker.jsonl"));
   const entries: Array<{ type: string; data: unknown }> = [];
   const messages: Array<{ content: string; options: unknown }> = [];
+  let widget: unknown;
   const supervisor = new WorkstreamSupervisor({
     cwd: root,
     rootDirectory: join(root, "subagents"),
@@ -118,6 +123,26 @@ test("retains task detail locally and emits one bounded handoff per completed pe
     assert.match(brief, /task-worker-report/);
     const workstream = await supervisor.launch({ kind: "task", brief, policy });
     await Promise.resolve();
+    session.emit({
+      type: "tool_execution_start",
+      toolCallId: "read-1",
+      toolName: "read",
+      args: {},
+    } as AgentSessionEvent);
+    await supervisor.flush();
+    await service.refreshWidget({
+      ui: {
+        setWidget(_key: string, content: unknown) {
+          widget = content;
+        },
+      },
+    } as any);
+    const widgetLines = (widget as any)(
+      {},
+      { fg: (_color: string, text: string) => text },
+    ).render(240);
+    assert.match(widgetLines.join("\n"), /task .*running/);
+    assert.match(widgetLines.join("\n"), /tool_started: Worker started read/);
     session.messages = [
       assistantReport("needs-decision", "A product choice is required."),
     ];
@@ -165,6 +190,14 @@ test("retains task detail locally and emits one bounded handoff per completed pe
     assert.equal(messages.length, 2);
     assert.equal(entries.length, 3);
     assert.equal((await supervisor.get(workstream.id))?.status, "settled");
+    await service.refreshWidget({
+      ui: {
+        setWidget(_key: string, content: unknown) {
+          widget = content;
+        },
+      },
+    } as any);
+    assert.equal(widget, undefined);
     assert.equal(
       (entries[0]?.data as { workstreamId?: string }).workstreamId,
       workstream.id,

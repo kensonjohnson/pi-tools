@@ -10,6 +10,7 @@ import {
 import {
   modelFieldForWorkstream,
   SUBAGENTS_EXTENSION_ID,
+  type SubagentDelegationMode,
   type SubagentWorkstreamKind,
 } from "./settings.ts";
 
@@ -33,6 +34,32 @@ export type SubagentLaunchPolicy = {
   maxConcurrentWorkers: number;
   model: ResolvedSubagentModel;
 };
+
+export async function resolveSubagentDelegationMode(
+  ctx: Pick<ExtensionContext, "cwd" | "isProjectTrusted">,
+  options: { configDirName?: string; registry?: SettingsRegistry } = {},
+): Promise<SubagentDelegationMode> {
+  if (!ctx.isProjectTrusted()) return "manual";
+  const settings = await getEffectiveSettings({
+    cwd: ctx.cwd,
+    projectTrusted: true,
+    configDirName: options.configDirName ?? CONFIG_DIR_NAME,
+    registry: options.registry,
+  });
+  if (
+    getSettingValue<boolean>(settings, SUBAGENTS_EXTENSION_ID, "enabled") ===
+    false
+  ) {
+    return "manual";
+  }
+  return getSettingValue<string>(
+    settings,
+    SUBAGENTS_EXTENSION_ID,
+    "delegationMode",
+  ) === "manual"
+    ? "manual"
+    : "proactive";
+}
 
 export async function resolveSubagentLaunchPolicy(
   ctx: SubagentLaunchContext,

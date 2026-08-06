@@ -9,6 +9,7 @@ import {
   SettingsRegistry,
 } from "../../lib/pi-tools-config.ts";
 import {
+  resolveSubagentDelegationMode,
   resolveSubagentLaunchPolicy,
   resolveSubagentModel,
 } from "./launch-policy.ts";
@@ -65,11 +66,13 @@ async function writeJson(path: string, value: unknown): Promise<void> {
 test("registers the approved four Subagents settings", () => {
   assert.deepEqual(Object.keys(SUBAGENT_SETTINGS.fields), [
     "enabled",
+    "delegationMode",
     "maxConcurrentWorkers",
     "models.task",
     "models.research",
   ]);
   assert.equal(SUBAGENT_SETTINGS.fields.enabled.default, true);
+  assert.equal(SUBAGENT_SETTINGS.fields.delegationMode.default, "proactive");
   assert.equal(SUBAGENT_SETTINGS.fields.maxConcurrentWorkers.default, 2);
   assert.equal(SUBAGENT_SETTINGS.fields["models.task"].default, "inherit");
   assert.equal(SUBAGENT_SETTINGS.fields["models.research"].default, "inherit");
@@ -130,6 +133,10 @@ test("uses trusted project overrides and rejects disabled or untrusted launches"
     const policy = await resolveSubagentLaunchPolicy(trusted, "task", {
       registry,
     });
+    assert.equal(
+      await resolveSubagentDelegationMode(trusted, { registry }),
+      "proactive",
+    );
     assert.equal(policy.maxConcurrentWorkers, 2);
     assert.equal(policy.model.model, parentModel);
 
@@ -144,8 +151,23 @@ test("uses trusted project overrides and rejects disabled or untrusted launches"
 
     await writeJson(join(agentDir, CONFIG_FILE_NAME), {
       version: 1,
+      extensions: { [SUBAGENTS_EXTENSION_ID]: { delegationMode: "manual" } },
+    });
+    assert.equal(
+      await resolveSubagentDelegationMode(trusted, { registry }),
+      "manual",
+    );
+    await writeJson(join(agentDir, CONFIG_FILE_NAME), {
+      version: 1,
       extensions: { [SUBAGENTS_EXTENSION_ID]: { enabled: false } },
     });
+    assert.equal(
+      await resolveSubagentDelegationMode(
+        { ...trusted, cwd: join(agentDir, "other-project") },
+        { registry },
+      ),
+      "manual",
+    );
     await assert.rejects(
       resolveSubagentLaunchPolicy(
         { ...trusted, cwd: join(agentDir, "other-project") },

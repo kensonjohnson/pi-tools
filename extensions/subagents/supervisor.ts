@@ -622,10 +622,10 @@ export class WorkstreamSupervisor {
     let journal: string | undefined;
     if (event.type === "tool_execution_start") {
       eventType = "tool_started";
-      journal = "Worker started a tool call.";
+      journal = `Worker started ${event.toolName || "a tool call"}.`;
     } else if (event.type === "tool_execution_end") {
       eventType = "tool_finished";
-      journal = "Worker finished a tool call.";
+      journal = `Worker finished ${event.toolName || "a tool call"}.`;
     }
     if (!eventType || !journal) return;
     this.track(this.recordRoutineEvent(id, eventType, journal));

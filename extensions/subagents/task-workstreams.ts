@@ -20,6 +20,13 @@ export const TASK_CONTROL_TIMELINE_ENTRY_TYPE =
 export const TASK_HANDOFF_MESSAGE_TYPE = "pi-tools:subagent-task-handoff";
 const MAX_HANDOFF_CHARS = 2_400;
 const MAX_TIMELINE_LINES = 80;
+const WIDGET_VISIBLE_STATUSES = new Set<WorkstreamManifest["status"]>([
+  "starting",
+  "running",
+  "paused",
+  "blocked",
+  "needs_decision",
+]);
 
 type TaskReportStatus = "completed" | "blocked" | "needs-decision";
 
@@ -187,16 +194,22 @@ export class TaskWorkstreamService {
   }
 
   async refreshWidget(ctx: Pick<ExtensionContext, "ui">): Promise<void> {
-    const manifests = await this.supervisor.list();
-    const rows = manifests
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-      .map((entry) => formatWidgetRow(entry));
+    const manifests = (await this.supervisor.list())
+      .filter((entry) => WIDGET_VISIBLE_STATUSES.has(entry.status))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    if (manifests.length === 0) {
+      this.clearWidget(ctx);
+      return;
+    }
+    const rows = await Promise.all(
+      manifests.map(async (entry) =>
+        formatWidgetRow(entry, await this.readLatestJournalActivity(entry)),
+      ),
+    );
     ctx.ui.setWidget("pi-tools-subagent-workstreams", (_tui, theme) => ({
       render: (width) => [
         theme.fg("accent", "Subagent workstreams"),
-        ...(rows.length > 0
-          ? rows.map((row) => truncateToWidth(row, width))
-          : [theme.fg("dim", "No subagent workstreams.")]),
+        ...rows.map((row) => truncateToWidth(row, width)),
       ],
       invalidate: () => {},
     }));
@@ -314,6 +327,27 @@ export class TaskWorkstreamService {
       ) as TaskWorkerReport;
     } catch {
       return undefined;
+    }
+  }
+
+  private async readLatestJournalActivity(
+    manifest: WorkstreamManifest,
+  ): Promise<string> {
+    try {
+      const line = (
+        await readFile(
+          join(this.workstreamDirectory(manifest), "journal.md"),
+          "utf8",
+        )
+      )
+        .split("\n")
+        .filter((entry) => entry.startsWith("["))
+        .at(-1);
+      return line
+        ? bound(line.replace(/^\[[^\]]+\]\s*/, ""), 240)
+        : "Awaiting worker activity.";
+    } catch {
+      return "Awaiting worker activity.";
     }
   }
 
@@ -520,23 +554,17 @@ function formatBoundedHandoff(
   return bound(lines.join("\n"), MAX_HANDOFF_CHARS);
 }
 
-function formatWidgetRow(manifest: WorkstreamManifest): string {
+function formatWidgetRow(
+  manifest: WorkstreamManifest,
+  activity: string,
+): string {
   const indicator =
     manifest.status === "running" || manifest.status === "starting"
       ? "●"
-      : manifest.status === "settled"
-        ? "✓"
+      : manifest.status === "paused"
+        ? "Ⅱ"
         : "!";
-  return `${indicator} ${shortId(manifest.id)}  ${manifest.kind} · ${manifest.status}  ${bound(firstLine(manifest.brief), 72)}`;
-}
-
-function firstLine(text: string): string {
-  return (
-    text
-      .split("\n")
-      .find((line) => line.trim())
-      ?.trim() ?? "Task worker"
-  );
+  return `${indicator} ${manifest.kind} ${shortId(manifest.id)} · ${manifest.status} — ${activity}`;
 }
 
 function shortId(id: string): string {
