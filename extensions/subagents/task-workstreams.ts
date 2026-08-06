@@ -15,6 +15,8 @@ import {
 } from "./supervisor.ts";
 
 export const TASK_TIMELINE_ENTRY_TYPE = "pi-tools:subagent-task-timeline";
+export const TASK_CONTROL_TIMELINE_ENTRY_TYPE =
+  "pi-tools:subagent-task-control-timeline";
 export const TASK_HANDOFF_MESSAGE_TYPE = "pi-tools:subagent-task-handoff";
 const MAX_HANDOFF_CHARS = 2_400;
 const MAX_TIMELINE_LINES = 80;
@@ -44,6 +46,13 @@ export type TaskTimelineEntry = {
   timeline: string[];
 };
 
+export type TaskControlTimelineEntry = {
+  workstreamId: string;
+  action: Exclude<TaskControlAction, "status">;
+  status: WorkstreamManifest["status"];
+  detail?: string;
+};
+
 export type TaskLaunchInput = {
   objective: string;
   scope: string;
@@ -53,6 +62,15 @@ export type TaskLaunchInput = {
 export type TaskFollowUpInput = {
   workstreamId: string;
   focus: string;
+};
+
+export type TaskControlAction =
+  "redirect" | "checkpoint" | "pause" | "cancel" | "resume" | "status";
+
+export type TaskControlInput = {
+  workstreamId: string;
+  action: TaskControlAction;
+  message?: string;
 };
 
 export class TaskWorkstreamService {
@@ -92,6 +110,30 @@ export class TaskWorkstreamService {
     );
   }
 
+  async deliverResearchSynthesis(
+    workstreamId: string,
+    synthesis: string,
+  ): Promise<boolean> {
+    const manifest = await this.requireTask(workstreamId);
+    // A research job may only inform the worker the parent explicitly linked
+    // while it is still live; it must never restart or reopen task work.
+    if (
+      manifest.status !== "running" ||
+      !(await this.supervisor.isLive(manifest.id))
+    ) {
+      return false;
+    }
+    try {
+      await this.supervisor.followUp(
+        manifest.id,
+        buildResearchSynthesisFollowUp(synthesis),
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async currentReport(workstreamId: string): Promise<{
     manifest: WorkstreamManifest;
     report?: TaskWorkerReport;
@@ -100,19 +142,61 @@ export class TaskWorkstreamService {
     return { manifest, report: await this.readLatestReport(manifest) };
   }
 
-  async refreshWidget(ctx: Pick<ExtensionContext, "ui">): Promise<void> {
-    const manifests = (await this.supervisor.list()).filter(
-      (entry) => entry.kind === "task",
+  async control(
+    ctx: ExtensionContext,
+    input: TaskControlInput,
+  ): Promise<WorkstreamManifest> {
+    const manifest = await this.requireTask(input.workstreamId);
+    const message = input.message?.trim();
+    if (input.action === "status") return manifest;
+
+    let next: WorkstreamManifest;
+    switch (input.action) {
+      case "redirect":
+        if (!message) throw new Error("A redirect instruction is required.");
+        next = await this.supervisor.redirect(
+          manifest.id,
+          buildRedirect(message),
+        );
+        break;
+      case "checkpoint":
+        next = await this.supervisor.checkpoint(manifest.id, message);
+        break;
+      case "pause":
+        next = await this.supervisor.pause(manifest.id, message);
+        break;
+      case "cancel":
+        next = await this.supervisor.cancel(manifest.id, message);
+        break;
+      case "resume": {
+        const policy = await resolveSubagentLaunchPolicy(ctx, "task");
+        next = await this.supervisor.resume(manifest.id, policy);
+        break;
+      }
+    }
+    this.pi.appendEntry<TaskControlTimelineEntry>(
+      TASK_CONTROL_TIMELINE_ENTRY_TYPE,
+      {
+        workstreamId: next.id,
+        action: input.action,
+        status: next.status,
+        ...(message ? { detail: bound(message, 500) } : {}),
+      },
     );
+    return next;
+  }
+
+  async refreshWidget(ctx: Pick<ExtensionContext, "ui">): Promise<void> {
+    const manifests = await this.supervisor.list();
     const rows = manifests
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
       .map((entry) => formatWidgetRow(entry));
     ctx.ui.setWidget("pi-tools-subagent-workstreams", (_tui, theme) => ({
       render: (width) => [
-        theme.fg("accent", "Task workstreams"),
+        theme.fg("accent", "Subagent workstreams"),
         ...(rows.length > 0
           ? rows.map((row) => truncateToWidth(row, width))
-          : [theme.fg("dim", "No task workstreams.")]),
+          : [theme.fg("dim", "No subagent workstreams.")]),
       ],
       invalidate: () => {},
     }));
@@ -126,7 +210,7 @@ export class TaskWorkstreamService {
     manifest: WorkstreamManifest;
     session: { messages: AgentMessage[] };
   }): Promise<WorkstreamCompletion> {
-    if (input.manifest.kind !== "task") return {};
+    if (input.manifest.kind !== "task") return undefined;
     const finalAssistantText = extractFinalAssistantText(
       input.session.messages,
     );
@@ -281,6 +365,42 @@ export function buildFocusedFollowUp(focus: string): string {
   ].join("\n");
 }
 
+export function buildResearchSynthesisFollowUp(synthesis: string): string {
+  return [
+    "# Linked research synthesis",
+    bound(synthesis, 2_400),
+    "",
+    "Use this cited synthesis only if it helps the active task. Do not request or import the research worker's transcript or raw sources. Continue your existing task and end the run with the required `<task-worker-report>` JSON block.",
+  ].join("\n");
+}
+
+export function buildRedirect(instruction: string): string {
+  return [
+    "# Parent redirect",
+    instruction.trim(),
+    "",
+    "Treat this as the current priority. Keep the existing worker context, stop work that no longer serves this direction, and end with the required `<task-worker-report>` JSON block when the run concludes.",
+  ].join("\n");
+}
+
+export const renderTaskControlTimelineEntry: EntryRenderer<
+  TaskControlTimelineEntry
+> = (entry, _options, theme) => {
+  const data = entry.data;
+  if (!isControlTimelineEntry(data)) return undefined;
+  return new Text(
+    [
+      theme.fg(
+        data.action === "cancel" ? "warning" : "accent",
+        `Task ${shortId(data.workstreamId)} · ${data.action} · ${data.status}`,
+      ),
+      ...(data.detail ? [theme.fg("dim", data.detail)] : []),
+    ].join("\n"),
+    0,
+    0,
+  );
+};
+
 export const renderTaskTimelineEntry: EntryRenderer<TaskTimelineEntry> = (
   entry,
   options,
@@ -407,7 +527,7 @@ function formatWidgetRow(manifest: WorkstreamManifest): string {
       : manifest.status === "settled"
         ? "✓"
         : "!";
-  return `${indicator} ${shortId(manifest.id)}  ${manifest.status}  ${bound(firstLine(manifest.brief), 72)}`;
+  return `${indicator} ${shortId(manifest.id)}  ${manifest.kind} · ${manifest.status}  ${bound(firstLine(manifest.brief), 72)}`;
 }
 
 function firstLine(text: string): string {
@@ -445,6 +565,18 @@ function bound(text: string, limit: number): string {
   return normalized.length <= limit
     ? normalized
     : `${normalized.slice(0, limit - 1)}…`;
+}
+
+function isControlTimelineEntry(
+  value: unknown,
+): value is TaskControlTimelineEntry {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "workstreamId" in value &&
+    "action" in value &&
+    "status" in value
+  );
 }
 
 function isTimelineEntry(value: unknown): value is TaskTimelineEntry {

@@ -40,6 +40,33 @@ const TaskReportParameters = Type.Object({
   }),
 });
 
+const TaskControlParameters = Type.Object({
+  workstreamId: Type.String({
+    description: "The task workstream identifier to control.",
+    minLength: 1,
+  }),
+  action: Type.Union(
+    [
+      Type.Literal("redirect"),
+      Type.Literal("checkpoint"),
+      Type.Literal("pause"),
+      Type.Literal("cancel"),
+      Type.Literal("resume"),
+      Type.Literal("status"),
+    ],
+    {
+      description:
+        "redirect steers current work; checkpoint snapshots recovery context; pause stops resumably; cancel is terminal; resume explicitly reopens a paused worker; status inspects state.",
+    },
+  ),
+  message: Type.Optional(
+    Type.String({
+      description:
+        "Required for redirect; optional concise reason for checkpoint, pause, or cancel. It is saved in the durable journal.",
+    }),
+  ),
+});
+
 export function registerTaskWorkstreamTools(
   pi: ExtensionAPI,
   getService: () => TaskWorkstreamService | undefined,
@@ -99,6 +126,41 @@ export function registerTaskWorkstreamTools(
   });
 
   pi.registerTool({
+    name: "subagent_task_control",
+    label: "Control task worker",
+    description:
+      "Perform a deliberate task-worker lifecycle action. Redirect uses the live steer queue; pause and cancel never restart work automatically; only an explicit resume may reopen a paused worker.",
+    parameters: TaskControlParameters,
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const service = getService();
+      if (!service) return unavailable();
+      try {
+        const workstream = await service.control(ctx, params);
+        await service.refreshWidget(ctx);
+        return {
+          content: [
+            {
+              type: "text",
+              text: formatControlResult(
+                workstream.id,
+                params.action,
+                workstream.status,
+              ),
+            },
+          ],
+          details: {
+            workstreamId: workstream.id,
+            action: params.action,
+            status: workstream.status,
+          },
+        };
+      } catch (error) {
+        return toolError(error);
+      }
+    },
+  });
+
+  pi.registerTool({
     name: "subagent_task_report",
     label: "Inspect task worker report",
     description:
@@ -132,6 +194,14 @@ export function registerTaskWorkstreamTools(
       }
     },
   });
+}
+
+function formatControlResult(
+  id: string,
+  action: string,
+  status: string,
+): string {
+  return `Task worker ${id}: ${action} recorded; status: ${status}.`;
 }
 
 function formatReport(

@@ -10,6 +10,7 @@ import {
   buildFocusedFollowUp,
   buildTaskBrief,
   TaskWorkstreamService,
+  TASK_CONTROL_TIMELINE_ENTRY_TYPE,
   TASK_HANDOFF_MESSAGE_TYPE,
   TASK_TIMELINE_ENTRY_TYPE,
 } from "./task-workstreams.ts";
@@ -136,6 +137,12 @@ test("retains task detail locally and emits one bounded handoff per completed pe
     assert.equal(entries[0]?.type, TASK_TIMELINE_ENTRY_TYPE);
     assert.match(messages[0]?.content ?? "", /needs a decision/);
     assert.deepEqual(messages[0]?.options, { triggerTurn: true });
+    await service.control({} as any, {
+      workstreamId: workstream.id,
+      action: "checkpoint",
+      message: "Retain the decision context.",
+    });
+    assert.equal(entries[1]?.type, TASK_CONTROL_TIMELINE_ENTRY_TYPE);
 
     const followUp = buildFocusedFollowUp(
       "Choose the smallest compatible design.",
@@ -156,7 +163,7 @@ test("retains task detail locally and emits one bounded handoff per completed pe
     assert.equal(second.report?.status, "completed");
     assert.equal(second.report?.sequence, 2);
     assert.equal(messages.length, 2);
-    assert.equal(entries.length, 2);
+    assert.equal(entries.length, 3);
     assert.equal((await supervisor.get(workstream.id))?.status, "settled");
     assert.equal(
       (entries[0]?.data as { workstreamId?: string }).workstreamId,

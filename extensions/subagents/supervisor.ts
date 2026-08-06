@@ -40,6 +40,13 @@ export type GitObservation = {
   commit?: string;
 };
 
+export type WorkstreamRecovery = {
+  checkpointAt: string;
+  reason: string;
+  workerSessionFile?: string;
+  journalTail: string[];
+};
+
 export type WorkstreamManifest = {
   version: number;
   id: string;
@@ -50,7 +57,9 @@ export type WorkstreamManifest = {
   updatedAt: string;
   workerSessionDirectory: string;
   workerSessionFile?: string;
+  linkedTaskWorkstreamId?: string;
   git: GitObservation;
+  recovery?: WorkstreamRecovery;
   failure?: string;
 };
 
@@ -64,6 +73,11 @@ export type WorkstreamEvent = {
     | "blocked"
     | "needs_decision"
     | "follow_up"
+    | "delivered"
+    | "redirected"
+    | "checkpoint"
+    | "resumed"
+    | "cancelled"
     | "failed"
     | "paused";
   status: WorkstreamStatus;
@@ -85,6 +99,7 @@ export type WorkerSession = Pick<
 export type WorkerSessionFactoryOptions = {
   cwd: string;
   sessionDirectory: string;
+  resumeSessionFile?: string;
   model: SubagentLaunchPolicy["model"];
   roleContract: string;
 };
@@ -115,6 +130,7 @@ export type WorkstreamSupervisorOptions = {
 export type LaunchWorkstreamInput = {
   kind: SubagentWorkstreamKind;
   brief: string;
+  linkedTaskWorkstreamId?: string;
   policy: SubagentLaunchPolicy;
 };
 
@@ -126,6 +142,12 @@ You are a delegated Pi worker operating in a trusted local repository.
 - Do not perform consequential external operations: remote Git actions, deployment, infrastructure or production-data changes, spending, publishing, or communication. Stop and report the need to the parent agent instead.
 - Keep status updates and final results concise. State what you changed or found, verification performed, blockers, and the next action.
 - The parent agent owns user intent, consequential decisions, and acceptance; do not make those decisions independently.
+`.trim();
+
+export const RESEARCH_WORKER_ROLE_CONTRACT = `
+${WORKER_ROLE_CONTRACT}
+
+You are a fire-and-forget research worker. Use non-mutating inspection and research tools only; do not edit repository files, run mutating commands, or perform external actions. Retain source URLs, titles, and evidence notes in your final structured research report. Separate evidence from inference and report uncertainty or a blocker rather than guessing.
 `.trim();
 
 export async function createPiWorkerSession(
@@ -149,10 +171,13 @@ export async function createPiWorkerSession(
     model: options.model.model,
     thinkingLevel: options.model.thinkingLevel,
     resourceLoader,
-    sessionManager: SessionManager.create(
-      options.cwd,
-      options.sessionDirectory,
-    ),
+    sessionManager: options.resumeSessionFile
+      ? SessionManager.open(
+          options.resumeSessionFile,
+          options.sessionDirectory,
+          options.cwd,
+        )
+      : SessionManager.create(options.cwd, options.sessionDirectory),
     settingsManager,
   });
   return session;
@@ -164,7 +189,7 @@ export class WorkstreamSupervisor {
   private readonly createSession: WorkerSessionFactory;
   private readonly observeGit: (cwd: string) => Promise<GitObservation>;
   private readonly onEvent?: (event: WorkstreamEvent) => void;
-  private onCompletion?: WorkstreamCompletionHandler;
+  private readonly completionHandlers: WorkstreamCompletionHandler[] = [];
   private readonly sessions = new Map<string, WorkerSession>();
   private readonly activeWorkstreams = new Set<string>();
   private readonly runs = new Map<string, Promise<void>>();
@@ -178,11 +203,17 @@ export class WorkstreamSupervisor {
     this.createSession = options.createSession ?? createPiWorkerSession;
     this.observeGit = options.observeGit ?? observeGit;
     this.onEvent = options.onEvent;
-    this.onCompletion = options.onCompletion;
+    if (options.onCompletion)
+      this.completionHandlers.push(options.onCompletion);
   }
 
   setCompletionHandler(handler: WorkstreamCompletionHandler | undefined): void {
-    this.onCompletion = handler;
+    this.completionHandlers.length = 0;
+    if (handler) this.completionHandlers.push(handler);
+  }
+
+  addCompletionHandler(handler: WorkstreamCompletionHandler): void {
+    this.completionHandlers.push(handler);
   }
 
   async launch(input: LaunchWorkstreamInput): Promise<WorkstreamManifest> {
@@ -202,6 +233,9 @@ export class WorkstreamSupervisor {
       kind: input.kind,
       status: "starting",
       brief: input.brief,
+      ...(input.linkedTaskWorkstreamId
+        ? { linkedTaskWorkstreamId: input.linkedTaskWorkstreamId }
+        : {}),
       createdAt: now,
       updatedAt: now,
       workerSessionDirectory,
@@ -216,7 +250,7 @@ export class WorkstreamSupervisor {
         cwd: this.cwd,
         sessionDirectory: workerSessionDirectory,
         model: input.policy.model,
-        roleContract: WORKER_ROLE_CONTRACT,
+        roleContract: roleContractFor(input.kind),
       });
     } catch (error) {
       this.activeWorkstreams.delete(id);
@@ -244,6 +278,15 @@ export class WorkstreamSupervisor {
 
   async get(id: string): Promise<WorkstreamManifest | undefined> {
     return this.readManifest(id);
+  }
+
+  async isLive(id: string): Promise<boolean> {
+    const manifest = await this.readManifest(id);
+    return Boolean(
+      manifest?.status === "running" &&
+      this.activeWorkstreams.has(id) &&
+      this.sessions.has(id),
+    );
   }
 
   async list(): Promise<WorkstreamManifest[]> {
@@ -277,10 +320,20 @@ export class WorkstreamSupervisor {
     const session = this.sessions.get(id);
     if (!session) {
       throw new Error(
-        `Task worker '${id}' is unavailable in this Pi session; it cannot receive a focused follow-up.`,
+        `Task worker '${id}' is unavailable in this Pi session; explicitly resume it before sending a focused follow-up.`,
       );
     }
     const manifest = await this.requireManifest(id);
+    if (manifest.status === "paused") {
+      throw new Error(
+        `Task worker '${id}' is paused; explicitly resume it first.`,
+      );
+    }
+    if (manifest.status === "cancelled") {
+      throw new Error(
+        `Task worker '${id}' was cancelled and cannot be resumed.`,
+      );
+    }
     if (this.activeWorkstreams.has(id)) {
       await session.followUp(prompt);
       await this.recordRoutineEvent(
@@ -302,11 +355,179 @@ export class WorkstreamSupervisor {
     return running;
   }
 
+  async recordDelivery(
+    id: string,
+    detail: string,
+  ): Promise<WorkstreamManifest> {
+    await this.recordRoutineEvent(id, "delivered", detail);
+    return this.requireManifest(id);
+  }
+
+  async redirect(id: string, prompt: string): Promise<WorkstreamManifest> {
+    const manifest = await this.requireManifest(id);
+    const session = this.sessions.get(id);
+    if (
+      !session ||
+      !this.activeWorkstreams.has(id) ||
+      manifest.status !== "running"
+    ) {
+      throw new Error(
+        `Task worker '${id}' is not running and cannot be redirected.`,
+      );
+    }
+    await session.steer(prompt);
+    await this.recordRoutineEvent(
+      id,
+      "redirected",
+      `Parent redirect queued: ${boundDetail(prompt)}`,
+    );
+    return this.requireManifest(id);
+  }
+
+  async checkpoint(
+    id: string,
+    reason = "Checkpoint requested by the parent agent.",
+  ): Promise<WorkstreamManifest> {
+    return this.enqueue(id, async () => {
+      const manifest = await this.requireManifest(id);
+      if (manifest.status === "cancelled") {
+        throw new Error(
+          `Task worker '${id}' was cancelled and has no resumable checkpoint.`,
+        );
+      }
+      const at = new Date().toISOString();
+      const recovery: WorkstreamRecovery = {
+        checkpointAt: at,
+        reason: boundDetail(reason),
+        ...(manifest.workerSessionFile
+          ? { workerSessionFile: manifest.workerSessionFile }
+          : {}),
+        journalTail: await this.readJournalTail(id),
+      };
+      const next: WorkstreamManifest = {
+        ...manifest,
+        updatedAt: at,
+        recovery,
+      };
+      await this.writeManifest(next);
+      await this.appendJournal(id, at, "checkpoint", reason);
+      this.onEvent?.({
+        workstreamId: id,
+        type: "checkpoint",
+        status: next.status,
+        at,
+      });
+      return next;
+    });
+  }
+
   async pause(
     id: string,
     reason = "Paused by the parent agent.",
   ): Promise<WorkstreamManifest> {
-    return this.transition(id, "paused", "paused", reason);
+    const manifest = await this.requireManifest(id);
+    if (manifest.status === "cancelled") {
+      throw new Error(
+        `Task worker '${id}' was cancelled and cannot be paused.`,
+      );
+    }
+    if (manifest.status === "paused") return manifest;
+    await this.checkpoint(id, reason);
+    const current = await this.requireManifest(id);
+    if (current.status !== "starting" && current.status !== "running") {
+      throw new Error(
+        `Task worker '${id}' is ${current.status} and cannot be paused.`,
+      );
+    }
+    const paused = await this.transition(id, "paused", "paused", reason);
+    const session = this.sessions.get(id);
+    if (session) {
+      try {
+        await session.abort();
+      } finally {
+        this.activeWorkstreams.delete(id);
+      }
+    }
+    return paused;
+  }
+
+  async cancel(
+    id: string,
+    reason = "Cancelled by the parent agent.",
+  ): Promise<WorkstreamManifest> {
+    const manifest = await this.requireManifest(id);
+    if (manifest.status === "cancelled") return manifest;
+    if (manifest.status === "settled") {
+      throw new Error(
+        `Task worker '${id}' has already settled and cannot be cancelled.`,
+      );
+    }
+    const cancelled = await this.transition(
+      id,
+      "cancelled",
+      "cancelled",
+      reason,
+    );
+    const session = this.sessions.get(id);
+    try {
+      await session?.abort();
+    } finally {
+      session?.dispose();
+      this.sessions.delete(id);
+      this.activeWorkstreams.delete(id);
+    }
+    return cancelled;
+  }
+
+  async resume(
+    id: string,
+    policy: SubagentLaunchPolicy,
+  ): Promise<WorkstreamManifest> {
+    const manifest = await this.requireManifest(id);
+    if (manifest.status === "cancelled") {
+      throw new Error(
+        `Task worker '${id}' was cancelled and cannot be resumed.`,
+      );
+    }
+    if (manifest.status !== "paused") {
+      throw new Error(
+        `Task worker '${id}' is ${manifest.status}; only paused workstreams can resume.`,
+      );
+    }
+    if (this.runningCount() >= policy.maxConcurrentWorkers) {
+      throw new Error(
+        `Subagent concurrency limit (${policy.maxConcurrentWorkers}) is reached; no worker was resumed.`,
+      );
+    }
+
+    let session = this.sessions.get(id);
+    if (!session) {
+      if (!manifest.workerSessionFile) {
+        throw new Error(
+          `Task worker '${id}' has no persisted worker session to resume.`,
+        );
+      }
+      session = await this.createSession({
+        cwd: this.cwd,
+        sessionDirectory: manifest.workerSessionDirectory,
+        resumeSessionFile: manifest.workerSessionFile,
+        model: policy.model,
+        roleContract: roleContractFor(manifest.kind),
+      });
+      this.sessions.set(id, session);
+      session.subscribe((event) => this.handleSessionEvent(id, event));
+    }
+
+    this.activeWorkstreams.add(id);
+    const running = await this.transition(
+      id,
+      "running",
+      "resumed",
+      "Explicit resume started from the persisted worker session.",
+      session.sessionFile,
+    );
+    this.startRun(id, session, buildResumeBrief(running));
+    return running;
   }
 
   async recoverInterrupted(): Promise<WorkstreamManifest[]> {
@@ -314,6 +535,10 @@ export class WorkstreamSupervisor {
     const recovered: WorkstreamManifest[] = [];
     for (const manifest of manifests) {
       if (manifest.status === "starting" || manifest.status === "running") {
+        await this.checkpoint(
+          manifest.id,
+          "Recovered after the previous Pi session ended; explicit resume is required.",
+        );
         recovered.push(
           await this.transition(
             manifest.id,
@@ -325,6 +550,38 @@ export class WorkstreamSupervisor {
       }
     }
     return recovered;
+  }
+
+  async shutdown(): Promise<WorkstreamManifest[]> {
+    const paused: WorkstreamManifest[] = [];
+    const pausedIds = new Set<string>();
+    for (const manifest of await this.list()) {
+      if (manifest.status === "starting" || manifest.status === "running") {
+        try {
+          paused.push(
+            await this.pause(
+              manifest.id,
+              "Pi session ended; explicit resume is required.",
+            ),
+          );
+          pausedIds.add(manifest.id);
+        } catch {
+          // Continue shutting down the remaining live worker sessions. A later
+          // trusted-session recovery scan will pause any interrupted manifest.
+        }
+      }
+    }
+    for (const [id, session] of this.sessions) {
+      try {
+        if (!pausedIds.has(id)) await session.abort();
+      } catch {
+        // Disposal still releases the in-process worker resource.
+      }
+      session.dispose();
+      this.sessions.delete(id);
+      this.activeWorkstreams.delete(id);
+    }
+    return paused;
   }
 
   async waitForSettlement(id: string): Promise<void> {
@@ -347,15 +604,17 @@ export class WorkstreamSupervisor {
       .catch((error) => this.failIfRunning(id, error));
     this.runs.set(id, run);
     void run.then(
-      () => {
-        this.runs.delete(id);
-        this.activeWorkstreams.delete(id);
-      },
-      () => {
-        this.runs.delete(id);
-        this.activeWorkstreams.delete(id);
-      },
+      () => this.clearRun(id, run),
+      () => this.clearRun(id, run),
     );
+  }
+
+  private clearRun(id: string, run: Promise<void>): void {
+    // A resumed worker can begin a fresh run before an aborted predecessor's
+    // promise unwinds. Only that run may release this worker's active slot.
+    if (this.runs.get(id) !== run) return;
+    this.runs.delete(id);
+    this.activeWorkstreams.delete(id);
   }
 
   private handleSessionEvent(id: string, event: AgentSessionEvent): void {
@@ -379,7 +638,13 @@ export class WorkstreamSupervisor {
 
     let completion: WorkstreamCompletion | void;
     try {
-      completion = await this.onCompletion?.({ manifest, session });
+      for (const handler of this.completionHandlers) {
+        const result = await handler({ manifest, session });
+        if (result !== undefined) {
+          completion = result;
+          break;
+        }
+      }
     } catch (error) {
       // A parent-side presentation failure must not restart or fail completed
       // worker execution. The durable worker session and journal remain intact.
@@ -387,6 +652,10 @@ export class WorkstreamSupervisor {
         detail: `Completion handoff failed: ${errorMessage(error)}`,
       };
     }
+    // A parent Stop/Cancel may have changed the state while the completion
+    // handler retained an artifact. Never overwrite that deliberate action.
+    const current = await this.readManifest(id);
+    if (!current || current.status !== "running") return;
     const status = completion?.status ?? "settled";
     const eventType =
       status === "blocked"
@@ -449,7 +718,12 @@ export class WorkstreamSupervisor {
 
   private async recordRoutineEvent(
     id: string,
-    eventType: "tool_started" | "tool_finished" | "follow_up",
+    eventType:
+      | "tool_started"
+      | "tool_finished"
+      | "follow_up"
+      | "delivered"
+      | "redirected",
     detail: string,
   ): Promise<void> {
     await this.enqueue(id, async () => {
@@ -524,12 +798,25 @@ export class WorkstreamSupervisor {
     eventType: WorkstreamEvent["type"],
     detail: string | undefined,
   ): Promise<void> {
-    const bounded = detail ? detail.replace(/\s+/g, " ").slice(0, 500) : "";
+    const bounded = detail ? boundDetail(detail) : "";
     await appendFile(
       this.journalPath(id),
       `[${at}] ${eventType}${bounded ? `: ${bounded}` : ""}\n`,
       { encoding: "utf8", mode: 0o600 },
     );
+  }
+
+  private async readJournalTail(id: string): Promise<string[]> {
+    try {
+      return (await readFile(this.journalPath(id), "utf8"))
+        .split("\n")
+        .filter((line) => line.startsWith("["))
+        .slice(-12)
+        .map((line) => boundDetail(line));
+    } catch (error) {
+      if (isMissing(error)) return [];
+      throw error;
+    }
   }
 
   private manifestPath(id: string): string {
@@ -554,6 +841,41 @@ async function observeGit(cwd: string): Promise<GitObservation> {
   } catch {
     return {};
   }
+}
+
+function roleContractFor(kind: SubagentWorkstreamKind): string {
+  return kind === "research"
+    ? RESEARCH_WORKER_ROLE_CONTRACT
+    : WORKER_ROLE_CONTRACT;
+}
+
+function buildResumeBrief(manifest: WorkstreamManifest): string {
+  const recovery = manifest.recovery;
+  return [
+    "# Explicit workstream resume",
+    "Resume the existing worker session; do not reconstruct the parent transcript.",
+    "",
+    "## Original brief",
+    manifest.brief,
+    ...(recovery
+      ? [
+          "",
+          "## Durable recovery checkpoint",
+          `Recorded: ${recovery.checkpointAt}`,
+          `Reason: ${recovery.reason}`,
+          "Recent journal:",
+          ...(recovery.journalTail.length > 0
+            ? recovery.journalTail
+            : ["No journal events were retained."]),
+        ]
+      : []),
+    "",
+    "Continue only from the retained worker context and this checkpoint. End with the required structured worker report.",
+  ].join("\n");
+}
+
+function boundDetail(detail: string): string {
+  return detail.replace(/\s+/g, " ").trim().slice(0, 500);
 }
 
 function errorMessage(error: unknown): string {

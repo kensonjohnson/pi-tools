@@ -204,10 +204,14 @@ test("removes future launch and control tools when disabled", async () => {
     );
     assert.deepEqual(active, ["read"]);
     assert.deepEqual(definitions, [SUBAGENT_SETTINGS]);
-    assert.equal(registeredTools.length, 3);
+    assert.equal(registeredTools.length, 7);
     assert.deepEqual(
       entryRenderers.map((entry: any) => entry.type),
-      ["pi-tools:subagent-task-timeline"],
+      [
+        "pi-tools:subagent-task-timeline",
+        "pi-tools:subagent-task-control-timeline",
+        "pi-tools:subagent-research-timeline",
+      ],
     );
   });
 });

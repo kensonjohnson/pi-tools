@@ -9,13 +9,16 @@ import { type WorkerSession, WorkstreamSupervisor } from "./supervisor.ts";
 
 class FakeWorkerSession {
   readonly sessionFile: string;
+  readonly prompts: string[] = [];
+  readonly steers: string[] = [];
+  readonly followUps: string[] = [];
+  aborts = 0;
+  disposed = false;
   private listeners: Array<(event: AgentSessionEvent) => void> = [];
-  private resolvePrompt!: () => void;
-  private rejectPrompt!: (error: Error) => void;
-  readonly promptResult = new Promise<void>((resolve, reject) => {
-    this.resolvePrompt = resolve;
-    this.rejectPrompt = reject;
-  });
+  private runs: Array<{ resolve: () => void; reject: (error: Error) => void }> =
+    [];
+  private pendingSettle = false;
+  private pendingFailure?: Error;
 
   constructor(sessionFile: string) {
     this.sessionFile = sessionFile;
@@ -28,34 +31,55 @@ class FakeWorkerSession {
     };
   }
 
-  prompt(): Promise<void> {
-    return this.promptResult;
+  prompt(text: string): Promise<void> {
+    this.prompts.push(text);
+    return new Promise<void>((resolve, reject) => {
+      this.runs.push({ resolve, reject });
+      if (this.pendingFailure) {
+        const error = this.pendingFailure;
+        this.pendingFailure = undefined;
+        reject(error);
+      } else if (this.pendingSettle) {
+        this.pendingSettle = false;
+        resolve();
+      }
+    });
   }
 
-  steer(): Promise<void> {
+  steer(text: string): Promise<void> {
+    this.steers.push(text);
     return Promise.resolve();
   }
 
-  followUp(): Promise<void> {
+  followUp(text: string): Promise<void> {
+    this.followUps.push(text);
     return Promise.resolve();
   }
 
   abort(): Promise<void> {
+    this.aborts++;
+    this.settle();
     return Promise.resolve();
   }
 
-  dispose(): void {}
+  dispose(): void {
+    this.disposed = true;
+  }
 
   emit(event: AgentSessionEvent): void {
     for (const listener of this.listeners) listener(event);
   }
 
-  settle(): void {
-    this.resolvePrompt();
+  settle(run = this.runs.length - 1): void {
+    const pending = this.runs[run];
+    if (pending) pending.resolve();
+    else this.pendingSettle = true;
   }
 
-  fail(message: string): void {
-    this.rejectPrompt(new Error(message));
+  fail(message: string, run = this.runs.length - 1): void {
+    const pending = this.runs[run];
+    if (pending) pending.reject(new Error(message));
+    else this.pendingFailure = new Error(message);
   }
 }
 
@@ -160,6 +184,138 @@ test("enforces one shared running cap without queueing task or research work", a
     assert.equal(second.kind, "research");
     sessions[1].settle();
     await supervisor.waitForSettlement(second.id);
+  });
+});
+
+test("redirects, checkpoints, pauses, resumes, and cancels only on explicit parent control", async () => {
+  await withSupervisor(async ({ root, supervisor, sessions }) => {
+    const workstream = await supervisor.launch({
+      kind: "task",
+      brief: "Make one local change.",
+      policy,
+    });
+    await Promise.resolve();
+    await supervisor.redirect(
+      workstream.id,
+      "Prioritize the failing test first.",
+    );
+    await supervisor.followUp(workstream.id, "Then report the result.");
+    assert.deepEqual(sessions[0].steers, [
+      "Prioritize the failing test first.",
+    ]);
+    assert.deepEqual(sessions[0].followUps, ["Then report the result."]);
+
+    const checkpoint = await supervisor.checkpoint(
+      workstream.id,
+      "Save before review.",
+    );
+    assert.equal(checkpoint.recovery?.reason, "Save before review.");
+    assert.ok((checkpoint.recovery?.journalTail.length ?? 0) > 0);
+    const journal = await readFile(
+      join(root, "subagents", workstream.id, "journal.md"),
+      "utf8",
+    );
+    assert.match(journal, /checkpoint: Save before review/);
+
+    const paused = await supervisor.pause(
+      workstream.id,
+      "Stop for a parent decision.",
+    );
+    assert.equal(paused.status, "paused");
+    assert.equal(sessions[0].aborts, 1);
+    await assert.rejects(
+      supervisor.followUp(workstream.id, "Do not queue while paused."),
+      /paused; explicitly resume/,
+    );
+
+    const resumed = await supervisor.resume(workstream.id, policy);
+    assert.equal(resumed.status, "running");
+    assert.equal(sessions.length, 1);
+    await Promise.resolve();
+    assert.match(
+      sessions[0].prompts.at(-1) ?? "",
+      /Explicit workstream resume/,
+    );
+    await supervisor.redirect(
+      workstream.id,
+      "Continue with the chosen option.",
+    );
+    assert.deepEqual(sessions[0].steers, [
+      "Prioritize the failing test first.",
+      "Continue with the chosen option.",
+    ]);
+
+    const cancelled = await supervisor.cancel(
+      workstream.id,
+      "No longer needed.",
+    );
+    assert.equal(cancelled.status, "cancelled");
+    assert.equal(sessions[0].disposed, true);
+    await assert.rejects(supervisor.resume(workstream.id, policy), /cancelled/);
+  });
+});
+
+test("recovers and reopens interrupted persisted worker sessions only after explicit resume", async () => {
+  await withSupervisor(async ({ root, supervisor, sessions }) => {
+    const workstream = await supervisor.launch({
+      kind: "task",
+      brief: "Continue across an extension reload.",
+      policy,
+    });
+    await Promise.resolve();
+    const reopenedOptions: Array<{ resumeSessionFile?: string }> = [];
+    const reloaded = new WorkstreamSupervisor({
+      cwd: root,
+      rootDirectory: join(root, "subagents"),
+      createSession: async (options) => {
+        reopenedOptions.push(options);
+        return new FakeWorkerSession(
+          join(options.sessionDirectory, "reopened.jsonl"),
+        ) as unknown as WorkerSession;
+      },
+    });
+    const recovered = await reloaded.recoverInterrupted();
+    assert.deepEqual(
+      recovered.map((entry) => entry.id),
+      [workstream.id],
+    );
+    const paused = await reloaded.get(workstream.id);
+    assert.equal(paused?.status, "paused");
+    assert.equal(sessions.length, 1);
+    assert.equal(
+      paused?.recovery?.workerSessionFile,
+      workstream.workerSessionFile,
+    );
+
+    await reloaded.resume(workstream.id, policy);
+    assert.equal(reopenedOptions.length, 1);
+    assert.equal(
+      reopenedOptions[0]?.resumeSessionFile,
+      workstream.workerSessionFile,
+    );
+  });
+});
+
+test("shutdown records paused recovery metadata then aborts and disposes live workers", async () => {
+  await withSupervisor(async ({ supervisor, sessions }) => {
+    const workstream = await supervisor.launch({
+      kind: "task",
+      brief: "Stop when the Pi session shuts down.",
+      policy,
+    });
+    await Promise.resolve();
+    const paused = await supervisor.shutdown();
+    assert.deepEqual(
+      paused.map((entry) => entry.id),
+      [workstream.id],
+    );
+    assert.equal((await supervisor.get(workstream.id))?.status, "paused");
+    assert.equal(
+      (await supervisor.get(workstream.id))?.recovery?.reason,
+      "Pi session ended; explicit resume is required.",
+    );
+    assert.equal(sessions[0].aborts, 1);
+    assert.equal(sessions[0].disposed, true);
   });
 });
 

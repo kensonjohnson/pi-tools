@@ -13,6 +13,12 @@ import {
   SUBAGENT_TOOL_NAMES,
 } from "./settings.ts";
 import {
+  renderResearchTimelineEntry,
+  ResearchWorkstreamService,
+} from "./research-workstreams.ts";
+import { registerResearchWorkstreamTools } from "./research-tools.ts";
+import {
+  renderTaskControlTimelineEntry,
   renderTaskTimelineEntry,
   TaskWorkstreamService,
 } from "./task-workstreams.ts";
@@ -22,12 +28,22 @@ import { WorkstreamSupervisor } from "./supervisor.ts";
 export default function (pi: ExtensionAPI) {
   let supervisor: WorkstreamSupervisor | undefined;
   let tasks: TaskWorkstreamService | undefined;
+  let research: ResearchWorkstreamService | undefined;
 
   publishExtensionSettings(pi.events, SUBAGENT_SETTINGS);
   registerTaskWorkstreamTools(pi, () => tasks);
+  registerResearchWorkstreamTools(pi, () => research);
   pi.registerEntryRenderer(
     "pi-tools:subagent-task-timeline",
     renderTaskTimelineEntry,
+  );
+  pi.registerEntryRenderer(
+    "pi-tools:subagent-task-control-timeline",
+    renderTaskControlTimelineEntry,
+  );
+  pi.registerEntryRenderer(
+    "pi-tools:subagent-research-timeline",
+    renderResearchTimelineEntry,
   );
 
   pi.on("session_start", async (_event, ctx) => {
@@ -37,6 +53,7 @@ export default function (pi: ExtensionAPI) {
     removeDisabledTools(pi, SUBAGENT_TOOL_NAMES, enabled);
     supervisor = undefined;
     tasks = undefined;
+    research = undefined;
     if (!enabled) return;
 
     supervisor = new WorkstreamSupervisor({
@@ -48,12 +65,16 @@ export default function (pi: ExtensionAPI) {
       },
     });
     tasks = new TaskWorkstreamService(pi, supervisor, ctx.cwd);
+    research = new ResearchWorkstreamService(pi, supervisor, tasks, ctx.cwd);
+    await supervisor.recoverInterrupted();
     await tasks.refreshWidget(ctx);
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    await supervisor?.shutdown();
     tasks?.clearWidget(ctx);
     supervisor = undefined;
     tasks = undefined;
+    research = undefined;
   });
 }
