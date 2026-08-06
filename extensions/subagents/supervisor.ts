@@ -185,7 +185,7 @@ export async function createPiWorkerSession(
 
 export class WorkstreamSupervisor {
   private readonly cwd: string;
-  private readonly rootDirectory: string;
+  readonly rootDirectory: string;
   private readonly createSession: WorkerSessionFactory;
   private readonly observeGit: (cwd: string) => Promise<GitObservation>;
   private readonly onEvent?: (event: WorkstreamEvent) => void;

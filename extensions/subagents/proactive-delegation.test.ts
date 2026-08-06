@@ -4,10 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import {
-  PROACTIVE_DELEGATION_GUIDANCE,
-  isSubagentWorkerSession,
-} from "./index.ts";
+import { isSubagentWorkerSession } from "./index.ts";
 import { SUBAGENT_TOOL_NAMES } from "./settings.ts";
 
 function makePi() {
@@ -59,11 +56,38 @@ test("injects proactive delegation guidance only for an enabled trusted main ses
       { systemPrompt: "Base prompt" },
       ctx,
     );
+    const systemPrompt =
+      (result as { systemPrompt?: string })?.systemPrompt ?? "";
+    assert.match(systemPrompt, /Proactive subagent delegation/);
+    assert.match(systemPrompt, /Do not wait for the user/);
     assert.match(
-      (result as { systemPrompt?: string })?.systemPrompt ?? "",
-      /Proactive subagent delegation/,
+      systemPrompt,
+      /Advisory default: delegate every repository implementation change to a task worker, regardless of origin\./,
     );
-    assert.match(PROACTIVE_DELEGATION_GUIDANCE, /Do not wait for the user/);
+    assert.match(
+      systemPrompt,
+      /Reserve direct main-agent work for answering, planning, and non-repository actions\./,
+    );
+    assert.match(
+      systemPrompt,
+      /This is advisory guidance, not a hard enforcement/,
+    );
+    assert.match(
+      systemPrompt,
+      /preserves main-agent context by isolating detailed investigation, tool output, and implementation\/debug churn/,
+    );
+    assert.match(
+      systemPrompt,
+      /concise, bounded handoffs relevant to integration and acceptance decisions, not detailed transcripts/,
+    );
+    assert.match(
+      systemPrompt,
+      /The main agent is the primary orchestrator: choose and coordinate workers, decide when to wait for or synthesize their results, integrate work, verify acceptance, and own the user relationship and final decisions\./,
+    );
+    assert.match(
+      systemPrompt,
+      /Workers execute bounded delegated work and do not own the user relationship or final decisions\./,
+    );
   } finally {
     await handlers.get("session_shutdown")?.({}, ctx);
     await rm(root, { recursive: true, force: true });

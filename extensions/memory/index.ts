@@ -4,6 +4,7 @@ import {
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { Text } from "@earendil-works/pi-tui";
 import {
   MEMORY_CATEGORIES,
   type MemoryCategory,
@@ -80,6 +81,28 @@ function formatRecall(
   );
 
   return sections.join("\n\n");
+}
+
+type RememberResultDetails = {
+  kind: "memory_remember";
+  category: MemoryCategory;
+  content: string;
+  id: string;
+  created: boolean;
+};
+
+function isRememberResultDetails(
+  details: unknown,
+): details is RememberResultDetails {
+  return (
+    typeof details === "object" &&
+    details !== null &&
+    (details as { kind?: unknown }).kind === "memory_remember" &&
+    isMemoryCategory((details as { category?: string }).category) &&
+    typeof (details as { content?: unknown }).content === "string" &&
+    typeof (details as { id?: unknown }).id === "string" &&
+    typeof (details as { created?: unknown }).created === "boolean"
+  );
 }
 
 function textResult(text: string, details?: unknown) {
@@ -185,6 +208,25 @@ export default function (pi: ExtensionAPI) {
         description: "The memory content to store",
       }),
     }),
+    renderResult(result, _options, theme) {
+      const first = result.content[0];
+      const confirmation =
+        first?.type === "text" ? first.text : "Memory result completed.";
+      const details = isRememberResultDetails(result.details)
+        ? result.details
+        : undefined;
+      if (!details) return new Text(theme.fg("dim", confirmation), 0, 0);
+
+      return new Text(
+        [
+          theme.fg("dim", confirmation),
+          theme.fg("accent", `${details.category} memory`),
+          details.content,
+        ].join("\n"),
+        0,
+        0,
+      );
+    },
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getReadyManager(ctx);
       if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
@@ -192,9 +234,15 @@ export default function (pi: ExtensionAPI) {
       const result = await manager.remember(params.category, params.content);
       return textResult(
         result.created
-          ? `Stored ${params.category} memory ${result.memory.id}.`
-          : `Matching ${params.category} memory already exists as ${result.memory.id}.`,
-        { id: result.memory.id, created: result.created },
+          ? `Stored ${params.category} memory.`
+          : `Matching ${params.category} memory already exists.`,
+        {
+          kind: "memory_remember",
+          category: params.category,
+          content: result.memory.content,
+          id: result.memory.id,
+          created: result.created,
+        } satisfies RememberResultDetails,
       );
     },
   });

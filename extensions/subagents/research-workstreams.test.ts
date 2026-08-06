@@ -6,6 +6,7 @@ import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { SubagentLaunchPolicy } from "./launch-policy.ts";
+import { CompletionInbox } from "./completion-inbox.ts";
 import {
   buildResearchBrief,
   ResearchWorkstreamService,
@@ -84,7 +85,7 @@ function researchReport(): AgentMessage {
   } as AgentMessage;
 }
 
-test("retains cited research artifacts, hands off one synthesis, and informs a linked live task worker", async () => {
+test("retains cited research artifacts, creates one durable inbox handoff, and informs a linked live task worker", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-tools-research-workstream-"));
   const sessions: FakeWorkerSession[] = [];
   const entries: Array<{ type: string; data: unknown }> = [];
@@ -109,12 +110,14 @@ test("retains cited research artifacts, hands off one synthesis, and informs a l
       messages.push({ content: String(message.content), options });
     },
   };
-  const tasks = new TaskWorkstreamService(pi as any, supervisor, root);
+  const inbox = new CompletionInbox(join(root, "subagents"));
+  const tasks = new TaskWorkstreamService(pi as any, supervisor, root, inbox);
   const research = new ResearchWorkstreamService(
     pi as any,
     supervisor,
     tasks,
     root,
+    inbox,
   );
 
   try {
@@ -149,12 +152,14 @@ test("retains cited research artifacts, hands off one synthesis, and informs a l
     assert.equal((await supervisor.get(job.id))?.status, "settled");
     assert.equal(entries.length, 1);
     assert.equal(entries[0]?.type, RESEARCH_TIMELINE_ENTRY_TYPE);
-    assert.equal(messages.length, 1);
+    assert.equal(messages.length, 0);
+    const records = await inbox.listUnconsumed();
+    assert.equal(records.length, 1);
     assert.match(
-      messages[0]?.content ?? "",
+      records[0]?.handoff ?? "",
       /Evidence source: https:\/\/example.com\/evidence/,
     );
-    assert.deepEqual(messages[0]?.options, { triggerTurn: true });
+    assert.equal(records[0]?.deliveryState, "pending");
     assert.equal(
       RESEARCH_HANDOFF_MESSAGE_TYPE,
       "pi-tools:subagent-research-handoff",

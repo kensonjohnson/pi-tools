@@ -8,6 +8,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { resolveSubagentLaunchPolicy } from "./launch-policy.ts";
+import { CompletionInbox } from "./completion-inbox.ts";
 import {
   type WorkstreamCompletion,
   type WorkstreamManifest,
@@ -68,21 +69,24 @@ export type ResearchControlInput = {
 };
 
 export class ResearchWorkstreamService {
-  private readonly pi: Pick<ExtensionAPI, "appendEntry" | "sendMessage">;
+  private readonly pi: Pick<ExtensionAPI, "appendEntry">;
   private readonly supervisor: WorkstreamSupervisor;
   private readonly tasks: TaskWorkstreamService;
   private readonly cwd: string;
+  private readonly inbox: CompletionInbox;
 
   constructor(
-    pi: Pick<ExtensionAPI, "appendEntry" | "sendMessage">,
+    pi: Pick<ExtensionAPI, "appendEntry">,
     supervisor: WorkstreamSupervisor,
     tasks: TaskWorkstreamService,
     cwd: string,
+    inbox = new CompletionInbox(supervisor.rootDirectory),
   ) {
     this.pi = pi;
     this.supervisor = supervisor;
     this.tasks = tasks;
     this.cwd = cwd;
+    this.inbox = inbox;
     supervisor.addCompletionHandler((input) => this.handleCompletion(input));
   }
 
@@ -189,31 +193,31 @@ export class ResearchWorkstreamService {
       reportArtifact: reportReference,
       sourceIndexArtifact: sourceReference,
     });
-    this.pi.sendMessage(
-      {
-        customType: RESEARCH_HANDOFF_MESSAGE_TYPE,
-        content: formatBoundedHandoff(
-          report,
-          reportReference,
-          sourceReference,
-          input.manifest.linkedTaskWorkstreamId,
-          delivery,
-        ),
-        display: true,
-        details: {
-          workstreamId: input.manifest.id,
-          reportArtifact: reportReference,
-          sourceIndexArtifact: sourceReference,
-          ...(input.manifest.linkedTaskWorkstreamId
-            ? {
-                linkedTaskWorkstreamId: input.manifest.linkedTaskWorkstreamId,
-                delivery,
-              }
-            : {}),
-        },
+    await this.inbox.create({
+      workstreamId: input.manifest.id,
+      kind: input.manifest.kind,
+      terminalStatus: report.status === "blocked" ? "blocked" : "settled",
+      handoff: formatBoundedHandoff(
+        report,
+        reportReference,
+        sourceReference,
+        input.manifest.linkedTaskWorkstreamId,
+        delivery,
+      ),
+      artifactReferences: [reportReference, sourceReference],
+      sourceCustomType: RESEARCH_HANDOFF_MESSAGE_TYPE,
+      sourceDetails: {
+        workstreamId: input.manifest.id,
+        reportArtifact: reportReference,
+        sourceIndexArtifact: sourceReference,
+        ...(input.manifest.linkedTaskWorkstreamId
+          ? {
+              linkedTaskWorkstreamId: input.manifest.linkedTaskWorkstreamId,
+              delivery,
+            }
+          : {}),
       },
-      { triggerTurn: true },
-    );
+    });
 
     return {
       status: report.status === "blocked" ? "blocked" : "settled",

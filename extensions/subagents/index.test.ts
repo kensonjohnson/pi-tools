@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { CompletionInbox } from "./completion-inbox.ts";
 import {
   CONFIG_FILE_NAME,
   SettingsRegistry,
@@ -179,6 +180,72 @@ test("uses trusted project overrides and rejects disabled or untrusted launches"
   });
 });
 
+test("queues durable completion inbox records only after settlement and acknowledges matching messages", async () => {
+  await withTemporaryConfig(async ({ cwd, agentDir }) => {
+    await writeJson(join(agentDir, CONFIG_FILE_NAME), {
+      version: 1,
+      extensions: {
+        [SUBAGENTS_EXTENSION_ID]: { enabled: true, delegationMode: "manual" },
+      },
+    });
+    const { default: extension } = await import("./index.ts");
+    const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+    const sent: Array<{ message: any; options: any }> = [];
+    const pi = {
+      events: {
+        emit() {},
+        on() {
+          return () => {};
+        },
+      },
+      on(name: string, handler: (event: any, ctx: any) => unknown) {
+        handlers.set(name, handler);
+      },
+      registerTool() {},
+      registerEntryRenderer() {},
+      getActiveTools: () => SUBAGENT_TOOL_NAMES,
+      setActiveTools() {},
+      sendMessage(message: any, options: any) {
+        sent.push({ message, options });
+      },
+      appendEntry() {},
+    };
+    const ctx = {
+      cwd,
+      isProjectTrusted: () => true,
+      ui: { setWidget() {} },
+    };
+    extension(pi as unknown as ExtensionAPI);
+    await handlers.get("session_start")?.({}, ctx);
+
+    const inbox = new CompletionInbox(join(cwd, "tmp", "subagents"));
+    await inbox.create({
+      workstreamId: "settled-worker",
+      kind: "task",
+      terminalStatus: "settled",
+      handoff: "Task worker settled without interrupting the parent.",
+      artifactReferences: ["tmp/subagents/settled-worker/reports/0001.json"],
+      sourceCustomType: "pi-tools:subagent-task-handoff",
+      sourceDetails: { workstreamId: "settled-worker" },
+    });
+    assert.equal(sent.length, 0);
+
+    await handlers.get("agent_settled")?.({}, ctx);
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0]?.options, { deliverAs: "nextTurn" });
+    assert.equal((await inbox.list())[0]?.deliveryState, "scheduled");
+
+    await handlers.get("message_end")?.(
+      {
+        message: { ...sent[0]?.message, role: "custom", timestamp: Date.now() },
+      },
+      ctx,
+    );
+    assert.equal((await inbox.list())[0]?.deliveryState, "acknowledged");
+    await handlers.get("session_shutdown")?.({}, ctx);
+  });
+});
+
 test("removes future launch and control tools when disabled", async () => {
   await withTemporaryConfig(async ({ cwd, agentDir }) => {
     await writeJson(join(agentDir, CONFIG_FILE_NAME), {
@@ -226,7 +293,7 @@ test("removes future launch and control tools when disabled", async () => {
     );
     assert.deepEqual(active, ["read"]);
     assert.deepEqual(definitions, [SUBAGENT_SETTINGS]);
-    assert.equal(registeredTools.length, 7);
+    assert.equal(registeredTools.length, 8);
     assert.deepEqual(
       entryRenderers.map((entry: any) => entry.type),
       [

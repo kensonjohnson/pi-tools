@@ -12,6 +12,7 @@ export const SUBAGENT_TOOL_NAMES = [
   "subagent_research_launch",
   "subagent_research_report",
   "subagent_research_control",
+  "subagent_wait",
 ] as const;
 
 export type SubagentWorkstreamKind = "task" | "research";

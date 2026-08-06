@@ -69,7 +69,9 @@ test("trust-gates code-search settings and active tools", async () => {
     );
     assert.deepEqual(active, ["read", "other_extension_tool"]);
     await assert.rejects(access(join(cwd, ".pi")));
-    await assert.rejects(access(join(root, "agent", "code-search-metrics.sqlite")));
+    await assert.rejects(
+      access(join(root, "agent", "code-search-metrics.sqlite")),
+    );
     assert.equal(
       (
         await tools.get("code_search")!.execute("", {}, undefined, undefined, {
@@ -101,7 +103,9 @@ test("trust-gates code-search settings and active tools", async () => {
       ...CODE_SEARCH_TOOL_NAMES,
     ]);
     await access(join(root, "agent", "code-search-metrics.sqlite"));
-    await assert.rejects(access(join(cwd, ".pi", "code-search", "metrics.sqlite")));
+    await assert.rejects(
+      access(join(cwd, ".pi", "code-search", "metrics.sqlite")),
+    );
     const notices: string[] = [];
     const commandContext = {
       ui: { notify: (message: string) => notices.push(message) },

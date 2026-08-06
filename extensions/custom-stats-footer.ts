@@ -158,35 +158,6 @@ function formatResetDuration(resetAtMs: number): string {
   return `${Math.max(1, minutes)}m`;
 }
 
-// Module-level state to track TPS across assistant responses.
-const responseTpsMeter = new ResponseTpsMeter();
-let footerEnabled = true;
-let quotaSettings: QuotaSettings = { ...DEFAULT_QUOTA_SETTINGS };
-let codexQuota: CodexQuota | undefined;
-let quotaUnavailable = false;
-let quotaTimer: ReturnType<typeof setInterval> | undefined;
-let quotaRefresh: Promise<void> | undefined;
-
-async function loadFooterSettings(ctx: ExtensionContext): Promise<void> {
-  const settings = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);
-  footerEnabled =
-    getSettingValue<boolean>(settings, FOOTER_SETTINGS_ID, "enabled") !== false;
-  quotaSettings = {
-    enabled:
-      getSettingValue<boolean>(
-        settings,
-        FOOTER_SETTINGS_ID,
-        "codexQuota.enabled",
-      ) ?? DEFAULT_QUOTA_SETTINGS.enabled,
-    refreshMinutes:
-      getSettingValue<number>(
-        settings,
-        FOOTER_SETTINGS_ID,
-        "codexQuota.refreshMinutes",
-      ) ?? DEFAULT_QUOTA_SETTINGS.refreshMinutes,
-  };
-}
-
 async function migrateLegacyQuotaSettings(
   ctx: ExtensionContext,
 ): Promise<void> {
@@ -234,6 +205,38 @@ function isAssistantMessage(message: unknown): message is AssistantMessage {
 }
 
 export default function (pi: ExtensionAPI) {
+  // Pi may reuse this module for same-cwd SDK workers, but invokes this factory
+  // per session. Keep all mutable UI/session state here so worker events cannot
+  // affect the interactive session's footer.
+  const responseTpsMeter = new ResponseTpsMeter();
+  let footerEnabled = true;
+  let quotaSettings: QuotaSettings = { ...DEFAULT_QUOTA_SETTINGS };
+  let codexQuota: CodexQuota | undefined;
+  let quotaUnavailable = false;
+  let quotaTimer: ReturnType<typeof setInterval> | undefined;
+  let quotaRefresh: Promise<void> | undefined;
+
+  const loadFooterSettings = async (ctx: ExtensionContext): Promise<void> => {
+    const settings = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);
+    footerEnabled =
+      getSettingValue<boolean>(settings, FOOTER_SETTINGS_ID, "enabled") !==
+      false;
+    quotaSettings = {
+      enabled:
+        getSettingValue<boolean>(
+          settings,
+          FOOTER_SETTINGS_ID,
+          "codexQuota.enabled",
+        ) ?? DEFAULT_QUOTA_SETTINGS.enabled,
+      refreshMinutes:
+        getSettingValue<number>(
+          settings,
+          FOOTER_SETTINGS_ID,
+          "codexQuota.refreshMinutes",
+        ) ?? DEFAULT_QUOTA_SETTINGS.refreshMinutes,
+    };
+  };
+
   publishExtensionSettings(pi.events, {
     id: FOOTER_SETTINGS_ID,
     label: "Custom Stats Footer",
@@ -262,14 +265,14 @@ export default function (pi: ExtensionAPI) {
 
   // Pi ends the assistant message before executing any tool calls, so this
   // response-scoped interval cannot include tool wall-clock time.
-  pi.on("message_start", (event) => {
-    if (footerEnabled && isAssistantMessage(event.message)) {
+  pi.on("message_start", (event, ctx) => {
+    if (ctx.hasUI && footerEnabled && isAssistantMessage(event.message)) {
       responseTpsMeter.start();
     }
   });
 
-  pi.on("message_end", (event) => {
-    if (footerEnabled && isAssistantMessage(event.message)) {
+  pi.on("message_end", (event, ctx) => {
+    if (ctx.hasUI && footerEnabled && isAssistantMessage(event.message)) {
       responseTpsMeter.finish(event.message);
     }
   });
@@ -528,6 +531,8 @@ export default function (pi: ExtensionAPI) {
 
   // Set up custom footer and begin quota polling only after a user has opted in.
   pi.on("session_start", async (_event, ctx) => {
+    if (!ctx.hasUI) return;
+
     responseTpsMeter.reset();
     await migrateLegacyQuotaSettings(ctx);
     await loadFooterSettings(ctx);
@@ -540,12 +545,12 @@ export default function (pi: ExtensionAPI) {
     startQuotaUpdates(ctx);
   });
 
-  pi.on("session_shutdown", () => {
-    stopQuotaUpdates();
+  pi.on("session_shutdown", (_event, ctx) => {
+    if (ctx.hasUI) stopQuotaUpdates();
   });
 
   // Re-assert footer when agent starts (prevents reset during agent activity)
   pi.on("agent_start", async (_event, ctx) => {
-    if (footerEnabled) setupFooter(ctx);
+    if (ctx.hasUI && footerEnabled) setupFooter(ctx);
   });
 }

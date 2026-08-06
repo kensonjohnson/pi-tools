@@ -6,8 +6,14 @@ import type {
   ExtensionContext,
   EntryRenderer,
 } from "@earendil-works/pi-coding-agent";
-import { Text, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+  type Component,
+  Text,
+  truncateToWidth,
+  type TUI,
+} from "@earendil-works/pi-tui";
 import { resolveSubagentLaunchPolicy } from "./launch-policy.ts";
+import { CompletionInbox } from "./completion-inbox.ts";
 import {
   type WorkstreamCompletion,
   type WorkstreamManifest,
@@ -20,13 +26,26 @@ export const TASK_CONTROL_TIMELINE_ENTRY_TYPE =
 export const TASK_HANDOFF_MESSAGE_TYPE = "pi-tools:subagent-task-handoff";
 const MAX_HANDOFF_CHARS = 2_400;
 const MAX_TIMELINE_LINES = 80;
-const WIDGET_VISIBLE_STATUSES = new Set<WorkstreamManifest["status"]>([
+const WIDGET_ACTIVE_STATUSES = new Set<WorkstreamManifest["status"]>([
   "starting",
   "running",
   "paused",
   "blocked",
   "needs_decision",
 ]);
+const WORKSTREAM_SPINNER_INTERVAL_MS = 80;
+const WORKSTREAM_SPINNER_FRAMES = [
+  "⠋",
+  "⠙",
+  "⠹",
+  "⠸",
+  "⠼",
+  "⠴",
+  "⠦",
+  "⠧",
+  "⠇",
+  "⠏",
+];
 
 type TaskReportStatus = "completed" | "blocked" | "needs-decision";
 
@@ -81,18 +100,21 @@ export type TaskControlInput = {
 };
 
 export class TaskWorkstreamService {
-  private readonly pi: Pick<ExtensionAPI, "appendEntry" | "sendMessage">;
+  private readonly pi: Pick<ExtensionAPI, "appendEntry">;
   private readonly supervisor: WorkstreamSupervisor;
   private readonly cwd: string;
+  private readonly inbox: CompletionInbox;
 
   constructor(
-    pi: Pick<ExtensionAPI, "appendEntry" | "sendMessage">,
+    pi: Pick<ExtensionAPI, "appendEntry">,
     supervisor: WorkstreamSupervisor,
     cwd: string,
+    inbox = new CompletionInbox(supervisor.rootDirectory),
   ) {
     this.pi = pi;
     this.supervisor = supervisor;
     this.cwd = cwd;
+    this.inbox = inbox;
     supervisor.setCompletionHandler((input) => this.handleCompletion(input));
   }
 
@@ -194,25 +216,28 @@ export class TaskWorkstreamService {
   }
 
   async refreshWidget(ctx: Pick<ExtensionContext, "ui">): Promise<void> {
+    const inboxRecords = await this.inbox.listUnconsumed();
+    const inboxByWorkstream = new Map(
+      inboxRecords.map((record) => [record.workstreamId, record.deliveryState]),
+    );
     const manifests = (await this.supervisor.list())
-      .filter((entry) => WIDGET_VISIBLE_STATUSES.has(entry.status))
+      .filter(
+        (entry) =>
+          WIDGET_ACTIVE_STATUSES.has(entry.status) ||
+          inboxByWorkstream.has(entry.id),
+      )
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     if (manifests.length === 0) {
       this.clearWidget(ctx);
       return;
     }
-    const rows = await Promise.all(
-      manifests.map(async (entry) =>
-        formatWidgetRow(entry, await this.readLatestJournalActivity(entry)),
-      ),
+    const rows = manifests.map((entry) =>
+      formatWidgetRow(entry, inboxByWorkstream.get(entry.id)),
     );
-    ctx.ui.setWidget("pi-tools-subagent-workstreams", (_tui, theme) => ({
-      render: (width) => [
-        theme.fg("accent", "Subagent workstreams"),
-        ...rows.map((row) => truncateToWidth(row, width)),
-      ],
-      invalidate: () => {},
-    }));
+    ctx.ui.setWidget(
+      "pi-tools-subagent-workstreams",
+      (tui, theme) => new WorkstreamsWidget(tui, theme, rows),
+    );
   }
 
   clearWidget(ctx: Pick<ExtensionContext, "ui">): void {
@@ -246,19 +271,24 @@ export class TaskWorkstreamService {
       artifact: artifactReference,
       timeline,
     });
-    this.pi.sendMessage(
-      {
-        customType: TASK_HANDOFF_MESSAGE_TYPE,
-        content: formatBoundedHandoff(report, artifactReference),
-        display: true,
-        details: {
-          workstreamId: input.manifest.id,
-          artifact: artifactReference,
-          status: report.status,
-        },
+    await this.inbox.create({
+      workstreamId: input.manifest.id,
+      kind: input.manifest.kind,
+      terminalStatus:
+        report.status === "blocked"
+          ? "blocked"
+          : report.status === "needs-decision"
+            ? "needs_decision"
+            : "settled",
+      handoff: formatBoundedHandoff(report, artifactReference),
+      artifactReferences: [artifactReference],
+      sourceCustomType: TASK_HANDOFF_MESSAGE_TYPE,
+      sourceDetails: {
+        workstreamId: input.manifest.id,
+        artifact: artifactReference,
+        status: report.status,
       },
-      { triggerTurn: true },
-    );
+    });
 
     return {
       status:
@@ -327,27 +357,6 @@ export class TaskWorkstreamService {
       ) as TaskWorkerReport;
     } catch {
       return undefined;
-    }
-  }
-
-  private async readLatestJournalActivity(
-    manifest: WorkstreamManifest,
-  ): Promise<string> {
-    try {
-      const line = (
-        await readFile(
-          join(this.workstreamDirectory(manifest), "journal.md"),
-          "utf8",
-        )
-      )
-        .split("\n")
-        .filter((entry) => entry.startsWith("["))
-        .at(-1);
-      return line
-        ? bound(line.replace(/^\[[^\]]+\]\s*/, ""), 240)
-        : "Awaiting worker activity.";
-    } catch {
-      return "Awaiting worker activity.";
     }
   }
 
@@ -554,17 +563,95 @@ function formatBoundedHandoff(
   return bound(lines.join("\n"), MAX_HANDOFF_CHARS);
 }
 
+export type WorkstreamWidgetRow = {
+  text: string;
+  status: WorkstreamManifest["status"];
+};
+
+type WorkstreamWidgetScheduler = {
+  setInterval(
+    callback: () => void,
+    milliseconds: number,
+  ): ReturnType<typeof setInterval>;
+  clearInterval(timer: ReturnType<typeof setInterval>): void;
+};
+
+const systemWidgetScheduler: WorkstreamWidgetScheduler = {
+  setInterval,
+  clearInterval,
+};
+
+export class WorkstreamsWidget implements Component {
+  private frame = 0;
+  private timer: ReturnType<typeof setInterval> | undefined;
+  private readonly tui: Pick<TUI, "requestRender">;
+  private readonly theme: { fg(color: string, text: string): string };
+  private readonly rows: WorkstreamWidgetRow[];
+  private readonly scheduler: WorkstreamWidgetScheduler;
+
+  constructor(
+    tui: Pick<TUI, "requestRender">,
+    theme: { fg(color: string, text: string): string },
+    rows: WorkstreamWidgetRow[],
+    scheduler: WorkstreamWidgetScheduler = systemWidgetScheduler,
+  ) {
+    this.tui = tui;
+    this.theme = theme;
+    this.rows = rows;
+    this.scheduler = scheduler;
+    if (rows.some((row) => row.status === "running")) {
+      this.timer = scheduler.setInterval(() => {
+        this.frame = (this.frame + 1) % WORKSTREAM_SPINNER_FRAMES.length;
+        this.tui.requestRender();
+      }, WORKSTREAM_SPINNER_INTERVAL_MS);
+    }
+  }
+
+  render(width: number): string[] {
+    return [
+      this.theme.fg("accent", "Subagent workstreams"),
+      ...this.rows.map((row) =>
+        truncateToWidth(
+          row.status === "running"
+            ? `${WORKSTREAM_SPINNER_FRAMES[this.frame]} ${row.text}`
+            : row.text,
+          width,
+        ),
+      ),
+    ];
+  }
+
+  invalidate(): void {}
+
+  dispose(): void {
+    if (this.timer === undefined) return;
+    this.scheduler.clearInterval(this.timer);
+    this.timer = undefined;
+  }
+}
+
 function formatWidgetRow(
   manifest: WorkstreamManifest,
-  activity: string,
-): string {
-  const indicator =
-    manifest.status === "running" || manifest.status === "starting"
-      ? "●"
-      : manifest.status === "paused"
-        ? "Ⅱ"
-        : "!";
-  return `${indicator} ${manifest.kind} ${shortId(manifest.id)} · ${manifest.status} — ${activity}`;
+  inboxState: "pending" | "scheduled" | undefined,
+): WorkstreamWidgetRow {
+  const inbox =
+    inboxState === "pending"
+      ? " · inbox pending"
+      : inboxState === "scheduled"
+        ? " · inbox queued"
+        : "";
+  return {
+    text: `${manifest.kind} ${shortId(manifest.id)} · ${workstreamPurpose(manifest)} · ${manifest.status}${inbox}`,
+    status: manifest.status,
+  };
+}
+
+function workstreamPurpose(manifest: WorkstreamManifest): string {
+  const marker =
+    manifest.kind === "research" ? "## Focused question\n" : "## Objective\n";
+  const afterMarker = manifest.brief.split(marker)[1];
+  const purpose = afterMarker?.split("\n")[0] ?? manifest.brief;
+  return bound(purpose, 160) || "Purpose retained in worker brief.";
 }
 
 function shortId(id: string): string {

@@ -1,6 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { Text } from "@earendil-works/pi-tui";
 import { TaskWorkstreamService } from "./task-workstreams.ts";
+
+const MAX_TASK_LAUNCH_TITLE_CHARS = 160;
 
 const TaskLaunchParameters = Type.Object({
   objective: Type.String({
@@ -77,6 +80,20 @@ export function registerTaskWorkstreamTools(
     description:
       "Explicitly launch one persistent task worker with a focused objective, scope, and minimal relevant context. The worker runs independently; do not delegate routine work merely because capacity exists.",
     parameters: TaskLaunchParameters,
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", `Task: ${taskLaunchTitle(args.objective)}`),
+        0,
+        0,
+      );
+    },
+    renderResult(_result, _options, theme, context) {
+      return new Text(
+        theme.fg("success", `Task: ${taskLaunchTitle(context.args.objective)}`),
+        0,
+        0,
+      );
+    },
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const service = getService();
       if (!service) return unavailable();
@@ -194,6 +211,13 @@ export function registerTaskWorkstreamTools(
       }
     },
   });
+}
+
+function taskLaunchTitle(objective: string): string {
+  const normalized = objective.replace(/\s+/g, " ").trim();
+  return normalized.length <= MAX_TASK_LAUNCH_TITLE_CHARS
+    ? normalized
+    : `${normalized.slice(0, MAX_TASK_LAUNCH_TITLE_CHARS - 1)}…`;
 }
 
 function formatControlResult(

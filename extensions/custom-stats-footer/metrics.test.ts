@@ -56,6 +56,23 @@ test("weights the aggregate by output tokens and response duration", () => {
   assert.notEqual(snapshot.averageTps, 30);
 });
 
+test("keeps interleaved session responses in their owning meters", () => {
+  let now = 0;
+  const main = new ResponseTpsMeter(() => now);
+  const worker = new ResponseTpsMeter(() => now);
+
+  main.start();
+  now = 100;
+  worker.start();
+  now = 1_100;
+  worker.finish(response(100));
+  now = 2_000;
+  main.finish(response(100));
+
+  assert.deepEqual(main.snapshot(), { lastTps: 50, averageTps: 50 });
+  assert.deepEqual(worker.snapshot(), { lastTps: 100, averageTps: 100 });
+});
+
 test("discards invalid responses without changing finalized metrics", () => {
   let now = 0;
   const meter = new ResponseTpsMeter(() => now);

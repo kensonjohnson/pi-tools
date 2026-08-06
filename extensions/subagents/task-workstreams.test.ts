@@ -6,11 +6,13 @@ import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { SubagentLaunchPolicy } from "./launch-policy.ts";
+import { CompletionInbox } from "./completion-inbox.ts";
 import {
   buildFocusedFollowUp,
   buildTaskBrief,
   TaskWorkstreamService,
   TASK_CONTROL_TIMELINE_ENTRY_TYPE,
+  WorkstreamsWidget,
   TASK_HANDOFF_MESSAGE_TYPE,
   TASK_TIMELINE_ENTRY_TYPE,
 } from "./task-workstreams.ts";
@@ -88,7 +90,64 @@ function assistantReport(status: string, outcome: string): AgentMessage {
   } as AgentMessage;
 }
 
-test("retains task detail locally and emits one bounded handoff per completed persistent run", async () => {
+test("animates only running workstreams and disposes its spinner timer", () => {
+  const timers = new Map<number, () => void>();
+  const cleared: number[] = [];
+  const scheduler = {
+    setInterval(callback: () => void, milliseconds: number) {
+      assert.equal(milliseconds, 80);
+      const id = timers.size + 1;
+      timers.set(id, callback);
+      return id as unknown as ReturnType<typeof setInterval>;
+    },
+    clearInterval(timer: ReturnType<typeof setInterval>) {
+      const id = timer as unknown as number;
+      cleared.push(id);
+      timers.delete(id);
+    },
+  };
+  let renders = 0;
+  const widget = new WorkstreamsWidget(
+    { requestRender: () => renders++ } as any,
+    { fg: (_color: string, text: string) => text },
+    [
+      { text: "task active objective · running", status: "running" },
+      { text: "task paused objective · paused", status: "paused" },
+      {
+        text: "task inbox objective · settled · inbox pending",
+        status: "settled",
+      },
+    ],
+    scheduler,
+  );
+
+  assert.equal(timers.size, 1);
+  assert.match(widget.render(240)[1] ?? "", /^⠋ task active objective/);
+  assert.doesNotMatch(widget.render(240)[2] ?? "", /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/);
+  assert.doesNotMatch(widget.render(240)[3] ?? "", /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/);
+
+  timers.get(1)?.();
+  assert.equal(renders, 1);
+  assert.match(widget.render(240)[1] ?? "", /^⠙ task active objective/);
+
+  widget.dispose();
+  assert.deepEqual(cleared, [1]);
+  assert.equal(timers.size, 0);
+  widget.dispose();
+  assert.deepEqual(cleared, [1]);
+
+  const staticWidget = new WorkstreamsWidget(
+    { requestRender() {} } as any,
+    { fg: (_color: string, text: string) => text },
+    [{ text: "task paused objective · paused", status: "paused" }],
+    scheduler,
+  );
+  assert.equal(timers.size, 0);
+  staticWidget.dispose();
+  assert.deepEqual(cleared, [1]);
+});
+
+test("retains task detail locally and creates one durable inbox handoff per completed persistent run", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-tools-task-workstream-"));
   const session = new FakeWorkerSession(join(root, "worker.jsonl"));
   const entries: Array<{ type: string; data: unknown }> = [];
@@ -100,6 +159,7 @@ test("retains task detail locally and emits one bounded handoff per completed pe
     createSession: async () => session as unknown as WorkerSession,
     observeGit: async () => ({ branch: "main", commit: "abc123" }),
   });
+  const inbox = new CompletionInbox(join(root, "subagents"));
   const service = new TaskWorkstreamService(
     {
       appendEntry(type, data) {
@@ -111,6 +171,7 @@ test("retains task detail locally and emits one bounded handoff per completed pe
     },
     supervisor,
     root,
+    inbox,
   );
 
   try {
@@ -137,12 +198,17 @@ test("retains task detail locally and emits one bounded handoff per completed pe
         },
       },
     } as any);
-    const widgetLines = (widget as any)(
-      {},
+    const runningWidget = (widget as any)(
+      { requestRender() {} },
       { fg: (_color: string, text: string) => text },
-    ).render(240);
-    assert.match(widgetLines.join("\n"), /task .*running/);
-    assert.match(widgetLines.join("\n"), /tool_started: Worker started read/);
+    );
+    const widgetLines = runningWidget.render(240);
+    assert.match(
+      widgetLines.join("\n"),
+      /task .*Add bounded task-worker handoffs.*running/,
+    );
+    assert.doesNotMatch(widgetLines.join("\n"), /tool_started|Worker started/);
+    runningWidget.dispose();
     session.messages = [
       assistantReport("needs-decision", "A product choice is required."),
     ];
@@ -157,11 +223,13 @@ test("retains task detail locally and emits one bounded handoff per completed pe
     );
     assert.equal(first.report?.sequence, 1);
     assert.match(first.report?.finalAssistantText ?? "", /product choice/);
-    assert.equal(messages.length, 1);
+    assert.equal(messages.length, 0);
     assert.equal(entries.length, 1);
     assert.equal(entries[0]?.type, TASK_TIMELINE_ENTRY_TYPE);
-    assert.match(messages[0]?.content ?? "", /needs a decision/);
-    assert.deepEqual(messages[0]?.options, { triggerTurn: true });
+    const firstInbox = await inbox.listUnconsumed();
+    assert.equal(firstInbox.length, 1);
+    assert.match(firstInbox[0]?.handoff ?? "", /needs a decision/);
+    assert.equal(firstInbox[0]?.deliveryState, "pending");
     await service.control({} as any, {
       workstreamId: workstream.id,
       action: "checkpoint",
@@ -187,9 +255,10 @@ test("retains task detail locally and emits one bounded handoff per completed pe
     const second = await service.currentReport(workstream.id);
     assert.equal(second.report?.status, "completed");
     assert.equal(second.report?.sequence, 2);
-    assert.equal(messages.length, 2);
+    assert.equal(messages.length, 0);
     assert.equal(entries.length, 3);
     assert.equal((await supervisor.get(workstream.id))?.status, "settled");
+    assert.equal((await inbox.listUnconsumed()).length, 2);
     await service.refreshWidget({
       ui: {
         setWidget(_key: string, content: unknown) {
@@ -197,7 +266,17 @@ test("retains task detail locally and emits one bounded handoff per completed pe
         },
       },
     } as any);
-    assert.equal(widget, undefined);
+    const settledWidget = (widget as any)(
+      { requestRender() {} },
+      { fg: (_color: string, text: string) => text },
+    );
+    const settledWidgetLines = settledWidget.render(240);
+    assert.match(settledWidgetLines.join("\n"), /settled · inbox pending/);
+    assert.doesNotMatch(
+      settledWidgetLines.join("\n"),
+      /tool_started|Worker started/,
+    );
+    settledWidget.dispose();
     assert.equal(
       (entries[0]?.data as { workstreamId?: string }).workstreamId,
       workstream.id,
