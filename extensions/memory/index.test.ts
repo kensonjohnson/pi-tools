@@ -88,18 +88,17 @@ test("memory_remember omits opaque IDs from confirmations and TUI output", async
       ),
     ]);
 
-    for (const [index, result] of results.entries()) {
+    assert.deepEqual(results.map((result) => result.content[0].text).sort(), [
+      "Matching decisions memory already exists.",
+      "Stored decisions memory.",
+    ]);
+
+    for (const result of results) {
       const confirmation = result.content[0].text;
       const rendered = tool.renderResult!(result, {}, plainTheme)
         .render(120)
         .join("\n");
 
-      assert.equal(
-        confirmation,
-        index === 0
-          ? "Stored decisions memory."
-          : "Matching decisions memory already exists.",
-      );
       assert.doesNotMatch(confirmation, new RegExp(id));
       assert.equal(result.details.id, id);
       assert.match(rendered, /decisions memory/);
