@@ -14,7 +14,7 @@
     "test:compression": "node --experimental-strip-types --test $(find extensions/tool-output-compression -name '*.test.ts' -print)",
     "test:code-search": "node --experimental-strip-types --test $(find extensions/code-search -name '*.test.ts' -print)",
     "test:subagents": "node --experimental-strip-types --test $(find extensions/subagents -name '*.test.ts' -print)",
-    "test:working-status": "node --experimental-strip-types --test $(find extensions/main-working-status -name '*.test.ts' -print)",
+    "test:working-spinner": "node --experimental-strip-types --test $(find extensions/main-working-spinner -name '*.test.ts' -print)",
     "verify:package": "npm pack --dry-run"
   },
   "dependencies": {

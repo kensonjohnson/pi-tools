@@ -5,7 +5,6 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CompletionInbox } from "./completion-inbox.ts";
-import { SUBAGENT_WAIT_STATE_EVENT } from "../../lib/subagent-wait-state.ts";
 import {
   CONFIG_FILE_NAME,
   SettingsRegistry,
@@ -20,6 +19,7 @@ import {
   SUBAGENT_SETTINGS,
   SUBAGENT_TOOL_NAMES,
 } from "./settings.ts";
+import { WAITING_ON_WORKERS_MESSAGE } from "./index.ts";
 
 const parentModel = {
   provider: "parent",
@@ -258,12 +258,10 @@ test("interrupts an active main-session wait and replays captured user inputs FI
     const { default: extension } = await import("./index.ts");
     const handlers = new Map<string, (event: any, ctx: any) => unknown>();
     const replayed: unknown[] = [];
-    const waitEvents: unknown[] = [];
+    const messages: Array<string | undefined> = [];
     const pi = {
       events: {
-        emit(channel: string, event: unknown) {
-          if (channel === SUBAGENT_WAIT_STATE_EVENT) waitEvents.push(event);
-        },
+        emit() {},
         on() {
           return () => {};
         },
@@ -285,13 +283,20 @@ test("interrupts an active main-session wait and replays captured user inputs FI
     let aborts = 0;
     const ctx = {
       cwd,
+      hasUI: true,
       isProjectTrusted: () => true,
       isIdle: () => idle,
+      mode: "tui",
       sessionManager: { getSessionId: () => "main-session" },
       abort() {
         aborts++;
       },
-      ui: { setWidget() {} },
+      ui: {
+        setWidget() {},
+        setWorkingMessage(message?: string) {
+          messages.push(message);
+        },
+      },
     };
     extension(pi as unknown as ExtensionAPI);
     await handlers.get("session_start")?.({}, ctx);
@@ -300,9 +305,7 @@ test("interrupts an active main-session wait and replays captured user inputs FI
       { toolCallId: "wait-1", toolName: "subagent_wait", args: {} },
       ctx,
     );
-    assert.deepEqual(waitEvents, [
-      { sessionId: "main-session", toolCallId: "wait-1", phase: "started" },
-    ]);
+    assert.deepEqual(messages, [WAITING_ON_WORKERS_MESSAGE]);
     const image = { type: "image", data: "preserved", mimeType: "image/png" };
     assert.deepEqual(
       await handlers.get("input")?.(
@@ -363,9 +366,7 @@ test("interrupts an active main-session wait and replays captured user inputs FI
       { toolCallId: "worker-wait", toolName: "subagent_wait", args: {} },
       workerCtx,
     );
-    assert.deepEqual(waitEvents, [
-      { sessionId: "main-session", toolCallId: "wait-1", phase: "started" },
-    ]);
+    assert.deepEqual(messages, [WAITING_ON_WORKERS_MESSAGE]);
 
     handlers.get("tool_execution_end")?.(
       {
@@ -376,11 +377,7 @@ test("interrupts an active main-session wait and replays captured user inputs FI
       },
       ctx,
     );
-    assert.deepEqual(waitEvents.at(-1), {
-      sessionId: "main-session",
-      toolCallId: "wait-1",
-      phase: "ended",
-    });
+    assert.deepEqual(messages.at(-1), undefined);
     assert.deepEqual(
       await handlers.get("input")?.(
         {
@@ -425,6 +422,7 @@ test("interrupts an active main-session wait and replays captured user inputs FI
       ctx,
     );
     await handlers.get("session_shutdown")?.({}, ctx);
+    assert.deepEqual(messages.at(-1), undefined);
     idle = true;
     await handlers.get("agent_settled")?.({}, ctx);
     assert.equal(replayed.length, 3);
