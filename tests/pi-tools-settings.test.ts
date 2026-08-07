@@ -9,6 +9,10 @@ import {
   SETTINGS_DEFINITION_EVENT,
   SETTINGS_DEFINITION_REQUEST_EVENT,
 } from "../lib/pi-tools-config.ts";
+import {
+  MAIN_WORKING_SPINNER_SETTINGS,
+  MainWorkingSpinnerPreview,
+} from "../extensions/main-working-spinner.ts";
 import extension from "../extensions/pi-tools-settings.ts";
 
 initTheme();
@@ -21,6 +25,126 @@ type CustomComponent = {
 function visible(component: CustomComponent): string {
   return component.render(100).join("\n");
 }
+
+test(
+  "renders and updates the main working spinner detail preview",
+  { timeout: 2_000 },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-tools-settings-preview-"));
+    const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    let component: CustomComponent | undefined;
+    process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+
+    try {
+      const handlers = new Map<string, Array<(data: unknown) => void>>();
+      const timers = new Map<number, () => void>();
+      const cleared: number[] = [];
+      let command:
+        { handler: (args: string, ctx: any) => Promise<void> } | undefined;
+      let complete!: () => void;
+      let customReady!: () => void;
+      const closed = new Promise<void>((resolve) => (complete = resolve));
+      const ready = new Promise<void>((resolve) => (customReady = resolve));
+      const pi = {
+        events: {
+          emit(channel: string, data: unknown) {
+            for (const handler of handlers.get(channel) ?? []) handler(data);
+          },
+          on(channel: string, handler: (data: unknown) => void) {
+            const listeners = handlers.get(channel) ?? [];
+            listeners.push(handler);
+            handlers.set(channel, listeners);
+            return () =>
+              handlers.set(
+                channel,
+                listeners.filter((listener) => listener !== handler),
+              );
+          },
+        },
+        registerCommand(
+          name: string,
+          registration: { handler: (args: string, ctx: any) => Promise<void> },
+        ) {
+          if (name === "pi-tools") command = registration;
+        },
+      } as unknown as ExtensionAPI;
+      extension(pi);
+      pi.events.on(SETTINGS_DEFINITION_REQUEST_EVENT, () => {
+        pi.events.emit(SETTINGS_DEFINITION_EVENT, {
+          ...MAIN_WORKING_SPINNER_SETTINGS,
+          detailPreview: (options) =>
+            new MainWorkingSpinnerPreview(options, {
+              setInterval(callback) {
+                const id = timers.size + cleared.length + 1;
+                timers.set(id, callback);
+                return id as unknown as ReturnType<typeof setInterval>;
+              },
+              clearInterval(timer) {
+                const id = timer as unknown as number;
+                cleared.push(id);
+                timers.delete(id);
+              },
+            }),
+        });
+      });
+
+      assert.ok(command, "expected the pi-tools command to register");
+      const open = command.handler("", {
+        mode: "tui",
+        cwd: join(root, "project"),
+        isProjectTrusted: () => true,
+        reload: async () => {},
+        ui: {
+          notify() {},
+          custom: async (factory: any) => {
+            component = factory(
+              { requestRender() {} },
+              {
+                fg: (_color: string, text: string) => text,
+                bold: (text: string) => text,
+              },
+              {},
+              complete,
+            );
+            customReady();
+            return closed;
+          },
+        },
+      });
+
+      await ready;
+      assert.ok(component, "expected the settings UI to open");
+      component.handleInput("\u001b[B");
+      component.handleInput("\r");
+      assert.match(visible(component), /Preview — Pulse · 100 ms/);
+      assert.match(visible(component), /· Working…/);
+
+      component.handleInput("\u001b[B");
+      component.handleInput("\r");
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.match(visible(component), /Preview — Sand · 100 ms/);
+
+      component.handleInput("\u001b");
+      assert.doesNotMatch(visible(component), /Preview —/);
+      assert.equal(timers.size, 0, "detail exit disposes the preview timer");
+      component.handleInput("\u001b");
+      await open;
+    } finally {
+      (
+        component as (CustomComponent & { dispose?: () => void }) | undefined
+      )?.dispose?.();
+      if (originalAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+      await rm(root, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+        retryDelay: 10,
+      });
+    }
+  },
+);
 
 test(
   "navigates extension settings without losing the selected write scope",

@@ -4,10 +4,12 @@ import {
   type ExtensionContext,
   type WorkingIndicatorOptions,
 } from "@earendil-works/pi-coding-agent";
+import { type Component, truncateToWidth } from "@earendil-works/pi-tui";
 import {
   getSettingValue,
   publishExtensionSettings,
   type ExtensionSettingsDefinition,
+  type SettingValue,
 } from "../lib/pi-tools-config.ts";
 import { getRuntimeSettings } from "../lib/pi-tools-runtime-settings.ts";
 export const MAIN_WORKING_SPINNER_SETTINGS_ID = "main-working-spinner";
@@ -205,10 +207,115 @@ export const WORKING_INDICATOR_FRAMES: Record<
   Arrows: ["▹▹▹▹▹", "▸▹▹▹▹", "▹▸▹▹▹", "▹▹▸▹▹", "▹▹▹▸▹", "▹▹▹▹▸"],
 };
 
+type WorkingSpinnerPreviewScheduler = {
+  setInterval(
+    callback: () => void,
+    milliseconds: number,
+  ): ReturnType<typeof setInterval>;
+  clearInterval(timer: ReturnType<typeof setInterval>): void;
+};
+
+const systemWorkingSpinnerPreviewScheduler: WorkingSpinnerPreviewScheduler = {
+  setInterval,
+  clearInterval,
+};
+
+/** Animated, settings-local preview; it never touches Pi's global indicator. */
+export class MainWorkingSpinnerPreview implements Component {
+  private readonly values: Record<string, SettingValue | undefined>;
+  private readonly requestRender: () => void;
+  private readonly theme: { fg(color: "accent" | "dim", text: string): string };
+  private readonly scheduler: WorkingSpinnerPreviewScheduler;
+  private frame = 0;
+  private timer: ReturnType<typeof setInterval> | undefined;
+
+  constructor(
+    options: {
+      values: Readonly<Record<string, SettingValue | undefined>>;
+      requestRender: () => void;
+      theme: { fg(color: "accent" | "dim", text: string): string };
+    },
+    scheduler: WorkingSpinnerPreviewScheduler = systemWorkingSpinnerPreviewScheduler,
+  ) {
+    this.values = { ...options.values };
+    this.requestRender = options.requestRender;
+    this.theme = options.theme;
+    this.scheduler = scheduler;
+    this.restartTimer();
+  }
+
+  updateValue(field: string, value: SettingValue): void {
+    this.values[field] = value;
+    if (field === "preset" || field === "intervalMs") {
+      this.frame = 0;
+      this.restartTimer();
+    }
+    this.requestRender();
+  }
+
+  render(width: number): string[] {
+    const preset = this.getPreset();
+    const options = resolveWorkingIndicatorOptions(
+      preset,
+      this.values.intervalMs,
+    );
+    const frame = options.frames[this.frame % options.frames.length] ?? "";
+    const intervalMs = this.getIntervalMs();
+
+    return [
+      truncateToWidth(
+        this.theme.fg("dim", `Preview — ${preset} · ${intervalMs} ms`),
+        width,
+      ),
+      truncateToWidth(`  ${this.theme.fg("accent", frame)} Working…`, width),
+    ];
+  }
+
+  invalidate(): void {}
+
+  dispose(): void {
+    this.stopTimer();
+  }
+
+  private getPreset(): WorkingIndicatorPreset {
+    return isWorkingIndicatorPreset(this.values.preset)
+      ? this.values.preset
+      : DEFAULT_WORKING_INDICATOR_PRESET;
+  }
+
+  private getIntervalMs(): number {
+    const value = this.values.intervalMs;
+    return typeof value === "number" && Number.isInteger(value) && value > 0
+      ? value
+      : DEFAULT_WORKING_INDICATOR_INTERVAL_MS;
+  }
+
+  private restartTimer(): void {
+    this.stopTimer();
+    const { frames, intervalMs } = resolveWorkingIndicatorOptions(
+      this.getPreset(),
+      this.values.intervalMs,
+    );
+    if (intervalMs === undefined || frames.length < 2) return;
+
+    this.timer = this.scheduler.setInterval(() => {
+      this.frame = (this.frame + 1) % frames.length;
+      this.requestRender();
+    }, intervalMs);
+  }
+
+  private stopTimer(): void {
+    if (this.timer === undefined) return;
+    this.scheduler.clearInterval(this.timer);
+    this.timer = undefined;
+  }
+}
+
 export const MAIN_WORKING_SPINNER_SETTINGS = {
   id: MAIN_WORKING_SPINNER_SETTINGS_ID,
   label: "Main Working Spinner",
   description: "Controls the main TUI working indicator.",
+  detailPreview: (options) => new MainWorkingSpinnerPreview(options),
   fields: {
     enabled: { type: "boolean", default: true, label: "Enabled" },
     preset: {

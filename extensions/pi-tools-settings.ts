@@ -24,6 +24,7 @@ import {
   type EffectiveSettings,
   type ExtensionSettingsDefinition,
   type SettingDefinition,
+  type SettingsDetailPreview,
   type SettingValue,
   type WritableConfigScope,
   updateSetting,
@@ -308,11 +309,18 @@ async function openSettingsUI(
       ctx.isProjectTrusted(),
     );
     let editingTextValue = false;
+    let activeDetailPreview: SettingsDetailPreview | undefined;
     let settingsList: SettingsList;
+
+    const disposeDetailPreview = () => {
+      activeDetailPreview?.dispose();
+      activeDetailPreview = undefined;
+    };
 
     const saveField = (
       id: string,
       input: string,
+      onChanged?: (registered: RegisteredField, value: SettingValue) => void,
       onSaved?: (registered: RegisteredField, value: SettingValue) => void,
     ) => {
       if (savePromise) return;
@@ -336,6 +344,7 @@ async function openSettingsUI(
         return;
       }
 
+      onChanged?.(registered, value);
       const pendingSave = saveSetting(ctx, scope, registered, value)
         .then(() => {
           settingsChanged = true;
@@ -366,6 +375,17 @@ async function openSettingsUI(
           settings,
           theme,
         );
+        const detailPreview = definition.detailPreview?.({
+          values: Object.fromEntries(
+            detailItems.map((item) => {
+              const field = item.id.slice(definition.id.length + 1);
+              return [field, getSettingValue(settings, definition.id, field)];
+            }),
+          ),
+          requestRender: () => tui.requestRender(),
+          theme,
+        });
+        activeDetailPreview = detailPreview;
         for (const detailItem of detailItems) {
           if (!detailItem.submenu) continue;
           const openTextSubmenu = detailItem.submenu;
@@ -392,6 +412,7 @@ async function openSettingsUI(
         detailContainer.addChild(
           new Text(theme.fg("dim", `Write scope: ${scope}`), 1, 0),
         );
+        if (detailPreview) detailContainer.addChild(detailPreview);
         const detailSettingsList = new SettingsList(
           detailItems,
           Math.min(detailItems.length + 2, 15),
@@ -404,17 +425,27 @@ async function openSettingsUI(
               ),
           },
           (id, input) => {
-            saveField(id, input, (registered, value) => {
-              if (registered.field !== "enabled") return;
-              settingsList.updateValue(
-                registered.definition.id,
-                `enabled: ${formatValue(value)}`,
-              );
-              tui.requestRender();
-            });
+            saveField(
+              id,
+              input,
+              (registered, value) => {
+                detailPreview?.updateValue(registered.field, value);
+                tui.requestRender();
+              },
+              (registered, value) => {
+                if (registered.field === "enabled") {
+                  settingsList.updateValue(
+                    registered.definition.id,
+                    `enabled: ${formatValue(value)}`,
+                  );
+                }
+                tui.requestRender();
+              },
+            );
           },
           () => {
             editingTextValue = false;
+            if (activeDetailPreview === detailPreview) disposeDetailPreview();
             closeSubmenu();
             tui.requestRender();
           },
@@ -430,6 +461,9 @@ async function openSettingsUI(
           },
           handleInput(data: string): void {
             detailSettingsList.handleInput(data);
+          },
+          dispose(): void {
+            if (activeDetailPreview === detailPreview) disposeDetailPreview();
           },
         };
       };
@@ -499,6 +533,9 @@ async function openSettingsUI(
               : data;
         settingsList.handleInput(navigationData);
         tui.requestRender();
+      },
+      dispose(): void {
+        disposeDetailPreview();
       },
     };
   });

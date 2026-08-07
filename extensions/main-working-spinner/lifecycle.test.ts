@@ -7,6 +7,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import extension, {
   DEFAULT_WORKING_INDICATOR_INTERVAL_MS,
   MAIN_WORKING_SPINNER_SETTINGS,
+  MainWorkingSpinnerPreview,
   WORKING_INDICATOR_FRAMES,
   WORKING_INDICATOR_PRESETS,
   resolveWorkingIndicatorOptions,
@@ -46,27 +47,37 @@ function createExtensionHarness() {
 }
 
 test("main TUI applies its configured spinner without changing working text", async () => {
-  const { handlers, indicators, messages, ui } = createExtensionHarness();
-  const ctx = {
-    cwd: process.cwd(),
-    hasUI: true,
-    isProjectTrusted: () => false,
-    mode: "tui",
-    ui,
-  };
+  const root = await mkdtemp(join(tmpdir(), "pi-tools-working-spinner-"));
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(root, "agent");
 
-  await handlers.get("session_start")?.({}, ctx);
-  assert.deepEqual(indicators, [
-    {
-      frames: [...WORKING_INDICATOR_FRAMES.Pulse],
-      intervalMs: DEFAULT_WORKING_INDICATOR_INTERVAL_MS,
-    },
-  ]);
-  assert.deepEqual(messages, []);
+  try {
+    const { handlers, indicators, messages, ui } = createExtensionHarness();
+    const ctx = {
+      cwd: join(root, "project"),
+      hasUI: true,
+      isProjectTrusted: () => false,
+      mode: "tui",
+      ui,
+    };
 
-  handlers.get("session_shutdown")?.({}, ctx);
-  assert.deepEqual(indicators.at(-1), undefined);
-  assert.deepEqual(messages, []);
+    await handlers.get("session_start")?.({}, ctx);
+    assert.deepEqual(indicators, [
+      {
+        frames: [...WORKING_INDICATOR_FRAMES.Pulse],
+        intervalMs: DEFAULT_WORKING_INDICATOR_INTERVAL_MS,
+      },
+    ]);
+    assert.deepEqual(messages, []);
+
+    handlers.get("session_shutdown")?.({}, ctx);
+    assert.deepEqual(indicators.at(-1), undefined);
+    assert.deepEqual(messages, []);
+  } finally {
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("headless and RPC sessions do not own the working spinner", async () => {
@@ -87,6 +98,52 @@ test("headless and RPC sessions do not own the working spinner", async () => {
     assert.deepEqual(indicators, []);
     assert.deepEqual(messages, []);
   }
+});
+
+test("previews selected frames at the selected interval and disposes its timer", () => {
+  const timers = new Map<number, () => void>();
+  const cleared: number[] = [];
+  const intervals: number[] = [];
+  let renders = 0;
+  const preview = new MainWorkingSpinnerPreview(
+    {
+      values: { preset: "Pulse", intervalMs: 100 },
+      requestRender: () => renders++,
+      theme: { fg: (_color: "accent" | "dim", text: string) => text },
+    },
+    {
+      setInterval(callback, milliseconds) {
+        const id = timers.size + cleared.length + 1;
+        timers.set(id, callback);
+        intervals.push(milliseconds);
+        return id as unknown as ReturnType<typeof setInterval>;
+      },
+      clearInterval(timer) {
+        const id = timer as unknown as number;
+        cleared.push(id);
+        timers.delete(id);
+      },
+    },
+  );
+
+  assert.match(preview.render(100).join("\n"), /Preview — Pulse · 100 ms/);
+  assert.match(preview.render(100).join("\n"), /· Working…/);
+  timers.get(1)?.();
+  assert.match(preview.render(100).join("\n"), /• Working…/);
+  assert.equal(renders, 1);
+
+  preview.updateValue("preset", "Static");
+  assert.deepEqual(cleared, [1]);
+  assert.match(preview.render(100).join("\n"), /Preview — Static · 100 ms/);
+
+  preview.updateValue("preset", "Line");
+  preview.updateValue("intervalMs", 250);
+  assert.deepEqual(intervals, [100, 100, 250]);
+  assert.match(preview.render(100).join("\n"), /Preview — Line · 250 ms/);
+  assert.match(preview.render(100).join("\n"), /- Working…/);
+
+  preview.dispose();
+  assert.deepEqual(cleared, [1, 2, 3]);
 });
 
 test("registers all approved presets and treats Static as non-animated", () => {
