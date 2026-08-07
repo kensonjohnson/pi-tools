@@ -114,7 +114,7 @@ test("animates only running workstreams and disposes its spinner timer", () => {
       { text: "task active objective · running", status: "running" },
       { text: "task paused objective · paused", status: "paused" },
       {
-        text: "Queued · Task worker · inbox objective",
+        text: "queued · inbox objective",
         status: "settled",
       },
     ],
@@ -165,7 +165,7 @@ test("animates only running workstreams and disposes its spinner timer", () => {
     `${frames[0]} task active objective · running`,
   );
   assert.equal(widget.render(240)[2], "task paused objective · paused");
-  assert.equal(widget.render(240)[3], "Queued · Task worker · inbox objective");
+  assert.equal(widget.render(240)[3], "queued · inbox objective");
 
   for (const frame of frames.slice(1)) {
     timers.get(1)?.();
@@ -198,6 +198,115 @@ test("animates only running workstreams and disposes its spinner timer", () => {
   assert.equal(timers.size, 0);
   staticWidget.dispose();
   assert.deepEqual(cleared, [1]);
+});
+
+test("renders only concise thinking and tool lifecycle tail rows", () => {
+  const timers = new Map<number, () => void>();
+  const widget = new WorkstreamsWidget(
+    { requestRender() {} } as any,
+    { fg: (_color: string, text: string) => text },
+    [
+      {
+        text: "running · inspect the flow",
+        status: "running",
+        events: [
+          {
+            kind: "thinking",
+            state: "complete",
+            text: "Thinking: Inspecting worker state",
+          },
+          { kind: "tool", state: "success", text: "Tool: read" },
+          { kind: "tool", state: "active", text: "Tool: bash" },
+          { kind: "tool", state: "failed", text: "Tool: write" },
+        ],
+      },
+    ],
+    {
+      setInterval(callback: () => void) {
+        timers.set(1, callback);
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      },
+      clearInterval() {
+        timers.clear();
+      },
+    },
+  );
+
+  assert.deepEqual(widget.render(240), [
+    "Subagent workstreams",
+    "⠁ running · inspect the flow",
+    "  Thinking: Inspecting worker state",
+    "  ✓ Tool: read",
+    "  ⠁ Tool: bash",
+    "  ! Tool: write",
+  ]);
+  assert.doesNotMatch(widget.render(240).join("\n"), /tool result/i);
+  widget.dispose();
+  assert.equal(timers.size, 0);
+});
+
+test("limits live progress rows to the configured output tail", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-tools-task-workstream-"));
+  const session = new FakeWorkerSession(join(root, "worker.jsonl"));
+  const supervisor = new WorkstreamSupervisor({
+    cwd: root,
+    rootDirectory: join(root, "subagents"),
+    createSession: async () => session as unknown as WorkerSession,
+    observeGit: async () => ({}),
+  });
+  const service = new TaskWorkstreamService(
+    { appendEntry() {} },
+    supervisor,
+    root,
+    new CompletionInbox(join(root, "subagents")),
+    1,
+  );
+
+  try {
+    const workstream = await supervisor.launch({
+      kind: "task",
+      brief: buildTaskBrief({ objective: "Inspect the tail", scope: "Tests" }),
+      policy,
+    });
+    await Promise.resolve();
+    session.emit({
+      type: "tool_execution_start",
+      toolCallId: "read-1",
+      toolName: "read",
+      args: {},
+    } as AgentSessionEvent);
+    session.emit({
+      type: "tool_execution_end",
+      toolCallId: "read-1",
+      toolName: "read",
+      result: "raw result",
+      isError: false,
+    } as AgentSessionEvent);
+    session.emit({
+      type: "tool_execution_start",
+      toolCallId: "bash-1",
+      toolName: "bash",
+      args: {},
+    } as AgentSessionEvent);
+    await service.refreshWidget({
+      ui: {
+        setWidget(_key: string, content: unknown) {
+          const widget = (content as any)(
+            { requestRender() {} },
+            { fg: (_color: string, text: string) => text },
+          );
+          const lines = widget.render(240).join("\n");
+          assert.match(lines, /Tool: bash/);
+          assert.doesNotMatch(lines, /Tool: read|raw result/);
+          widget.dispose();
+        },
+      },
+    } as any);
+    assert.equal((await supervisor.get(workstream.id))?.status, "running");
+  } finally {
+    await supervisor.shutdown();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("retains task detail locally and creates one durable inbox handoff per completed persistent run", async () => {
@@ -258,7 +367,7 @@ test("retains task detail locally and creates one durable inbox handoff per comp
     const widgetLines = runningWidget.render(240);
     assert.match(
       widgetLines.join("\n"),
-      /running · Task worker · Add bounded task-worker handoffs/,
+      /running · Add bounded task-worker handoffs/,
     );
     assert.doesNotMatch(widgetLines.join("\n"), /tool_started|Worker started/);
     runningWidget.dispose();
@@ -324,7 +433,7 @@ test("retains task detail locally and creates one durable inbox handoff per comp
       { fg: (_color: string, text: string) => text },
     );
     const settledWidgetLines = settledWidget.render(24);
-    assert.match(settledWidgetLines[1] ?? "", /^Queued · Task worker/);
+    assert.match(settledWidgetLines[1] ?? "", /^queued ·/);
     assert.doesNotMatch(
       settledWidgetLines.join("\n"),
       new RegExp(workstream.id),

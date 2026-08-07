@@ -63,9 +63,17 @@ export type WorkstreamManifest = {
   failure?: string;
 };
 
+export type WorkstreamProgressEvent = {
+  id: string;
+  kind: "thinking" | "tool";
+  state: "active" | "complete" | "success" | "failed";
+  text: string;
+};
+
 export type WorkstreamEvent = {
   workstreamId: string;
   type:
+    | "progress"
     | "started"
     | "tool_started"
     | "tool_finished"
@@ -195,6 +203,7 @@ export class WorkstreamSupervisor {
   private readonly runs = new Map<string, Promise<void>>();
   private readonly writes = new Set<Promise<unknown>>();
   private readonly queues = new Map<string, Promise<void>>();
+  private readonly progress = new Map<string, WorkstreamProgressEvent[]>();
 
   constructor(options: WorkstreamSupervisorOptions) {
     this.cwd = options.cwd;
@@ -287,6 +296,10 @@ export class WorkstreamSupervisor {
       this.activeWorkstreams.has(id) &&
       this.sessions.has(id),
     );
+  }
+
+  progressEvents(id: string): readonly WorkstreamProgressEvent[] {
+    return this.progress.get(id) ?? [];
   }
 
   async list(): Promise<WorkstreamManifest[]> {
@@ -618,17 +631,90 @@ export class WorkstreamSupervisor {
   }
 
   private handleSessionEvent(id: string, event: AgentSessionEvent): void {
+    if (event.type === "message_update") {
+      const update = event.assistantMessageEvent;
+      if (update.type === "thinking_start") {
+        this.recordProgress(id, {
+          id: `thinking:${update.contentIndex}`,
+          kind: "thinking",
+          state: "active",
+          text: "Thinking…",
+        });
+      } else if (update.type === "thinking_delta") {
+        this.updateProgressText(
+          id,
+          `thinking:${update.contentIndex}`,
+          update.delta,
+        );
+      } else if (update.type === "thinking_end") {
+        this.finishProgress(id, `thinking:${update.contentIndex}`, "complete");
+      }
+      return;
+    }
+
     let eventType: WorkstreamEvent["type"] | undefined;
     let journal: string | undefined;
     if (event.type === "tool_execution_start") {
+      this.recordProgress(id, {
+        id: `tool:${event.toolCallId}`,
+        kind: "tool",
+        state: "active",
+        text: `Tool: ${event.toolName || "tool call"}`,
+      });
       eventType = "tool_started";
       journal = `Worker started ${event.toolName || "a tool call"}.`;
     } else if (event.type === "tool_execution_end") {
+      this.finishProgress(
+        id,
+        `tool:${event.toolCallId}`,
+        event.isError ? "failed" : "success",
+      );
       eventType = "tool_finished";
       journal = `Worker finished ${event.toolName || "a tool call"}.`;
     }
     if (!eventType || !journal) return;
     this.track(this.recordRoutineEvent(id, eventType, journal));
+  }
+
+  private recordProgress(id: string, event: WorkstreamProgressEvent): void {
+    const events = this.progress.get(id) ?? [];
+    events.push(event);
+    this.progress.set(id, events.slice(-40));
+    this.notifyProgress(id);
+  }
+
+  private updateProgressText(id: string, eventId: string, delta: string): void {
+    const events = this.progress.get(id);
+    const event = events?.find((entry) => entry.id === eventId);
+    if (!event || !delta) return;
+    const prior =
+      event.text === "Thinking…" ? "" : event.text.replace(/^Thinking:\s*/, "");
+    const text = boundDetail(`${prior}${delta}`);
+    event.text = text ? `Thinking: ${text}` : "Thinking…";
+    this.notifyProgress(id);
+  }
+
+  private finishProgress(
+    id: string,
+    eventId: string,
+    state: Extract<
+      WorkstreamProgressEvent["state"],
+      "complete" | "success" | "failed"
+    >,
+  ): void {
+    const event = this.progress.get(id)?.find((entry) => entry.id === eventId);
+    if (!event) return;
+    event.state = state;
+    this.notifyProgress(id);
+  }
+
+  private notifyProgress(id: string): void {
+    this.onEvent?.({
+      workstreamId: id,
+      type: "progress",
+      status: "running",
+      at: new Date().toISOString(),
+    });
   }
 
   private async settleIfRunning(id: string): Promise<void> {

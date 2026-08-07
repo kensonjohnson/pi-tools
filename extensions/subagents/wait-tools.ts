@@ -33,10 +33,20 @@ export type SubagentWaitResult = {
 export class SubagentWaitService {
   private readonly supervisor: WorkstreamSupervisor;
   private readonly inbox: CompletionInbox;
+  private readonly onConsumed?: (
+    reports: readonly CompletionInboxRecord[],
+  ) => Promise<void> | void;
 
-  constructor(supervisor: WorkstreamSupervisor, inbox: CompletionInbox) {
+  constructor(
+    supervisor: WorkstreamSupervisor,
+    inbox: CompletionInbox,
+    onConsumed?: (
+      reports: readonly CompletionInboxRecord[],
+    ) => Promise<void> | void,
+  ) {
     this.supervisor = supervisor;
     this.inbox = inbox;
+    this.onConsumed = onConsumed;
   }
 
   async wait(
@@ -102,6 +112,7 @@ export class SubagentWaitService {
         "A completion report was already consumed by another wait.",
       );
     }
+    await this.onConsumed?.(consumed);
     return {
       workstreamIds: manifests.map((manifest) => manifest.id),
       reports: consumed,

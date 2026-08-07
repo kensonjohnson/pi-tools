@@ -61,6 +61,25 @@ export async function resolveSubagentDelegationMode(
     : "proactive";
 }
 
+export async function resolveSubagentOutputTailLines(
+  ctx: Pick<ExtensionContext, "cwd" | "isProjectTrusted">,
+  options: { configDirName?: string; registry?: SettingsRegistry } = {},
+): Promise<number> {
+  if (!ctx.isProjectTrusted()) return 0;
+  const settings = await getEffectiveSettings({
+    cwd: ctx.cwd,
+    projectTrusted: true,
+    configDirName: options.configDirName ?? CONFIG_DIR_NAME,
+    registry: options.registry,
+  });
+  const value = getSettingValue<number>(
+    settings,
+    SUBAGENTS_EXTENSION_ID,
+    "outputTailLines",
+  );
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
 export async function resolveSubagentLaunchPolicy(
   ctx: SubagentLaunchContext,
   kind: SubagentWorkstreamKind,
