@@ -17,6 +17,7 @@ import { CompletionInbox } from "./completion-inbox.ts";
 import {
   type WorkstreamCompletion,
   type WorkstreamManifest,
+  type WorkstreamProgressEvent,
   WorkstreamSupervisor,
 } from "./supervisor.ts";
 
@@ -129,17 +130,23 @@ export class TaskWorkstreamService {
   private readonly supervisor: WorkstreamSupervisor;
   private readonly cwd: string;
   private readonly inbox: CompletionInbox;
+  private readonly outputTailLines: number;
 
   constructor(
     pi: Pick<ExtensionAPI, "appendEntry">,
     supervisor: WorkstreamSupervisor,
     cwd: string,
     inbox = new CompletionInbox(supervisor.rootDirectory),
+    outputTailLines = 0,
   ) {
     this.pi = pi;
     this.supervisor = supervisor;
     this.cwd = cwd;
     this.inbox = inbox;
+    this.outputTailLines =
+      Number.isSafeInteger(outputTailLines) && outputTailLines >= 0
+        ? outputTailLines
+        : 0;
     supervisor.setCompletionHandler((input) => this.handleCompletion(input));
   }
 
@@ -257,7 +264,15 @@ export class TaskWorkstreamService {
       return;
     }
     const rows = manifests.map((entry) =>
-      formatWidgetRow(entry, inboxByWorkstream.get(entry.id)),
+      formatWidgetRow(
+        entry,
+        inboxByWorkstream.get(entry.id),
+        WIDGET_ACTIVE_STATUSES.has(entry.status) && this.outputTailLines > 0
+          ? this.supervisor
+              .progressEvents(entry.id)
+              .slice(-this.outputTailLines)
+          : [],
+      ),
     );
     ctx.ui.setWidget(
       "pi-tools-subagent-workstreams",
@@ -588,9 +603,15 @@ function formatBoundedHandoff(
   return bound(lines.join("\n"), MAX_HANDOFF_CHARS);
 }
 
+export type WorkstreamWidgetEvent = Pick<
+  WorkstreamProgressEvent,
+  "kind" | "state" | "text"
+>;
+
 export type WorkstreamWidgetRow = {
   text: string;
   status: WorkstreamManifest["status"];
+  events?: WorkstreamWidgetEvent[];
 };
 
 type WorkstreamWidgetScheduler = {
@@ -635,14 +656,28 @@ export class WorkstreamsWidget implements Component {
   render(width: number): string[] {
     return [
       this.theme.fg("accent", "Subagent workstreams"),
-      ...this.rows.map((row) =>
+      ...this.rows.flatMap((row) => [
         truncateToWidth(
           row.status === "running"
             ? `${WORKSTREAM_SPINNER_FRAMES[this.frame]} ${row.text}`
             : row.text,
           width,
         ),
-      ),
+        ...(row.events ?? []).map((event) => {
+          const marker =
+            event.state === "active"
+              ? WORKSTREAM_SPINNER_FRAMES[this.frame]
+              : event.state === "success"
+                ? "✓"
+                : event.state === "failed"
+                  ? "!"
+                  : "";
+          return truncateToWidth(
+            `  ${marker ? `${marker} ` : ""}${event.text}`,
+            width,
+          );
+        }),
+      ]),
     ];
   }
 
@@ -658,20 +693,26 @@ export class WorkstreamsWidget implements Component {
 function formatWidgetRow(
   manifest: WorkstreamManifest,
   inboxState: "pending" | "scheduled" | undefined,
+  events: readonly WorkstreamProgressEvent[],
 ): WorkstreamWidgetRow {
-  const state = inboxState ? "Queued" : workstreamStatus(manifest.status);
+  const state = inboxState ? "queued" : workstreamStatus(manifest.status);
   return {
-    text: `${state} · ${workstreamKind(manifest.kind)} · ${workstreamPurpose(manifest)}`,
+    text: `${state} · ${workstreamPurpose(manifest)}`,
     status: manifest.status,
+    ...(events.length
+      ? {
+          events: events.map(({ kind, state, text }) => ({
+            kind,
+            state,
+            text,
+          })),
+        }
+      : {}),
   };
 }
 
 function workstreamStatus(status: WorkstreamManifest["status"]): string {
   return status.replaceAll("_", " ");
-}
-
-function workstreamKind(kind: WorkstreamManifest["kind"]): string {
-  return kind === "task" ? "Task worker" : "Research job";
 }
 
 function workstreamPurpose(manifest: WorkstreamManifest): string {

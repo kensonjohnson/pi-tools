@@ -47,6 +47,15 @@ export const SUBAGENT_SETTINGS: ExtensionSettingsDefinition = {
       description:
         "Combined cap across task workers and research jobs; launches above it are refused.",
     },
+    outputTailLines: {
+      type: "number",
+      default: 0,
+      minimum: 0,
+      integer: true,
+      label: "Live output tail lines",
+      description:
+        "Shows this many newest concise thinking and tool lifecycle rows per live workstream; 0 hides them.",
+    },
     "models.task": {
       type: "string",
       default: "inherit",

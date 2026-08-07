@@ -148,11 +148,98 @@ test("starts persistent SDK workstreams with a manifest, journal, and Git observ
     );
     assert.match(journal, /Worker started a tool call/);
     assert.match(journal, /Worker finished a tool call/);
-    assert.deepEqual(events, ["started", "tool_started", "tool_finished"]);
+    assert.deepEqual(events, [
+      "started",
+      "progress",
+      "progress",
+      "tool_started",
+      "tool_finished",
+    ]);
 
     sessions[0].settle();
     await supervisor.waitForSettlement(workstream.id);
     assert.equal((await supervisor.get(workstream.id))?.status, "settled");
+  });
+});
+
+test("captures bounded thinking and tool lifecycle progress without tool results", async () => {
+  await withSupervisor(async ({ supervisor, sessions }) => {
+    const workstream = await supervisor.launch({
+      kind: "task",
+      brief: "Inspect progress.",
+      policy,
+    });
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "thinking_start",
+        contentIndex: 0,
+      },
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "thinking_delta",
+        contentIndex: 0,
+        delta: "Inspecting the worker state.",
+      },
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "thinking_end",
+        contentIndex: 0,
+      },
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "tool_execution_start",
+      toolCallId: "tool-1",
+      toolName: "read",
+      args: {},
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "tool_execution_end",
+      toolCallId: "tool-1",
+      toolName: "read",
+      result: "raw tool result must not appear",
+      isError: false,
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "tool_execution_start",
+      toolCallId: "tool-2",
+      toolName: "bash",
+      args: {},
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "tool_execution_end",
+      toolCallId: "tool-2",
+      toolName: "bash",
+      result: "raw failed result must not appear",
+      isError: true,
+    } as AgentSessionEvent);
+
+    assert.deepEqual(supervisor.progressEvents(workstream.id), [
+      {
+        id: "thinking:0",
+        kind: "thinking",
+        state: "complete",
+        text: "Thinking: Inspecting the worker state.",
+      },
+      {
+        id: "tool:tool-1",
+        kind: "tool",
+        state: "success",
+        text: "Tool: read",
+      },
+      {
+        id: "tool:tool-2",
+        kind: "tool",
+        state: "failed",
+        text: "Tool: bash",
+      },
+    ]);
+    sessions[0].settle();
+    await supervisor.waitForSettlement(workstream.id);
   });
 });
 

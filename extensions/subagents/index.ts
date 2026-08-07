@@ -27,7 +27,10 @@ import {
   TaskWorkstreamService,
 } from "./task-workstreams.ts";
 import { registerTaskWorkstreamTools } from "./task-tools.ts";
-import { resolveSubagentDelegationMode } from "./launch-policy.ts";
+import {
+  resolveSubagentDelegationMode,
+  resolveSubagentOutputTailLines,
+} from "./launch-policy.ts";
 import {
   CompletionInbox,
   CompletionInboxDelivery,
@@ -114,6 +117,7 @@ export default function (pi: ExtensionAPI) {
     sessionActive = true;
     waitMessageUI = ctx.hasUI && ctx.mode === "tui" ? ctx.ui : undefined;
     delegationMode = await resolveSubagentDelegationMode(ctx);
+    const outputTailLines = await resolveSubagentOutputTailLines(ctx);
 
     supervisor = new WorkstreamSupervisor({
       cwd: ctx.cwd,
@@ -126,8 +130,16 @@ export default function (pi: ExtensionAPI) {
     inbox = new CompletionInbox(supervisor.rootDirectory);
     await inbox.recoverScheduled();
     inboxDelivery = new CompletionInboxDelivery(pi, inbox);
-    wait = new SubagentWaitService(supervisor, inbox);
-    tasks = new TaskWorkstreamService(pi, supervisor, ctx.cwd, inbox);
+    wait = new SubagentWaitService(supervisor, inbox, async () => {
+      await tasks?.refreshWidget(ctx);
+    });
+    tasks = new TaskWorkstreamService(
+      pi,
+      supervisor,
+      ctx.cwd,
+      inbox,
+      outputTailLines,
+    );
     research = new ResearchWorkstreamService(
       pi,
       supervisor,

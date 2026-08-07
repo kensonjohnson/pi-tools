@@ -171,7 +171,10 @@ test("wait snapshots all live workers, returns bounded terminal reports, and con
     });
     return { status: manifest.kind === "research" ? "blocked" : "settled" };
   });
-  const wait = new SubagentWaitService(supervisor, inbox);
+  let consumedIds: string[] | undefined;
+  const wait = new SubagentWaitService(supervisor, inbox, (reports) => {
+    consumedIds = reports.map((report) => report.id);
+  });
 
   try {
     const task = await supervisor.launch({
@@ -202,6 +205,10 @@ test("wait snapshots all live workers, returns bounded terminal reports, and con
       [task.id, research.id].sort(),
     );
     assert.equal(result.reports.length, 2);
+    assert.deepEqual(
+      consumedIds?.sort(),
+      result.reports.map((report) => report.id).sort(),
+    );
     assert.deepEqual(
       result.reports.map((report) => report.deliveryState),
       ["consumed", "consumed"],

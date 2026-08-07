@@ -13,6 +13,7 @@ import {
   resolveSubagentDelegationMode,
   resolveSubagentLaunchPolicy,
   resolveSubagentModel,
+  resolveSubagentOutputTailLines,
 } from "./launch-policy.ts";
 import {
   SUBAGENTS_EXTENSION_ID,
@@ -65,17 +66,21 @@ async function writeJson(path: string, value: unknown): Promise<void> {
   await writeFile(path, `${JSON.stringify(value)}\n`, "utf8");
 }
 
-test("registers the approved four Subagents settings", () => {
+test("registers Subagents settings including an opt-in live output tail", () => {
   assert.deepEqual(Object.keys(SUBAGENT_SETTINGS.fields), [
     "enabled",
     "delegationMode",
     "maxConcurrentWorkers",
+    "outputTailLines",
     "models.task",
     "models.research",
   ]);
   assert.equal(SUBAGENT_SETTINGS.fields.enabled.default, true);
   assert.equal(SUBAGENT_SETTINGS.fields.delegationMode.default, "proactive");
   assert.equal(SUBAGENT_SETTINGS.fields.maxConcurrentWorkers.default, 2);
+  assert.equal(SUBAGENT_SETTINGS.fields.outputTailLines.default, 0);
+  assert.equal(SUBAGENT_SETTINGS.fields.outputTailLines.minimum, 0);
+  assert.equal(SUBAGENT_SETTINGS.fields.outputTailLines.integer, true);
   assert.equal(SUBAGENT_SETTINGS.fields["models.task"].default, "inherit");
   assert.equal(SUBAGENT_SETTINGS.fields["models.research"].default, "inherit");
 });
@@ -141,6 +146,10 @@ test("uses trusted project overrides and rejects disabled or untrusted launches"
     );
     assert.equal(policy.maxConcurrentWorkers, 2);
     assert.equal(policy.model.model, parentModel);
+    assert.equal(
+      await resolveSubagentOutputTailLines(trusted, { registry }),
+      0,
+    );
 
     await assert.rejects(
       resolveSubagentLaunchPolicy(
@@ -211,15 +220,32 @@ test("queues durable completion inbox records only after settlement and acknowle
       },
       appendEntry() {},
     };
+    let widget: unknown;
     const ctx = {
       cwd,
       isProjectTrusted: () => true,
-      ui: { setWidget() {} },
+      ui: {
+        setWidget(_id: string, next: unknown) {
+          widget = next;
+        },
+      },
     };
     extension(pi as unknown as ExtensionAPI);
     await handlers.get("session_start")?.({}, ctx);
 
-    const inbox = new CompletionInbox(join(cwd, "tmp", "subagents"));
+    const inboxRoot = join(cwd, "tmp", "subagents");
+    await writeJson(join(inboxRoot, "settled-worker", "manifest.json"), {
+      version: 1,
+      id: "settled-worker",
+      kind: "task",
+      status: "settled",
+      brief: "## Objective\nInbox objective",
+      createdAt: "2025-01-01T00:00:00.000Z",
+      updatedAt: "2025-01-01T00:00:00.000Z",
+      workerSessionDirectory: join(inboxRoot, "settled-worker", "session"),
+      git: {},
+    });
+    const inbox = new CompletionInbox(inboxRoot);
     await inbox.create({
       workstreamId: "settled-worker",
       kind: "task",
@@ -235,6 +261,7 @@ test("queues durable completion inbox records only after settlement and acknowle
     assert.equal(sent.length, 1);
     assert.deepEqual(sent[0]?.options, { deliverAs: "nextTurn" });
     assert.equal((await inbox.list())[0]?.deliveryState, "scheduled");
+    assert.notEqual(widget, undefined);
 
     await handlers.get("message_end")?.(
       {
@@ -243,6 +270,7 @@ test("queues durable completion inbox records only after settlement and acknowle
       ctx,
     );
     assert.equal((await inbox.list())[0]?.deliveryState, "acknowledged");
+    assert.equal(widget, undefined);
     await handlers.get("session_shutdown")?.({}, ctx);
   });
 });
