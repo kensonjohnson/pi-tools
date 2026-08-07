@@ -4,7 +4,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import puppeteer from "puppeteer-core";
-import { spawn, execSync } from "node:child_process";
+import { execSync, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Text } from "@earendil-works/pi-tui";
@@ -13,6 +13,7 @@ import {
   isExtensionEnabled,
   removeDisabledTools,
 } from "../../lib/pi-tools-runtime-settings.ts";
+import { launchBrave } from "./brave-launch.ts";
 
 // ------------------------------------------------------------------------------
 // Shared State
@@ -35,7 +36,7 @@ const BROWSER_TOOL_NAMES = [
   "browser_logs",
 ] as const;
 
-let braveProcess: ReturnType<typeof spawn> | null = null;
+let braveProcess: ChildProcess | null = null;
 
 // ------------------------------------------------------------------------------
 // Helpers
@@ -229,9 +230,11 @@ export default function (pi: ExtensionAPI) {
       return new Text(text, 0, 0);
     },
     renderResult(result, _options, theme) {
-      const text = result.details?.alreadyRunning
-        ? theme.fg("dim", "Brave already running")
-        : theme.fg("success", "Brave started");
+      const text = result.isError
+        ? theme.fg("error", "Brave unavailable")
+        : result.details?.alreadyRunning
+          ? theme.fg("dim", "Brave already running")
+          : theme.fg("success", "Brave started");
       return new Text(text, 0, 0);
     },
     async execute(_toolCallId, params) {
@@ -286,21 +289,36 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // Spawn Brave
-      braveProcess = spawn(
-        BRAVE_PATH,
-        [
-          "--remote-debugging-port=9222",
-          `--user-data-dir=${SCRAPING_DIR}`,
-          "--no-first-run",
-          "--no-default-browser-check",
-        ],
-        { detached: true, stdio: "ignore" },
-      );
+      // Start Brave while consuming asynchronous child-process launch errors.
+      try {
+        braveProcess = await launchBrave({
+          executable: BRAVE_PATH,
+          args: [
+            "--remote-debugging-port=9222",
+            `--user-data-dir=${SCRAPING_DIR}`,
+            "--no-first-run",
+            "--no-default-browser-check",
+          ],
+          spawnOptions: { detached: true, stdio: "ignore" },
+        });
+      } catch (error) {
+        braveProcess = null;
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text", text: message }],
+          isError: true,
+          details: { started: false },
+        };
+      }
       braveProcess.unref();
 
       if (!braveProcess.pid) {
-        throw new Error("Failed to spawn Brave process");
+        braveProcess = null;
+        return {
+          content: [{ type: "text", text: "Failed to spawn Brave process." }],
+          isError: true,
+          details: { started: false },
+        };
       }
 
       // Wait for it to be ready

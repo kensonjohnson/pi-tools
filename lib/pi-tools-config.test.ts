@@ -284,6 +284,20 @@ test("parses scalar input according to registered field definitions", () => {
   assert.equal(parseSettingInput(fields.label, "weekly quota"), "weekly quota");
 });
 
+test("accepts only integer values for integer number settings", () => {
+  const registry = new SettingsRegistry();
+  registry.register({
+    id: "integer-setting",
+    label: "Integer setting",
+    fields: {
+      cap: { type: "number", default: 2, minimum: 1, integer: true },
+    },
+  });
+  const cap = registry.get("integer-setting")!.fields.cap;
+  assert.equal(parseSettingInput(cap, "3"), 3);
+  assert.equal(parseSettingInput(cap, "1.5"), undefined);
+});
+
 test("requires trust for project writes and writes a sparse project override", async () => {
   await withTemporaryPaths(async ({ cwd, agentDir }) => {
     const registry = createRegistry();

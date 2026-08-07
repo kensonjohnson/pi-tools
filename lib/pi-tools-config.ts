@@ -1,6 +1,8 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { Component } from "@earendil-works/pi-tui";
 
 export const CONFIG_FILE_NAME = "pi-tools.json";
 export const DEFAULT_CONFIG_DIR_NAME = ".pi";
@@ -29,6 +31,7 @@ export type NumberSettingDefinition = SettingMetadata & {
   default: number;
   minimum?: number;
   maximum?: number;
+  integer?: boolean;
 };
 
 export type StringSettingDefinition = SettingMetadata & {
@@ -48,11 +51,24 @@ export type SettingDefinition =
   | StringSettingDefinition
   | EnumSettingDefinition;
 
+export type SettingsDetailPreview = Component & {
+  updateValue(field: string, value: SettingValue): void;
+  dispose(): void;
+};
+
+export type SettingsDetailPreviewFactory = (options: {
+  values: Readonly<Record<string, SettingValue | undefined>>;
+  requestRender: () => void;
+  theme: Theme;
+}) => SettingsDetailPreview;
+
 export type ExtensionSettingsDefinition = {
   id: string;
   label: string;
   description?: string;
   fields: Record<string, SettingDefinition>;
+  /** Optional extension-owned preview rendered only in this extension's detail screen. */
+  detailPreview?: SettingsDetailPreviewFactory;
   toolNames?: readonly string[];
 };
 
@@ -405,6 +421,7 @@ function isValidSettingValue(
       return (
         typeof value === "number" &&
         Number.isFinite(value) &&
+        (!definition.integer || Number.isInteger(value)) &&
         (definition.minimum === undefined || value >= definition.minimum) &&
         (definition.maximum === undefined || value <= definition.maximum)
       );
