@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import {
   CompletionInbox,
@@ -156,6 +157,21 @@ export function registerSubagentWaitTool(
     description:
       "Deliberately wait for selected live workers, or every worker live now, and return their bounded terminal reports without waking or interrupting the parent later.",
     parameters: WaitParameters,
+    renderShell: "self",
+    renderCall() {
+      return new Text("", 0, 0);
+    },
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial || isInterruptedWaitResult(result.details)) {
+        return new Text("", 0, 0);
+      }
+      const report = result.content.find((content) => content.type === "text");
+      return new Text(
+        report?.type === "text" ? theme.fg("toolOutput", report.text) : "",
+        0,
+        0,
+      );
+    },
     async execute(_toolCallId, params, signal) {
       const service = getService();
       if (!service) return unavailable();
@@ -232,6 +248,14 @@ class WaitCancelledError extends Error {
       "subagent_wait was cancelled; workers and completion records were left unchanged.",
     );
   }
+}
+
+function isInterruptedWaitResult(details: unknown): boolean {
+  return (
+    typeof details === "object" &&
+    details !== null &&
+    (details as { interrupted?: unknown }).interrupted === true
+  );
 }
 
 function interruptedWaitResult() {

@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { CompletionInbox } from "./completion-inbox.ts";
+import { SUBAGENT_WAIT_STATE_EVENT } from "../../lib/subagent-wait-state.ts";
 import {
   CONFIG_FILE_NAME,
   SettingsRegistry,
@@ -257,9 +258,12 @@ test("interrupts an active main-session wait and replays captured user inputs FI
     const { default: extension } = await import("./index.ts");
     const handlers = new Map<string, (event: any, ctx: any) => unknown>();
     const replayed: unknown[] = [];
+    const waitEvents: unknown[] = [];
     const pi = {
       events: {
-        emit() {},
+        emit(channel: string, event: unknown) {
+          if (channel === SUBAGENT_WAIT_STATE_EVENT) waitEvents.push(event);
+        },
         on() {
           return () => {};
         },
@@ -283,6 +287,7 @@ test("interrupts an active main-session wait and replays captured user inputs FI
       cwd,
       isProjectTrusted: () => true,
       isIdle: () => idle,
+      sessionManager: { getSessionId: () => "main-session" },
       abort() {
         aborts++;
       },
@@ -295,6 +300,9 @@ test("interrupts an active main-session wait and replays captured user inputs FI
       { toolCallId: "wait-1", toolName: "subagent_wait", args: {} },
       ctx,
     );
+    assert.deepEqual(waitEvents, [
+      { sessionId: "main-session", toolCallId: "wait-1", phase: "started" },
+    ]);
     const image = { type: "image", data: "preserved", mimeType: "image/png" };
     assert.deepEqual(
       await handlers.get("input")?.(
@@ -335,6 +343,7 @@ test("interrupts an active main-session wait and replays captured user inputs FI
     const workerCtx = {
       ...ctx,
       sessionManager: {
+        getSessionId: () => "worker-session",
         getSessionDir: () => join(cwd, "tmp", "subagents", "worker", "session"),
       },
     };
@@ -350,6 +359,13 @@ test("interrupts an active main-session wait and replays captured user inputs FI
       undefined,
     );
     assert.equal(aborts, 2);
+    handlers.get("tool_execution_start")?.(
+      { toolCallId: "worker-wait", toolName: "subagent_wait", args: {} },
+      workerCtx,
+    );
+    assert.deepEqual(waitEvents, [
+      { sessionId: "main-session", toolCallId: "wait-1", phase: "started" },
+    ]);
 
     handlers.get("tool_execution_end")?.(
       {
@@ -360,6 +376,11 @@ test("interrupts an active main-session wait and replays captured user inputs FI
       },
       ctx,
     );
+    assert.deepEqual(waitEvents.at(-1), {
+      sessionId: "main-session",
+      toolCallId: "wait-1",
+      phase: "ended",
+    });
     assert.deepEqual(
       await handlers.get("input")?.(
         {

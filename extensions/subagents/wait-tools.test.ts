@@ -75,8 +75,21 @@ async function tick(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
 
+const plainTheme = {
+  fg(_color: string, text: string) {
+    return text;
+  },
+};
+
 test("renders an interrupted wait as a non-error outcome", async () => {
-  let definition: { execute: (...args: any[]) => Promise<any> } | undefined;
+  let definition:
+    | {
+        execute: (...args: any[]) => Promise<any>;
+        renderShell?: string;
+        renderCall?: (...args: any[]) => { render(width: number): string[] };
+        renderResult?: (...args: any[]) => { render(width: number): string[] };
+      }
+    | undefined;
   registerSubagentWaitTool(
     {
       registerTool(tool: unknown) {
@@ -101,6 +114,32 @@ test("renders an interrupted wait as a non-error outcome", async () => {
   assert.equal(
     result?.content[0]?.text,
     "Wait interrupted; workers and completion records were left unchanged.",
+  );
+  assert.equal(definition?.renderShell, "self");
+  assert.deepEqual(
+    definition?.renderCall?.({}, plainTheme, {}).render(120),
+    [],
+  );
+  assert.deepEqual(
+    definition
+      ?.renderResult?.(result, { isPartial: false }, plainTheme, {})
+      .render(120),
+    [],
+  );
+  assert.deepEqual(
+    definition
+      ?.renderResult?.(
+        {
+          content: [{ type: "text", text: "Waited worker reports:\n\nDone." }],
+          details: {},
+        },
+        { isPartial: false },
+        plainTheme,
+        {},
+      )
+      .render(120)
+      .map((line) => line.trimEnd()),
+    ["Waited worker reports:", "", "Done."],
   );
 });
 

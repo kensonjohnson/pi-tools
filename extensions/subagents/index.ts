@@ -7,6 +7,7 @@ import {
   type InputEvent,
 } from "@earendil-works/pi-coding-agent";
 import { publishExtensionSettings } from "../../lib/pi-tools-config.ts";
+import { SUBAGENT_WAIT_STATE_EVENT } from "../../lib/subagent-wait-state.ts";
 import {
   isExtensionEnabled,
   removeDisabledTools,
@@ -139,12 +140,24 @@ export default function (pi: ExtensionAPI) {
       event.toolName === "subagent_wait"
     ) {
       activeWaitToolCallIds.add(event.toolCallId);
+      pi.events.emit(SUBAGENT_WAIT_STATE_EVENT, {
+        sessionId: ctx.sessionManager.getSessionId(),
+        toolCallId: event.toolCallId,
+        phase: "started",
+      });
     }
   });
 
   pi.on("tool_execution_end", (event, ctx) => {
-    if (!isSubagentWorkerSession(ctx)) {
-      activeWaitToolCallIds.delete(event.toolCallId);
+    if (
+      !isSubagentWorkerSession(ctx) &&
+      activeWaitToolCallIds.delete(event.toolCallId)
+    ) {
+      pi.events.emit(SUBAGENT_WAIT_STATE_EVENT, {
+        sessionId: ctx.sessionManager.getSessionId(),
+        toolCallId: event.toolCallId,
+        phase: "ended",
+      });
     }
   });
 
@@ -203,6 +216,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    for (const toolCallId of activeWaitToolCallIds) {
+      pi.events.emit(SUBAGENT_WAIT_STATE_EVENT, {
+        sessionId: ctx.sessionManager.getSessionId(),
+        toolCallId,
+        phase: "ended",
+      });
+    }
     sessionActive = false;
     waitAbortPending = false;
     activeWaitToolCallIds.clear();
