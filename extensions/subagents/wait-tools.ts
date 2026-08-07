@@ -174,7 +174,9 @@ export function registerSubagentWaitTool(
           },
         };
       } catch (error) {
-        return toolError(error);
+        return error instanceof WaitCancelledError
+          ? interruptedWaitResult()
+          : toolError(error);
       }
     },
   });
@@ -230,6 +232,23 @@ class WaitCancelledError extends Error {
       "subagent_wait was cancelled; workers and completion records were left unchanged.",
     );
   }
+}
+
+function interruptedWaitResult() {
+  return {
+    content: [
+      {
+        type: "text" as const,
+        text: "Wait interrupted; workers and completion records were left unchanged.",
+      },
+    ],
+    isError: false,
+    terminate: true,
+    details: {
+      interrupted: true,
+      workersAndInboxUnchanged: true,
+    },
+  };
 }
 
 function unavailable() {

@@ -659,16 +659,19 @@ function formatWidgetRow(
   manifest: WorkstreamManifest,
   inboxState: "pending" | "scheduled" | undefined,
 ): WorkstreamWidgetRow {
-  const inbox =
-    inboxState === "pending"
-      ? " · inbox pending"
-      : inboxState === "scheduled"
-        ? " · inbox queued"
-        : "";
+  const state = inboxState ? "Queued" : workstreamStatus(manifest.status);
   return {
-    text: `${manifest.kind} ${shortId(manifest.id)} · ${workstreamPurpose(manifest)} · ${manifest.status}${inbox}`,
+    text: `${state} · ${workstreamKind(manifest.kind)} · ${workstreamPurpose(manifest)}`,
     status: manifest.status,
   };
+}
+
+function workstreamStatus(status: WorkstreamManifest["status"]): string {
+  return status.replaceAll("_", " ");
+}
+
+function workstreamKind(kind: WorkstreamManifest["kind"]): string {
+  return kind === "task" ? "Task worker" : "Research job";
 }
 
 function workstreamPurpose(manifest: WorkstreamManifest): string {

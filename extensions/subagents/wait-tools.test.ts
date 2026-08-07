@@ -11,7 +11,7 @@ import {
 } from "./completion-inbox.ts";
 import type { WorkerSession } from "./supervisor.ts";
 import { WorkstreamSupervisor } from "./supervisor.ts";
-import { SubagentWaitService } from "./wait-tools.ts";
+import { registerSubagentWaitTool, SubagentWaitService } from "./wait-tools.ts";
 
 class FakeWorkerSession {
   readonly sessionFile: string;
@@ -74,6 +74,35 @@ const policy: SubagentLaunchPolicy = {
 async function tick(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 10));
 }
+
+test("renders an interrupted wait as a non-error outcome", async () => {
+  let definition: { execute: (...args: any[]) => Promise<any> } | undefined;
+  registerSubagentWaitTool(
+    {
+      registerTool(tool: unknown) {
+        definition = tool as typeof definition;
+      },
+    } as any,
+    () =>
+      new SubagentWaitService(
+        { list: async () => [] } as unknown as WorkstreamSupervisor,
+        {} as CompletionInbox,
+      ),
+  );
+  const controller = new AbortController();
+  controller.abort();
+
+  const result = await definition?.execute("wait-1", {}, controller.signal);
+
+  assert.equal(result?.isError, false);
+  assert.equal(result?.terminate, true);
+  assert.equal(result?.details.interrupted, true);
+  assert.equal(result?.details.workersAndInboxUnchanged, true);
+  assert.equal(
+    result?.content[0]?.text,
+    "Wait interrupted; workers and completion records were left unchanged.",
+  );
+});
 
 test("wait snapshots all live workers, returns bounded terminal reports, and consumes only that snapshot", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-tools-subagent-wait-"));

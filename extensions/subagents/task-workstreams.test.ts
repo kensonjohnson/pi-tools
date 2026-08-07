@@ -114,7 +114,7 @@ test("animates only running workstreams and disposes its spinner timer", () => {
       { text: "task active objective · running", status: "running" },
       { text: "task paused objective · paused", status: "paused" },
       {
-        text: "task inbox objective · settled · inbox pending",
+        text: "Queued · Task worker · inbox objective",
         status: "settled",
       },
     ],
@@ -165,10 +165,7 @@ test("animates only running workstreams and disposes its spinner timer", () => {
     `${frames[0]} task active objective · running`,
   );
   assert.equal(widget.render(240)[2], "task paused objective · paused");
-  assert.equal(
-    widget.render(240)[3],
-    "task inbox objective · settled · inbox pending",
-  );
+  assert.equal(widget.render(240)[3], "Queued · Task worker · inbox objective");
 
   for (const frame of frames.slice(1)) {
     timers.get(1)?.();
@@ -261,7 +258,7 @@ test("retains task detail locally and creates one durable inbox handoff per comp
     const widgetLines = runningWidget.render(240);
     assert.match(
       widgetLines.join("\n"),
-      /task .*Add bounded task-worker handoffs.*running/,
+      /running · Task worker · Add bounded task-worker handoffs/,
     );
     assert.doesNotMatch(widgetLines.join("\n"), /tool_started|Worker started/);
     runningWidget.dispose();
@@ -326,8 +323,12 @@ test("retains task detail locally and creates one durable inbox handoff per comp
       { requestRender() {} },
       { fg: (_color: string, text: string) => text },
     );
-    const settledWidgetLines = settledWidget.render(240);
-    assert.match(settledWidgetLines.join("\n"), /settled · inbox pending/);
+    const settledWidgetLines = settledWidget.render(24);
+    assert.match(settledWidgetLines[1] ?? "", /^Queued · Task worker/);
+    assert.doesNotMatch(
+      settledWidgetLines.join("\n"),
+      new RegExp(workstream.id),
+    );
     assert.doesNotMatch(
       settledWidgetLines.join("\n"),
       /tool_started|Worker started/,
