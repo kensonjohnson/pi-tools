@@ -47,6 +47,22 @@ Connects to Brave Browser on `localhost:9222`.
 | `browser_cookies`    | List cookies for the current tab                                                                                                      |
 | `browser_pick`       | Interactive element picker — click to select                                                                                          |
 
+### `code-search`
+
+Local AST-aware code navigation for trusted projects. Use **Code Search → Mode** in `/pi-tools` to select `observe` (index only) or `apply` (enables its navigation tools).
+
+Code Search requires native `better-sqlite3` and Tree-sitter bindings. If Pi reports a missing `better-sqlite3` binding, change to the pi-tools package directory—the directory containing this repository's `package.json` (for example, `/your/repos/pi-tools` from the local install above)—and run the command for your npm version:
+
+```bash
+# npm 11
+npm approve-scripts --all
+
+# npm 12+
+npm install-scripts --all
+```
+
+Restart Pi or run `/reload` after the scripts complete.
+
 ### `custom-stats-footer`
 
 Replaces Pi's default footer with context usage and last/average response tokens per second. TPS is measured from each assistant response's stream start to finish and therefore excludes time spent executing tools; the average is weighted by response tokens and stream duration.

@@ -2,6 +2,7 @@ import {
   CONFIG_DIR_NAME,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -45,7 +46,49 @@ function globalMetricsPath(): string {
   );
 }
 
-export default function (pi: ExtensionAPI) {
+const PACKAGE_PATH = fileURLToPath(new URL("../..", import.meta.url));
+
+export function codeSearchNativeBindingGuidance(): string {
+  return [
+    "Code Search is unavailable because its better-sqlite3 native binding is missing.",
+    `From the pi-tools package directory (${PACKAGE_PATH}), run one of:`,
+    "npm 11: npm approve-scripts --all",
+    "npm 12+: npm install-scripts --all",
+    "Then restart Pi or run /reload.",
+  ].join("\n");
+}
+
+function isNativeBindingError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    /Could not locate the bindings file|better_sqlite3\.node|NODE_MODULE_VERSION|ERR_DLOPEN_FAILED/i.test(
+      error.message,
+    )
+  );
+}
+
+function startupFailureMessage(error: unknown): string {
+  if (isNativeBindingError(error)) return codeSearchNativeBindingGuidance();
+  const detail = error instanceof Error ? error.message : String(error);
+  return `Code Search could not start and has been disabled: ${detail}`;
+}
+
+type CodeSearchExtensionOptions = {
+  createMetricsStore?: (options: {
+    path: string;
+    retentionDays: number;
+  }) => CodeSearchMetricsStore;
+};
+
+export function createCodeSearchExtension(
+  pi: ExtensionAPI,
+  options: CodeSearchExtensionOptions = {},
+): void {
+  const createMetricsStore: NonNullable<
+    CodeSearchExtensionOptions["createMetricsStore"]
+  > =
+    options.createMetricsStore ??
+    ((metricsOptions) => new CodeSearchMetricsStore(metricsOptions));
   let mode: CodeSearchMode = "off";
   let runtime: CodeSearchToolRuntime | undefined;
   let retentionDays = 90;
@@ -57,9 +100,18 @@ export default function (pi: ExtensionAPI) {
     current?.metrics?.close();
   }
 
+  function disableRuntime(next: CodeSearchToolRuntime): void {
+    if (runtime === next) {
+      runtime = undefined;
+      mode = "off";
+      removeCodeSearchTools(pi);
+    }
+  }
+
   function startWorker(
     next: CodeSearchToolRuntime,
     watchEnabled: boolean,
+    notify: (message: string, level: "warning") => void,
   ): void {
     runtime = next;
     void next.worker
@@ -85,10 +137,12 @@ export default function (pi: ExtensionAPI) {
           enabled: watchEnabled,
         });
       })
-      .catch(async () => {
-        if (runtime === next) runtime = undefined;
+      .catch(async (error: unknown) => {
+        const failed = runtime === next;
+        disableRuntime(next);
         await next.worker.close();
         next.metrics?.close();
+        if (failed) notify(startupFailureMessage(error), "warning");
       });
   }
 
@@ -128,6 +182,19 @@ export default function (pi: ExtensionAPI) {
         "metrics.retentionDays",
       ),
     );
+    let metrics: CodeSearchMetricsStore;
+    try {
+      metrics = createMetricsStore({
+        path: globalMetricsPath(),
+        retentionDays,
+      });
+    } catch (error) {
+      mode = "off";
+      removeCodeSearchTools(pi);
+      ctx.ui.notify(startupFailureMessage(error), "warning");
+      return;
+    }
+
     startWorker(
       {
         root: ctx.cwd,
@@ -175,15 +242,13 @@ export default function (pi: ExtensionAPI) {
           ),
         ),
         mode,
-        metrics: new CodeSearchMetricsStore({
-          path: globalMetricsPath(),
-          retentionDays,
-        }),
+        metrics,
         worker: new CodeSearchWorkerClient(),
       },
       Boolean(
         getSettingValue(settings, CODE_SEARCH_EXTENSION_ID, "index.watch"),
       ),
+      (message, level) => ctx.ui.notify(message, level),
     );
   });
 
@@ -224,4 +289,8 @@ export default function (pi: ExtensionAPI) {
       );
     },
   });
+}
+
+export default function (pi: ExtensionAPI): void {
+  createCodeSearchExtension(pi);
 }
