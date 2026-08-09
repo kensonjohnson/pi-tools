@@ -19,6 +19,9 @@ import {
 } from "./worker-protocol.ts";
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
+// tree-sitter's native string bridge rejects a callback result at 32 KiB or
+// larger. Return bounded chunks so valid large source files remain indexable.
+const TREE_SITTER_INPUT_CHUNK_SIZE = 8 * 1024;
 const WATCH_DEBOUNCE_MS = 150;
 const LANGUAGE_BY_EXTENSION: Record<string, LanguageName | undefined> = {
   ".js": "javascript",
@@ -425,7 +428,9 @@ async function discover(
       if (!unchanged) {
         const parser = new Parser();
         parser.setLanguage((await languageFor(language)) as never);
-        const rootNode = parser.parse(text).rootNode as unknown as TreeNode;
+        const rootNode = parser.parse((offset) =>
+          text.slice(offset, offset + TREE_SITTER_INPUT_CHUNK_SIZE),
+        ).rootNode as unknown as TreeNode;
         parseHasError = Boolean(rootNode.hasError);
         result.symbolsByPath.set(
           path,

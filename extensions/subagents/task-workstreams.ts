@@ -131,6 +131,7 @@ export class TaskWorkstreamService {
   private readonly cwd: string;
   private readonly inbox: CompletionInbox;
   private readonly outputTailLines: number;
+  private widgetRefreshVersion = 0;
 
   constructor(
     pi: Pick<ExtensionAPI, "appendEntry">,
@@ -248,6 +249,7 @@ export class TaskWorkstreamService {
   }
 
   async refreshWidget(ctx: Pick<ExtensionContext, "ui">): Promise<void> {
+    const version = ++this.widgetRefreshVersion;
     const inboxRecords = await this.inbox.listUnconsumed();
     const inboxByWorkstream = new Map(
       inboxRecords.map((record) => [record.workstreamId, record.deliveryState]),
@@ -259,8 +261,12 @@ export class TaskWorkstreamService {
           inboxByWorkstream.has(entry.id),
       )
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    // Refreshes originate independently from worker events, settlement, and
+    // inbox acknowledgement. Never let an older async read restore a queued
+    // row after a newer acknowledgement refresh removed it.
+    if (version !== this.widgetRefreshVersion) return;
     if (manifests.length === 0) {
-      this.clearWidget(ctx);
+      this.clearWidget(ctx, version);
       return;
     }
     const rows = manifests.map((entry) =>
@@ -280,7 +286,8 @@ export class TaskWorkstreamService {
     );
   }
 
-  clearWidget(ctx: Pick<ExtensionContext, "ui">): void {
+  clearWidget(ctx: Pick<ExtensionContext, "ui">, version?: number): void {
+    if (version === undefined) ++this.widgetRefreshVersion;
     ctx.ui.setWidget("pi-tools-subagent-workstreams", undefined);
   }
 

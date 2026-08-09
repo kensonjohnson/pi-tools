@@ -6,7 +6,11 @@ import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { SubagentLaunchPolicy } from "./launch-policy.ts";
-import { CompletionInbox } from "./completion-inbox.ts";
+import {
+  CompletionInbox,
+  CompletionInboxDelivery,
+  type CompletionInboxRecord,
+} from "./completion-inbox.ts";
 import {
   buildFocusedFollowUp,
   buildTaskBrief,
@@ -66,6 +70,41 @@ class FakeWorkerSession {
 
   settle(run = this.runs.length - 1): void {
     this.runs[run]?.resolve();
+  }
+}
+
+class DelayedCompletionInbox extends CompletionInbox {
+  private delayedRead:
+    | {
+        started: () => void;
+        resume: Promise<void>;
+      }
+    | undefined;
+
+  delayNextRead(): {
+    waitUntilStarted: Promise<void>;
+    release(): void;
+  } {
+    let started!: () => void;
+    let release!: () => void;
+    const waitUntilStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const resume = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.delayedRead = { started, resume };
+    return { waitUntilStarted, release };
+  }
+
+  override async listUnconsumed(): Promise<CompletionInboxRecord[]> {
+    const records = await super.listUnconsumed();
+    const delayedRead = this.delayedRead;
+    if (!delayedRead) return records;
+    this.delayedRead = undefined;
+    delayedRead.started();
+    await delayedRead.resume;
+    return records;
   }
 }
 
@@ -303,6 +342,79 @@ test("limits live progress rows to the configured output tail", async () => {
       },
     } as any);
     assert.equal((await supervisor.get(workstream.id))?.status, "running");
+  } finally {
+    await supervisor.shutdown();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("does not restore a queued row when acknowledgement overtakes an older widget refresh", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-tools-task-workstream-"));
+  const session = new FakeWorkerSession(join(root, "worker.jsonl"));
+  const supervisor = new WorkstreamSupervisor({
+    cwd: root,
+    rootDirectory: join(root, "subagents"),
+    createSession: async () => session as unknown as WorkerSession,
+    observeGit: async () => ({}),
+  });
+  const inbox = new DelayedCompletionInbox(join(root, "subagents"));
+  const service = new TaskWorkstreamService(
+    { appendEntry() {} },
+    supervisor,
+    root,
+    inbox,
+  );
+  const sent: any[] = [];
+  const delivery = new CompletionInboxDelivery(
+    {
+      sendMessage(message) {
+        sent.push(message);
+      },
+    } as any,
+    inbox,
+  );
+  let widget: unknown;
+  const ctx = {
+    ui: {
+      setWidget(_key: string, content: unknown) {
+        widget = content;
+      },
+    },
+  } as any;
+
+  try {
+    const workstream = await supervisor.launch({
+      kind: "task",
+      brief: buildTaskBrief({
+        objective: "Remove acknowledged completion rows.",
+        scope: "Widget refresh regression test.",
+      }),
+      policy,
+    });
+    await Promise.resolve();
+    session.messages = [assistantReport("completed", "Completion recorded.")];
+    session.settle();
+    await supervisor.waitForSettlement(workstream.id);
+    assert.equal(await delivery.schedule(), true);
+
+    const delayed = inbox.delayNextRead();
+    const staleRefresh = service.refreshWidget(ctx);
+    await delayed.waitUntilStarted;
+
+    assert.equal(
+      await delivery.acknowledgeMessage({
+        ...sent[0],
+        role: "custom",
+        timestamp: Date.now(),
+      } as AgentMessage),
+      1,
+    );
+    await service.refreshWidget(ctx);
+    assert.equal(widget, undefined);
+
+    delayed.release();
+    await staleRefresh;
+    assert.equal(widget, undefined);
   } finally {
     await supervisor.shutdown();
     await rm(root, { recursive: true, force: true });
