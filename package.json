@@ -13,6 +13,7 @@
     "test:browser": "node --experimental-strip-types --test $(find extensions/browser-tools -name '*.test.ts' -print)",
     "test:compression": "node --experimental-strip-types --test $(find extensions/tool-output-compression -name '*.test.ts' -print)",
     "test:code-search": "node --experimental-strip-types --test $(find extensions/code-search -name '*.test.ts' -print)",
+    "test:lsp": "node --experimental-strip-types --test $(find extensions/lsp-inspection -name '*.test.ts' -print)",
     "test:subagents": "node --experimental-strip-types --test $(find extensions/subagents -name '*.test.ts' -print)",
     "test:working-spinner": "node --experimental-strip-types --test $(find extensions/main-working-spinner -name '*.test.ts' -print)",
     "verify:package": "npm pack --dry-run"
