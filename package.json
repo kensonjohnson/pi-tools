@@ -34,7 +34,8 @@
     "tree-sitter-typescript": "0.23.2",
     "turndown": "^7.2.4",
     "turndown-plugin-gfm": "^1.0.2",
-    "uuid": "^14.0.0"
+    "uuid": "^14.0.0",
+    "vscode-languageserver-protocol": "3.18.2"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
