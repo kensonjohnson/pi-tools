@@ -3,8 +3,12 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentSession,
+  AgentSessionEvent,
+} from "@earendil-works/pi-coding-agent";
+
+type AgentMessage = AgentSession["messages"][number];
 import type { SubagentLaunchPolicy } from "./launch-policy.ts";
 import { CompletionInbox } from "./completion-inbox.ts";
 import {

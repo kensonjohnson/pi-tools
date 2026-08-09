@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  codeSearchNativeBindingGuidance,
+  createCodeSearchExtension,
+} from "./index.ts";
 import { CODE_SEARCH_SETTINGS, CODE_SEARCH_TOOL_NAMES } from "./settings.ts";
 
 test("trust-gates code-search settings and active tools", async () => {
@@ -149,6 +153,67 @@ test("trust-gates code-search settings and active tools", async () => {
     await shutdown?.();
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("disables code search and guides native binding installation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-tools-code-search-binding-"));
+  try {
+    await mkdir(join(root, ".pi"), { recursive: true });
+    await writeFile(
+      join(root, ".pi", "pi-tools.json"),
+      JSON.stringify({
+        version: 1,
+        extensions: { "code-search": { mode: "apply" } },
+      }),
+      "utf8",
+    );
+    const handlers = new Map<string, (event: unknown, ctx: any) => unknown>();
+    let active = ["read"];
+    const notices: string[] = [];
+    const pi = {
+      events: {
+        emit() {},
+        on() {
+          return () => {};
+        },
+      },
+      on(name: string, handler: (event: unknown, ctx: any) => unknown) {
+        handlers.set(name, handler);
+      },
+      registerTool(tool: { name: string }) {
+        active.push(tool.name);
+      },
+      registerCommand() {},
+      getActiveTools: () => active,
+      setActiveTools(toolNames: string[]) {
+        active = toolNames;
+      },
+    };
+
+    createCodeSearchExtension(pi as unknown as ExtensionAPI, {
+      createMetricsStore() {
+        throw new Error(
+          "Could not locate the bindings file. Tried: /tmp/better_sqlite3.node",
+        );
+      },
+    });
+    await handlers.get("session_start")?.(
+      {},
+      {
+        cwd: root,
+        isProjectTrusted: () => true,
+        ui: { notify: (message: string) => notices.push(message) },
+      },
+    );
+
+    assert.deepEqual(active, ["read"]);
+    assert.deepEqual(notices, [codeSearchNativeBindingGuidance()]);
+    assert.match(notices[0], /npm 11: npm approve-scripts --all/);
+    assert.match(notices[0], /npm 12\+: npm install-scripts --all/);
+    assert.match(notices[0], /pi-tools package directory \(.+\)/);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

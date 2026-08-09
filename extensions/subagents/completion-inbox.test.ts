@@ -3,12 +3,14 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import {
   COMPLETION_INBOX_MESSAGE_TYPE,
   CompletionInbox,
   CompletionInboxDelivery,
 } from "./completion-inbox.ts";
+
+type AgentMessage = AgentSession["messages"][number];
 
 async function createRecord(inbox: CompletionInbox, number: number) {
   return inbox.create({

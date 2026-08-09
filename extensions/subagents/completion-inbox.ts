@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentSession,
+  ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import type { SubagentWorkstreamKind } from "./settings.ts";
 import type { WorkstreamStatus } from "./supervisor.ts";
 
@@ -10,6 +12,7 @@ export const COMPLETION_INBOX_MESSAGE_TYPE =
   "pi-tools:subagent-completion-inbox";
 const MAX_BATCH_RECORDS = 6;
 const MAX_BATCH_CHARS = 7_200;
+type AgentMessage = AgentSession["messages"][number];
 
 export type CompletionInboxDeliveryState =
   "pending" | "scheduled" | "acknowledged" | "consumed";

@@ -148,6 +148,31 @@ test("worker indexes metadata and symbols without persisting source bodies", asy
   }
 });
 
+test("worker indexes symbols from source beyond Tree-sitter's native string limit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-tools-code-search-large-"));
+  const databasePath = join(root, ".pi", "code-search", "index.sqlite");
+  const worker = new CodeSearchWorkerClient();
+  try {
+    await writeFile(
+      join(root, "large.ts"),
+      `// ${"x".repeat(40 * 1024)}\nexport function largeSource() {}\n`,
+    );
+    await worker.initialize(databasePath, root);
+    const status = await worker.refresh({ root, additionalIgnores: "" });
+    assert.equal(status.freshness, "fresh");
+    assert.equal(status.coverage.indexedFiles, 1);
+    assert.deepEqual(
+      (await worker.searchSymbols({ query: "largeSource", limit: 1 })).map(
+        (symbol) => symbol.name,
+      ),
+      ["largeSource"],
+    );
+  } finally {
+    await worker.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("worker extracts AST symbols and spans for every supported language", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-tools-code-search-symbols-"));
   const databasePath = join(root, ".pi", "code-search", "index.sqlite");

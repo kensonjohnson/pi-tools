@@ -171,10 +171,43 @@ test("captures bounded thinking and tool lifecycle progress without tool results
     });
     sessions[0].emit({
       type: "message_update",
-      assistantMessageEvent: {
-        type: "thinking_start",
-        contentIndex: 0,
+      assistantMessageEvent: { type: "thinking_start", contentIndex: 1 },
+    } as AgentSessionEvent);
+    assert.deepEqual(supervisor.progressEvents(workstream.id), [
+      {
+        id: "thinking:1",
+        kind: "thinking",
+        state: "active",
+        text: "Thinking…",
       },
+    ]);
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_end", contentIndex: 1 },
+    } as AgentSessionEvent);
+    assert.deepEqual(supervisor.progressEvents(workstream.id), []);
+
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_start", contentIndex: 2 },
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "thinking_delta",
+        contentIndex: 2,
+        delta: " \n\t ",
+      },
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_end", contentIndex: 2 },
+    } as AgentSessionEvent);
+    assert.deepEqual(supervisor.progressEvents(workstream.id), []);
+
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_start", contentIndex: 0 },
     } as AgentSessionEvent);
     sessions[0].emit({
       type: "message_update",
@@ -186,16 +219,13 @@ test("captures bounded thinking and tool lifecycle progress without tool results
     } as AgentSessionEvent);
     sessions[0].emit({
       type: "message_update",
-      assistantMessageEvent: {
-        type: "thinking_end",
-        contentIndex: 0,
-      },
+      assistantMessageEvent: { type: "thinking_end", contentIndex: 0 },
     } as AgentSessionEvent);
     sessions[0].emit({
       type: "tool_execution_start",
       toolCallId: "tool-1",
       toolName: "read",
-      args: {},
+      args: { path: "path/to/file.ts" },
     } as AgentSessionEvent);
     sessions[0].emit({
       type: "tool_execution_end",
@@ -208,7 +238,7 @@ test("captures bounded thinking and tool lifecycle progress without tool results
       type: "tool_execution_start",
       toolCallId: "tool-2",
       toolName: "bash",
-      args: {},
+      args: { command: "rg  something --flag" },
     } as AgentSessionEvent);
     sessions[0].emit({
       type: "tool_execution_end",
@@ -216,6 +246,45 @@ test("captures bounded thinking and tool lifecycle progress without tool results
       toolName: "bash",
       result: "raw failed result must not appear",
       isError: true,
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "tool_execution_start",
+      toolCallId: "tool-3",
+      toolName: "write",
+      args: { path: "path/to/file.md" },
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "tool_execution_end",
+      toolCallId: "tool-3",
+      toolName: "write",
+      result: "raw tool result must not appear",
+      isError: false,
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "tool_execution_start",
+      toolCallId: "tool-4",
+      toolName: "edit",
+      args: { path: "path/to/file.md" },
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "tool_execution_end",
+      toolCallId: "tool-4",
+      toolName: "edit",
+      result: "raw tool result must not appear",
+      isError: false,
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "tool_execution_start",
+      toolCallId: "tool-5",
+      toolName: "brave_search",
+      args: { query: "do not render raw arguments" },
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "tool_execution_end",
+      toolCallId: "tool-5",
+      toolName: "brave_search",
+      result: "raw tool result must not appear",
+      isError: false,
     } as AgentSessionEvent);
 
     assert.deepEqual(supervisor.progressEvents(workstream.id), [
@@ -229,15 +298,114 @@ test("captures bounded thinking and tool lifecycle progress without tool results
         id: "tool:tool-1",
         kind: "tool",
         state: "success",
-        text: "Tool: read",
+        text: "Reading path/to/file.ts",
       },
       {
         id: "tool:tool-2",
         kind: "tool",
         state: "failed",
-        text: "Tool: bash",
+        text: "Bash: rg something --flag",
+      },
+      {
+        id: "tool:tool-3",
+        kind: "tool",
+        state: "success",
+        text: "Writing path/to/file.md",
+      },
+      {
+        id: "tool:tool-4",
+        kind: "tool",
+        state: "success",
+        text: "Editing path/to/file.md",
+      },
+      {
+        id: "tool:tool-5",
+        kind: "tool",
+        state: "success",
+        text: "Tool: brave_search",
       },
     ]);
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_start", contentIndex: 0 },
+    } as AgentSessionEvent);
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_end", contentIndex: 0 },
+    } as AgentSessionEvent);
+    assert.deepEqual(
+      supervisor
+        .progressEvents(workstream.id)
+        .filter((event) => event.kind === "thinking"),
+      [
+        {
+          id: "thinking:0",
+          kind: "thinking",
+          state: "complete",
+          text: "Thinking: Inspecting the worker state.",
+        },
+      ],
+    );
+    sessions[0].emit({
+      type: "tool_execution_start",
+      toolCallId: "tool-6",
+      toolName: "bash",
+      args: { command: `\u001b${"x".repeat(200)}` },
+    } as AgentSessionEvent);
+    const bounded = supervisor.progressEvents(workstream.id).at(-1);
+    assert.equal(bounded?.text.length, 180);
+    assert.match(bounded?.text ?? "", /^Bash: x+…$/);
+    assert.doesNotMatch(bounded?.text ?? "", /\u001b/);
+    sessions[0].settle();
+    await supervisor.waitForSettlement(workstream.id);
+  });
+});
+
+test("renders whitespace-delimited OpenAI reasoning summaries as plain-text parts", async () => {
+  await withSupervisor(async ({ supervisor, sessions }) => {
+    const workstream = await supervisor.launch({
+      kind: "task",
+      brief: "Inspect summary rendering.",
+      policy,
+    });
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_start", contentIndex: 3 },
+    } as AgentSessionEvent);
+    for (const delta of [
+      "**Inspect",
+      " the worker state.**",
+      "\n\n",
+      "**Update",
+      " the focused tests.**",
+    ]) {
+      sessions[0].emit({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "thinking_delta",
+          contentIndex: 3,
+          delta,
+        },
+      } as AgentSessionEvent);
+    }
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_end", contentIndex: 3 },
+    } as AgentSessionEvent);
+
+    const thinking = supervisor
+      .progressEvents(workstream.id)
+      .filter((event) => event.kind === "thinking");
+    assert.deepEqual(thinking, [
+      {
+        id: "thinking:3",
+        kind: "thinking",
+        state: "complete",
+        text: "Thinking: Inspect the worker state. · Update the focused tests.",
+      },
+    ]);
+    assert.doesNotMatch(thinking[0]?.text ?? "", /\*\*/);
+
     sessions[0].settle();
     await supervisor.waitForSettlement(workstream.id);
   });
