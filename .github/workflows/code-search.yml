@@ -20,6 +20,6 @@ jobs:
           cache: npm
       # The test suite needs no dev-only package, so this one clean production
       # install both validates packaging dependencies and exercises native code.
-      - run: npm ci --omit=dev
+      - run: ONNXRUNTIME_NODE_INSTALL=skip npm ci --omit=dev
       - run: npm run test:code-search
       - run: npm run verify:package
