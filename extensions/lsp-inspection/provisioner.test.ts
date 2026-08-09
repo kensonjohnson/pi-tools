@@ -47,7 +47,6 @@ test("provisioner uses only reviewed npm and Go commands, validates them, and ca
         "install",
         "--prefix",
         runner.stageDirectories[0],
-        "--no-save",
         "--ignore-scripts",
         "--no-audit",
         "--no-fund",
@@ -91,6 +90,18 @@ test("provisioner uses only reviewed npm and Go commands, validates them, and ca
   });
 });
 
+test("npm install omits --no-save so integrity validates against its root lockfile", async () => {
+  await withState(async (paths) => {
+    const runner = new FakeRunner();
+    const result = await new ManagedLspProvisioner({ paths, runner }).ensure(
+      "typescript",
+    );
+
+    assertAvailable(result, "installed");
+    assert.equal(runner.commands[0]!.arguments.includes("--no-save"), false);
+  });
+});
+
 test("concurrent callers share one staged install and recover after a failed stage", async () => {
   await withState(async (paths) => {
     const runner = new FakeRunner({ holdInstalls: true });
@@ -110,6 +121,25 @@ test("concurrent callers share one staged install and recover after a failed sta
     const recovered = await provisioner.ensure("go");
     assertAvailable(recovered, "installed");
     assert.equal(runner.installCalls, 3);
+  });
+});
+
+test("a later cancelled caller leaves the creator-owned shared install running", async () => {
+  await withState(async (paths) => {
+    const runner = new FakeRunner({ holdInstalls: true });
+    const provisioner = new ManagedLspProvisioner({ paths, runner });
+    const session = new AbortController();
+    const background = provisioner.ensure("python", { signal: session.signal });
+    await runner.waitForInstall();
+
+    const tool = new AbortController();
+    const inspection = provisioner.ensure("python", { signal: tool.signal });
+    tool.abort();
+    assertFailure(await inspection, "cancelled");
+    assert.equal(runner.abortCalls, 0);
+
+    runner.releaseInstall();
+    assertAvailable(await background, "installed");
   });
 });
 
@@ -251,7 +281,12 @@ class FakeRunner implements LspCommandRunner {
         this.failNextInstall = false;
         return { code: 1, stdout: "", stderr: "installation failed" };
       }
-      if (command.command === "npm") await this.#writeNpmLock(command, stage);
+      if (command.command === "npm") {
+        // npm --no-save succeeds without creating the root lockfile.
+        if (!command.arguments.includes("--no-save")) {
+          await this.#writeNpmLock(command, stage);
+        }
+      }
       return { code: 0, stdout: "", stderr: "" };
     }
     if (this.options.badProbe)
@@ -286,7 +321,7 @@ class FakeRunner implements LspCommandRunner {
       JSON.stringify({
         lockfileVersion: 3,
         packages: {
-          [`node_modules/${name}`]: {
+          [join(stage, "node_modules", name)]: {
             version,
             ...(this.options.omitIntegrity
               ? {}

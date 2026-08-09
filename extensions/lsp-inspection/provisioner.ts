@@ -88,6 +88,7 @@ export class ManagedLspProvisioner {
     if (options.signal?.aborted) return Promise.resolve(cancelledResult());
 
     let inFlight = this.#inFlight.get(catalogId);
+    const ownsCancellation = !inFlight;
     if (!inFlight) {
       const controller = new AbortController();
       const promise = this.#ensure(catalogId, controller.signal).finally(() => {
@@ -96,7 +97,7 @@ export class ManagedLspProvisioner {
       inFlight = { controller, promise };
       this.#inFlight.set(catalogId, inFlight);
     }
-    return joinProvisioning(inFlight, options.signal);
+    return joinProvisioning(inFlight, options.signal, ownsCancellation);
   }
 
   async #ensure(
@@ -289,7 +290,6 @@ export function installCommand(
         "install",
         "--prefix",
         stage,
-        "--no-save",
         "--ignore-scripts",
         "--no-audit",
         "--no-fund",
@@ -330,7 +330,7 @@ async function readSourceIntegrity(
       packages?: Record<string, { version?: unknown; integrity?: unknown }>;
     };
     const primary = descriptor.source.packages[0];
-    const entry = lock.packages?.[`node_modules/${primary.name}`];
+    const entry = npmLockEntry(lock.packages, primary.name);
     if (
       entry?.version !== primary.version ||
       typeof entry.integrity !== "string" ||
@@ -347,14 +347,31 @@ async function readSourceIntegrity(
   }
 }
 
+function npmLockEntry(
+  packages:
+    Record<string, { version?: unknown; integrity?: unknown }> | undefined,
+  packageName: string,
+): { version?: unknown; integrity?: unknown } | undefined {
+  const expectedPath = `node_modules/${packageName}`;
+  return (
+    packages?.[expectedPath] ??
+    Object.entries(packages ?? {}).find(([path]) =>
+      path.replaceAll("\\", "/").endsWith(`/${expectedPath}`),
+    )?.[1]
+  );
+}
+
 function joinProvisioning(
   inFlight: InFlightProvisioning,
   signal: AbortSignal | undefined,
+  ownsCancellation: boolean,
 ): Promise<LspProvisioningResult> {
   if (!signal) return inFlight.promise;
   return new Promise((resolve) => {
     const onAbort = () => {
-      inFlight.controller.abort();
+      // The creator owns the child process. A later tool caller may leave the
+      // shared operation, but must not cancel session-start provisioning.
+      if (ownsCancellation) inFlight.controller.abort();
       resolve(cancelledResult());
     };
     signal.addEventListener("abort", onAbort, { once: true });

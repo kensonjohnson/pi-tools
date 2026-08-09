@@ -19,6 +19,15 @@ async function createServerManager(
     workspace?: boolean;
     delay?: boolean;
     timeoutMs?: number;
+    pushOnly?: boolean;
+    pushDelayMs?: number;
+    pushVersioned?: boolean;
+    pushNone?: boolean;
+    dynamicDiagnostics?: boolean;
+    dynamicWorkspaceDiagnostics?: boolean;
+    refresh?: boolean;
+    stalePushDelayMs?: number;
+    pushDiagnosticQuietMs?: number;
   } = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), "pi-lsp-client-"));
@@ -26,6 +35,7 @@ async function createServerManager(
   const processes: ChildProcess[] = [];
   const manager = new LspServerManager({
     requestTimeoutMs: options.timeoutMs ?? 1_000,
+    pushDiagnosticQuietMs: options.pushDiagnosticQuietMs,
     launcher: () => {
       const child = spawn(process.execPath, [fixture], {
         cwd: directory,
@@ -35,6 +45,19 @@ async function createServerManager(
           FAKE_LSP_LOG: logPath,
           FAKE_LSP_WORKSPACE: options.workspace ? "1" : "0",
           FAKE_LSP_DELAY: options.delay ? "1" : "0",
+          FAKE_LSP_PUSH_ONLY: options.pushOnly ? "1" : "0",
+          FAKE_LSP_PUSH_DELAY: String(options.pushDelayMs ?? 0),
+          FAKE_LSP_PUSH_VERSIONED: options.pushVersioned ? "1" : "0",
+          FAKE_LSP_PUSH_NONE: options.pushNone ? "1" : "0",
+          FAKE_LSP_DYNAMIC: options.dynamicDiagnostics ? "1" : "0",
+          FAKE_LSP_DYNAMIC_WORKSPACE: options.dynamicWorkspaceDiagnostics
+            ? "1"
+            : "0",
+          FAKE_LSP_REFRESH: options.refresh ? "1" : "0",
+          FAKE_LSP_STALE_PUSH_DELAY:
+            options.stalePushDelayMs === undefined
+              ? "unset"
+              : String(options.stalePushDelayMs),
         },
       });
       // The production launcher and LspClient both consume these; retain one
@@ -67,6 +90,18 @@ async function waitForLog(
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.fail(`Timed out waiting for fake LSP event '${expected}'.`);
+}
+
+async function waitForDiagnosticCount(
+  client: { getDiagnostics(uri: string): readonly unknown[] },
+  uri: string,
+  expected: number,
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (client.getDiagnostics(uri).length === expected) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`Timed out waiting for ${expected} fake diagnostics.`);
 }
 
 async function readLog(logPath: string): Promise<string[]> {
@@ -104,7 +139,7 @@ test("manager reuses a framed stdio client and synchronizes diagnostics", async 
       }),
       { status: "ok", value: undefined },
     );
-    await waitForLog(server.logPath, "open:1:const first = 1;");
+    await waitForLog(server.logPath, "publish:1:1");
     assert.equal(first.value.getDiagnostics(uri).length, 1);
 
     await first.value.synchronizeDocument({
@@ -113,7 +148,7 @@ test("manager reuses a framed stdio client and synchronizes diagnostics", async 
       text: "const second = 2;",
       version: 2,
     });
-    await waitForLog(server.logPath, "change:2:const second = 2;");
+    await waitForLog(server.logPath, "publish:2:0");
     assert.deepEqual(first.value.getDiagnostics(uri), []);
 
     const document = await first.value.documentDiagnostics({
@@ -132,6 +167,228 @@ test("manager reuses a framed stdio client and synchronizes diagnostics", async 
     });
     const events = await waitForLog(server.logPath, "workspace");
     assert.ok(events.indexOf("initialize") < events.indexOf("initialized"));
+    assert.ok(events.includes("initialize-pull:none"));
+    assert.ok(events.includes("initialize-push:true"));
+  } finally {
+    await server.dispose();
+  }
+});
+
+test("push-only diagnostics wait for a post-synchronization delayed update and clean clear", async () => {
+  const server = await createServerManager({
+    pushOnly: true,
+    pushDelayMs: 25,
+    pushDiagnosticQuietMs: 5,
+  });
+  try {
+    const result = await server.manager.getForFile({
+      projectRoot: server.directory,
+      filePath: "source.ts",
+      executablePath: "/managed/fake-language-server",
+    });
+    assert.equal(result.status, "ok");
+    if (result.status !== "ok") return;
+    const uri = pathToFileURL(join(server.directory, "source.ts")).toString();
+
+    const first = await result.value.documentDiagnostics({
+      uri,
+      languageId: "typescript",
+      text: "const problem = 1;",
+      version: 1,
+    });
+    assert.deepEqual(first, {
+      status: "ok",
+      value: {
+        kind: "full",
+        items: [
+          {
+            range: {
+              start: { line: 0, character: 0 },
+              end: { line: 0, character: 1 },
+            },
+            severity: 1,
+            message: "first diagnostic",
+          },
+        ],
+      },
+    });
+    await waitForLog(server.logPath, "publish:1:1");
+
+    const cleared = await result.value.documentDiagnostics({
+      uri,
+      languageId: "typescript",
+      text: "const clean = 1;",
+      version: 2,
+    });
+    assert.deepEqual(cleared, {
+      status: "ok",
+      value: { kind: "full", items: [] },
+    });
+    await waitForLog(server.logPath, "publish:2:0");
+  } finally {
+    await server.dispose();
+  }
+});
+
+test("default push quiet window rejects a delayed unversioned old-content publish", async () => {
+  const server = await createServerManager({
+    pushOnly: true,
+    pushDelayMs: 800,
+    stalePushDelayMs: 300,
+    timeoutMs: 4_000,
+  });
+  try {
+    const result = await server.manager.getForFile({
+      projectRoot: server.directory,
+      filePath: "source.ts",
+      executablePath: "/managed/fake-language-server",
+    });
+    assert.equal(result.status, "ok");
+    if (result.status !== "ok") return;
+    const uri = pathToFileURL(join(server.directory, "source.ts")).toString();
+    await result.value.synchronizeDocument({
+      uri,
+      languageId: "typescript",
+      text: "const old = 1;",
+      version: 1,
+    });
+    await waitForDiagnosticCount(result.value, uri, 1);
+
+    const fresh = await result.value.documentDiagnostics({
+      uri,
+      languageId: "typescript",
+      text: "const current = 2;",
+      version: 2,
+    });
+    assert.deepEqual(fresh, {
+      status: "ok",
+      value: { kind: "full", items: [] },
+    });
+  } finally {
+    await server.dispose();
+  }
+});
+
+test("versioned pushes reject stale pre-change diagnostics and missing updates time out", async () => {
+  const server = await createServerManager({
+    pushOnly: true,
+    pushVersioned: true,
+    pushDiagnosticQuietMs: 0,
+    timeoutMs: 100,
+  });
+  try {
+    const result = await server.manager.getForFile({
+      projectRoot: server.directory,
+      filePath: "source.ts",
+      executablePath: "/managed/fake-language-server",
+    });
+    assert.equal(result.status, "ok");
+    if (result.status !== "ok") return;
+    const uri = pathToFileURL(join(server.directory, "source.ts")).toString();
+    await result.value.synchronizeDocument({
+      uri,
+      languageId: "typescript",
+      text: "const old = 1;",
+      version: 1,
+    });
+    await waitForLog(server.logPath, "publish:1:1");
+    const fresh = await result.value.documentDiagnostics({
+      uri,
+      languageId: "typescript",
+      text: "const current = 2;",
+      version: 2,
+    });
+    assert.deepEqual(fresh, {
+      status: "ok",
+      value: { kind: "full", items: [] },
+    });
+
+    await server.dispose();
+    const noPush = await createServerManager({
+      pushOnly: true,
+      pushNone: true,
+      timeoutMs: 200,
+      pushDiagnosticQuietMs: 0,
+    });
+    try {
+      const noPushResult = await noPush.manager.getForFile({
+        projectRoot: noPush.directory,
+        filePath: "source.ts",
+        executablePath: "/managed/fake-language-server",
+      });
+      assert.equal(noPushResult.status, "ok");
+      if (noPushResult.status !== "ok") return;
+      assert.deepEqual(
+        await noPushResult.value.documentDiagnostics(
+          {
+            uri: pathToFileURL(join(noPush.directory, "source.ts")).toString(),
+            languageId: "typescript",
+            text: "const noUpdate = 1;",
+            version: 1,
+          },
+          { timeoutMs: 20 },
+        ),
+        { status: "unavailable", reason: "timeout" },
+      );
+    } finally {
+      await noPush.dispose();
+    }
+  } finally {
+    await server.dispose();
+  }
+});
+
+test("dynamic document diagnostics and refresh invalidate prior pull result ids", async () => {
+  const server = await createServerManager({
+    dynamicDiagnostics: true,
+    dynamicWorkspaceDiagnostics: true,
+    refresh: true,
+  });
+  try {
+    const result = await server.manager.getForFile({
+      projectRoot: server.directory,
+      filePath: "source.py",
+      executablePath: "/managed/fake-language-server",
+    });
+    assert.equal(result.status, "ok");
+    if (result.status !== "ok") return;
+    await waitForLog(server.logPath, "dynamic-registered");
+    assert.equal(result.value.supportsDocumentDiagnostics, true);
+    assert.equal(result.value.supportsWorkspaceDiagnostics, true);
+    assert.deepEqual(await result.value.workspaceDiagnostics(), {
+      status: "ok",
+      value: { items: [] },
+    });
+    await waitForLog(server.logPath, "workspace");
+    const uri = pathToFileURL(join(server.directory, "source.py")).toString();
+    assert.equal(
+      (
+        await result.value.documentDiagnostics({
+          uri,
+          languageId: "python",
+          text: "x = 1",
+          version: 1,
+        })
+      ).status,
+      "ok",
+    );
+    await waitForLog(server.logPath, "refresh-ack");
+    assert.equal(
+      (
+        await result.value.documentDiagnostics({
+          uri,
+          languageId: "python",
+          text: "x = 2",
+          version: 2,
+        })
+      ).status,
+      "ok",
+    );
+    const events = await waitForLog(server.logPath, "document-previous:none");
+    assert.equal(
+      events.filter((event) => event === "document-previous:none").length,
+      2,
+    );
   } finally {
     await server.dispose();
   }
@@ -167,6 +424,7 @@ test("request abort and timeout bridge to protocol cancellation", async () => {
     });
     assert.equal(result.status, "ok");
     if (result.status !== "ok") return;
+    await waitForLog(server.logPath, "initialize-pull:true");
     const uri = pathToFileURL(join(server.directory, "source.go")).toString();
     const controller = new AbortController();
     const pending = result.value.documentDiagnostics(

@@ -37,6 +37,7 @@ export type LspServerManagerOptions = {
   launcher?: LspServerLauncher;
   clock?: LspClock;
   requestTimeoutMs?: number;
+  pushDiagnosticQuietMs?: number;
 };
 
 type ConnectionRecord = {
@@ -54,11 +55,13 @@ export class LspServerManager {
   #launcher: LspServerLauncher;
   #clock: LspClock | undefined;
   #requestTimeoutMs: number | undefined;
+  #pushDiagnosticQuietMs: number | undefined;
 
   constructor(options: LspServerManagerOptions = {}) {
     this.#launcher = options.launcher ?? defaultLauncher;
     this.#clock = options.clock;
     this.#requestTimeoutMs = options.requestTimeoutMs;
+    this.#pushDiagnosticQuietMs = options.pushDiagnosticQuietMs;
   }
 
   async getOrStart(
@@ -138,6 +141,8 @@ export class LspServerManager {
       process,
       clock: this.#clock,
       requestTimeoutMs: this.#requestTimeoutMs,
+      initializationOptions: initializationOptionsFor(request.descriptor),
+      pushDiagnosticQuietMs: this.#pushDiagnosticQuietMs,
     });
     const initialized = await client.initialize();
     if (initialized.status !== "ok") {
@@ -199,6 +204,14 @@ function defaultLauncher(
     arguments: request.arguments,
     cwd: request.rootPath,
   });
+}
+
+function initializationOptionsFor(
+  descriptor: LspCatalogDescriptor,
+): Record<string, unknown> | undefined {
+  // gopls normally publishes diagnostics. Its reviewed pull mode works with
+  // document diagnostics while the client retains push fallback for all servers.
+  return descriptor.id === "go" ? { pullDiagnostics: true } : undefined;
 }
 
 function unavailable<T>(reason: "unconfigured" | "broken"): LspOutcome<T> {
