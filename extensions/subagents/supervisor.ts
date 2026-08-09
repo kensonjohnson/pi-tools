@@ -24,6 +24,7 @@ import type { SubagentWorkstreamKind } from "./settings.ts";
 
 const execFileAsync = promisify(execFile);
 const WORKSTREAM_SCHEMA_VERSION = 1;
+const MAX_PROGRESS_LABEL_LENGTH = 180;
 
 export type WorkstreamStatus =
   | "starting"
@@ -68,6 +69,11 @@ export type WorkstreamProgressEvent = {
   kind: "thinking" | "tool";
   state: "active" | "complete" | "success" | "failed";
   text: string;
+};
+
+type ReasoningSpan = {
+  progressId: string;
+  hasSummary: boolean;
 };
 
 export type WorkstreamEvent = {
@@ -204,6 +210,10 @@ export class WorkstreamSupervisor {
   private readonly writes = new Set<Promise<unknown>>();
   private readonly queues = new Map<string, Promise<void>>();
   private readonly progress = new Map<string, WorkstreamProgressEvent[]>();
+  private readonly reasoningSpans = new Map<
+    string,
+    Map<number, ReasoningSpan>
+  >();
 
   constructor(options: WorkstreamSupervisorOptions) {
     this.cwd = options.cwd;
@@ -634,20 +644,17 @@ export class WorkstreamSupervisor {
     if (event.type === "message_update") {
       const update = event.assistantMessageEvent;
       if (update.type === "thinking_start") {
+        const span = this.startReasoningSpan(id, update.contentIndex);
         this.recordProgress(id, {
-          id: `thinking:${update.contentIndex}`,
+          id: span.progressId,
           kind: "thinking",
           state: "active",
           text: "Thinking…",
         });
       } else if (update.type === "thinking_delta") {
-        this.updateProgressText(
-          id,
-          `thinking:${update.contentIndex}`,
-          update.delta,
-        );
+        this.updateThinkingProgress(id, update.contentIndex, update.delta);
       } else if (update.type === "thinking_end") {
-        this.finishProgress(id, `thinking:${update.contentIndex}`, "complete");
+        this.finishThinkingProgress(id, update.contentIndex);
       }
       return;
     }
@@ -659,7 +666,7 @@ export class WorkstreamSupervisor {
         id: `tool:${event.toolCallId}`,
         kind: "tool",
         state: "active",
-        text: `Tool: ${event.toolName || "tool call"}`,
+        text: toolProgressLabel(event.toolName, event.args),
       });
       eventType = "tool_started";
       journal = `Worker started ${event.toolName || "a tool call"}.`;
@@ -683,14 +690,66 @@ export class WorkstreamSupervisor {
     this.notifyProgress(id);
   }
 
+  private startReasoningSpan(id: string, contentIndex: number): ReasoningSpan {
+    const spans =
+      this.reasoningSpans.get(id) ?? new Map<number, ReasoningSpan>();
+    const baseProgressId = `thinking:${contentIndex}`;
+    const retained = new Set(
+      (this.progress.get(id) ?? []).map((event) => event.id),
+    );
+    let progressId = baseProgressId;
+    let occurrence = 2;
+    while (retained.has(progressId)) {
+      progressId = `${baseProgressId}:${occurrence++}`;
+    }
+    const span = { progressId, hasSummary: false };
+    spans.set(contentIndex, span);
+    this.reasoningSpans.set(id, spans);
+    return span;
+  }
+
+  private updateThinkingProgress(
+    id: string,
+    contentIndex: number,
+    delta: string,
+  ): void {
+    const span = this.reasoningSpans.get(id)?.get(contentIndex);
+    if (!span || !delta || !delta.trim()) return;
+    span.hasSummary = true;
+    this.updateProgressText(id, span.progressId, delta);
+  }
+
+  private finishThinkingProgress(id: string, contentIndex: number): void {
+    const spans = this.reasoningSpans.get(id);
+    if (!spans) return;
+    const span = spans.get(contentIndex);
+    if (!span) return;
+    spans.delete(contentIndex);
+    if (spans.size === 0) this.reasoningSpans.delete(id);
+    if (!span.hasSummary) {
+      this.removeProgress(id, span.progressId);
+      return;
+    }
+    this.finishProgress(id, span.progressId, "complete");
+  }
+
   private updateProgressText(id: string, eventId: string, delta: string): void {
     const events = this.progress.get(id);
     const event = events?.find((entry) => entry.id === eventId);
-    if (!event || !delta) return;
+    if (!event) return;
     const prior =
       event.text === "Thinking…" ? "" : event.text.replace(/^Thinking:\s*/, "");
     const text = boundDetail(`${prior}${delta}`);
     event.text = text ? `Thinking: ${text}` : "Thinking…";
+    this.notifyProgress(id);
+  }
+
+  private removeProgress(id: string, eventId: string): void {
+    const events = this.progress.get(id);
+    if (!events) return;
+    const next = events.filter((event) => event.id !== eventId);
+    if (next.length === events.length) return;
+    this.progress.set(id, next);
     this.notifyProgress(id);
   }
 
@@ -958,6 +1017,39 @@ function buildResumeBrief(manifest: WorkstreamManifest): string {
     "",
     "Continue only from the retained worker context and this checkpoint. End with the required structured worker report.",
   ].join("\n");
+}
+
+function toolProgressLabel(toolName: unknown, args: unknown): string {
+  const name = progressText(typeof toolName === "string" ? toolName : "");
+  const path = progressArgument(args, "path");
+  if (name === "read" && path) return progressLabel("Reading ", path);
+  if (name === "write" && path) return progressLabel("Writing ", path);
+  if (name === "edit" && path) return progressLabel("Editing ", path);
+  if (name === "bash") {
+    const command = progressArgument(args, "command");
+    if (command) return progressLabel("Bash: ", command);
+  }
+  return progressLabel("Tool: ", name || "tool call");
+}
+
+function progressArgument(args: unknown, key: string): string | undefined {
+  if (!args || typeof args !== "object" || Array.isArray(args))
+    return undefined;
+  const value = (args as Record<string, unknown>)[key];
+  return typeof value === "string" && progressText(value) ? value : undefined;
+}
+
+function progressLabel(prefix: string, detail: string): string {
+  const text = progressText(detail);
+  const available = MAX_PROGRESS_LABEL_LENGTH - prefix.length;
+  return `${prefix}${text.length <= available ? text : `${text.slice(0, available - 1)}…`}`;
+}
+
+function progressText(value: string): string {
+  return value
+    .replace(/\s+/g, " ")
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+    .trim();
 }
 
 function boundDetail(detail: string): string {

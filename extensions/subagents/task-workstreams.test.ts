@@ -254,9 +254,21 @@ test("renders only concise thinking and tool lifecycle tail rows", () => {
             state: "complete",
             text: "Thinking: Inspecting worker state",
           },
-          { kind: "tool", state: "success", text: "Tool: read" },
-          { kind: "tool", state: "active", text: "Tool: bash" },
-          { kind: "tool", state: "failed", text: "Tool: write" },
+          {
+            kind: "tool",
+            state: "success",
+            text: "Reading path/to/file.ts",
+          },
+          {
+            kind: "tool",
+            state: "active",
+            text: "Bash: rg something --flag",
+          },
+          {
+            kind: "tool",
+            state: "failed",
+            text: "Editing path/to/file.md",
+          },
         ],
       },
     ],
@@ -275,9 +287,9 @@ test("renders only concise thinking and tool lifecycle tail rows", () => {
     "Subagent workstreams",
     "⠁ running · inspect the flow",
     "  Thinking: Inspecting worker state",
-    "  ✓ Tool: read",
-    "  ⠁ Tool: bash",
-    "  ! Tool: write",
+    "  ✓ Reading path/to/file.ts",
+    "  ⠁ Bash: rg something --flag",
+    "  ! Editing path/to/file.md",
   ]);
   assert.doesNotMatch(widget.render(240).join("\n"), /tool result/i);
   widget.dispose();
