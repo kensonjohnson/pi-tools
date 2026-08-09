@@ -1,7 +1,7 @@
 import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type {
+  AgentSession,
   ExtensionAPI,
   ExtensionContext,
   EntryRenderer,
@@ -21,6 +21,7 @@ export const RESEARCH_TIMELINE_ENTRY_TYPE =
 export const RESEARCH_HANDOFF_MESSAGE_TYPE =
   "pi-tools:subagent-research-handoff";
 const MAX_HANDOFF_CHARS = 2_400;
+type AgentMessage = AgentSession["messages"][number];
 
 type ResearchReportStatus = "completed" | "blocked";
 
@@ -422,7 +423,9 @@ function extractFinalAssistantText(messages: AgentMessage[]): string {
   return "";
 }
 
-function formatLinkedSynthesis(report: ResearchJobReport): string {
+function formatLinkedSynthesis(
+  report: Omit<ResearchJobReport, "sequence">,
+): string {
   return bound(
     [
       `Research answer: ${report.synthesis}`,
@@ -436,7 +439,7 @@ function formatLinkedSynthesis(report: ResearchJobReport): string {
 }
 
 function formatBoundedHandoff(
-  report: ResearchJobReport,
+  report: Omit<ResearchJobReport, "sequence">,
   reportArtifact: string,
   sourceIndexArtifact: string,
   linkedTaskWorkstreamId: string | undefined,

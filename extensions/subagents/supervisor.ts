@@ -77,6 +77,9 @@ type ReasoningSpan = {
   summaryParts: string[];
 };
 
+type RoutineWorkstreamEventType =
+  "tool_started" | "tool_finished" | "follow_up" | "delivered" | "redirected";
+
 export type WorkstreamEvent = {
   workstreamId: string;
   type:
@@ -660,7 +663,7 @@ export class WorkstreamSupervisor {
       return;
     }
 
-    let eventType: WorkstreamEvent["type"] | undefined;
+    let eventType: RoutineWorkstreamEventType | undefined;
     let journal: string | undefined;
     if (event.type === "tool_execution_start") {
       this.recordProgress(id, {
@@ -792,7 +795,7 @@ export class WorkstreamSupervisor {
     const session = this.sessions.get(id);
     if (!manifest || !session || manifest.status !== "running") return;
 
-    let completion: WorkstreamCompletion | void;
+    let completion: WorkstreamCompletion | void = undefined;
     try {
       for (const handler of this.completionHandlers) {
         const result = await handler({ manifest, session });
@@ -874,12 +877,7 @@ export class WorkstreamSupervisor {
 
   private async recordRoutineEvent(
     id: string,
-    eventType:
-      | "tool_started"
-      | "tool_finished"
-      | "follow_up"
-      | "delivered"
-      | "redirected",
+    eventType: RoutineWorkstreamEventType,
     detail: string,
   ): Promise<void> {
     await this.enqueue(id, async () => {

@@ -1,7 +1,7 @@
 import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type {
+  AgentSession,
   ExtensionAPI,
   ExtensionContext,
   EntryRenderer,
@@ -26,6 +26,7 @@ export const TASK_CONTROL_TIMELINE_ENTRY_TYPE =
   "pi-tools:subagent-task-control-timeline";
 export const TASK_HANDOFF_MESSAGE_TYPE = "pi-tools:subagent-task-handoff";
 const MAX_HANDOFF_CHARS = 2_400;
+type AgentMessage = AgentSession["messages"][number];
 const MAX_TIMELINE_LINES = 80;
 const WIDGET_ACTIVE_STATUSES = new Set<WorkstreamManifest["status"]>([
   "starting",
@@ -251,8 +252,11 @@ export class TaskWorkstreamService {
   async refreshWidget(ctx: Pick<ExtensionContext, "ui">): Promise<void> {
     const version = ++this.widgetRefreshVersion;
     const inboxRecords = await this.inbox.listUnconsumed();
-    const inboxByWorkstream = new Map(
-      inboxRecords.map((record) => [record.workstreamId, record.deliveryState]),
+    const inboxByWorkstream = new Map<string, "pending" | "scheduled">(
+      inboxRecords.map((record) => [
+        record.workstreamId,
+        record.deliveryState === "scheduled" ? "scheduled" : "pending",
+      ]),
     );
     const manifests = (await this.supervisor.list())
       .filter(
@@ -294,7 +298,7 @@ export class TaskWorkstreamService {
   private async handleCompletion(input: {
     manifest: WorkstreamManifest;
     session: { messages: AgentMessage[] };
-  }): Promise<WorkstreamCompletion> {
+  }): Promise<WorkstreamCompletion | undefined> {
     if (input.manifest.kind !== "task") return undefined;
     const finalAssistantText = extractFinalAssistantText(
       input.session.messages,
@@ -582,7 +586,7 @@ function extractFinalAssistantText(messages: AgentMessage[]): string {
 }
 
 function formatBoundedHandoff(
-  report: TaskWorkerReport,
+  report: Omit<TaskWorkerReport, "sequence">,
   artifact: string,
 ): string {
   const label =
