@@ -361,6 +361,56 @@ test("captures bounded thinking and tool lifecycle progress without tool results
   });
 });
 
+test("renders whitespace-delimited OpenAI reasoning summaries as plain-text parts", async () => {
+  await withSupervisor(async ({ supervisor, sessions }) => {
+    const workstream = await supervisor.launch({
+      kind: "task",
+      brief: "Inspect summary rendering.",
+      policy,
+    });
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_start", contentIndex: 3 },
+    } as AgentSessionEvent);
+    for (const delta of [
+      "**Inspect",
+      " the worker state.**",
+      "\n\n",
+      "**Update",
+      " the focused tests.**",
+    ]) {
+      sessions[0].emit({
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "thinking_delta",
+          contentIndex: 3,
+          delta,
+        },
+      } as AgentSessionEvent);
+    }
+    sessions[0].emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_end", contentIndex: 3 },
+    } as AgentSessionEvent);
+
+    const thinking = supervisor
+      .progressEvents(workstream.id)
+      .filter((event) => event.kind === "thinking");
+    assert.deepEqual(thinking, [
+      {
+        id: "thinking:3",
+        kind: "thinking",
+        state: "complete",
+        text: "Thinking: Inspect the worker state. · Update the focused tests.",
+      },
+    ]);
+    assert.doesNotMatch(thinking[0]?.text ?? "", /\*\*/);
+
+    sessions[0].settle();
+    await supervisor.waitForSettlement(workstream.id);
+  });
+});
+
 test("enforces one shared running cap without queueing task or research work", async () => {
   await withSupervisor(async ({ supervisor, sessions }) => {
     const capOne = { ...policy, maxConcurrentWorkers: 1 };

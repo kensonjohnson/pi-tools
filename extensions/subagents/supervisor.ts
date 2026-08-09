@@ -74,6 +74,7 @@ export type WorkstreamProgressEvent = {
 type ReasoningSpan = {
   progressId: string;
   hasSummary: boolean;
+  summaryParts: string[];
 };
 
 export type WorkstreamEvent = {
@@ -702,7 +703,7 @@ export class WorkstreamSupervisor {
     while (retained.has(progressId)) {
       progressId = `${baseProgressId}:${occurrence++}`;
     }
-    const span = { progressId, hasSummary: false };
+    const span = { progressId, hasSummary: false, summaryParts: [] };
     spans.set(contentIndex, span);
     this.reasoningSpans.set(id, spans);
     return span;
@@ -714,9 +715,22 @@ export class WorkstreamSupervisor {
     delta: string,
   ): void {
     const span = this.reasoningSpans.get(id)?.get(contentIndex);
-    if (!span || !delta || !delta.trim()) return;
+    if (!span || !delta) return;
+    if (!delta.trim()) {
+      // Pi emits a whitespace-only boundary (usually "\n\n") between OpenAI
+      // reasoning-summary parts. Stream chunks themselves are not boundaries.
+      if (/\r?\n/.test(delta) && span.summaryParts.at(-1)?.trim()) {
+        span.summaryParts.push("");
+      }
+      return;
+    }
+    if (span.summaryParts.length === 0) span.summaryParts.push("");
+    const last = span.summaryParts.length - 1;
+    span.summaryParts[last] = boundDetail(`${span.summaryParts[last]}${delta}`);
+    const summary = formatReasoningSummary(span.summaryParts);
+    if (!summary) return;
     span.hasSummary = true;
-    this.updateProgressText(id, span.progressId, delta);
+    this.updateProgressText(id, span.progressId, summary);
   }
 
   private finishThinkingProgress(id: string, contentIndex: number): void {
@@ -733,13 +747,10 @@ export class WorkstreamSupervisor {
     this.finishProgress(id, span.progressId, "complete");
   }
 
-  private updateProgressText(id: string, eventId: string, delta: string): void {
+  private updateProgressText(id: string, eventId: string, text: string): void {
     const events = this.progress.get(id);
     const event = events?.find((entry) => entry.id === eventId);
     if (!event) return;
-    const prior =
-      event.text === "Thinking…" ? "" : event.text.replace(/^Thinking:\s*/, "");
-    const text = boundDetail(`${prior}${delta}`);
     event.text = text ? `Thinking: ${text}` : "Thinking…";
     this.notifyProgress(id);
   }
@@ -1054,6 +1065,24 @@ function progressText(value: string): string {
 
 function boundDetail(detail: string): string {
   return detail.replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
+function formatReasoningSummary(parts: readonly string[]): string {
+  return boundDetail(
+    parts
+      .map((part) => stripPresentationBoldMarkers(progressText(part)))
+      .filter(Boolean)
+      .join(" · "),
+  );
+}
+
+function stripPresentationBoldMarkers(text: string): string {
+  // Keep literal asterisks intact; only remove delimiters in prose-style
+  // Markdown emphasis, such as the fully bold OpenAI summary labels.
+  return text.replace(
+    /(^|[\s([{])\*\*(?=\S)|(?<=\S)\*\*(?=$|[\s)\]}.,;:!?])/g,
+    "$1",
+  );
 }
 
 function errorMessage(error: unknown): string {

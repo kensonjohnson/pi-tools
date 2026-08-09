@@ -252,7 +252,7 @@ test("renders only concise thinking and tool lifecycle tail rows", () => {
           {
             kind: "thinking",
             state: "complete",
-            text: "Thinking: Inspecting worker state",
+            text: "Thinking: Inspecting worker state · Updating focused tests",
           },
           {
             kind: "tool",
@@ -260,9 +260,9 @@ test("renders only concise thinking and tool lifecycle tail rows", () => {
             text: "Reading path/to/file.ts",
           },
           {
-            kind: "tool",
+            kind: "thinking",
             state: "active",
-            text: "Bash: rg something --flag",
+            text: "Thinking: Comparing test results",
           },
           {
             kind: "tool",
@@ -286,12 +286,14 @@ test("renders only concise thinking and tool lifecycle tail rows", () => {
   assert.deepEqual(widget.render(240), [
     "Subagent workstreams",
     "⠁ running · inspect the flow",
-    "  Thinking: Inspecting worker state",
+    "  ✓ Thinking: Inspecting worker state · Updating focused tests",
     "  ✓ Reading path/to/file.ts",
-    "  ⠁ Bash: rg something --flag",
+    "  ⠁ Thinking: Comparing test results",
     "  ! Editing path/to/file.md",
   ]);
-  assert.doesNotMatch(widget.render(240).join("\n"), /tool result/i);
+  const rendered = widget.render(240).join("\n");
+  assert.doesNotMatch(rendered, /tool result/i);
+  assert.doesNotMatch(rendered, /\*\*/);
   widget.dispose();
   assert.equal(timers.size, 0);
 });

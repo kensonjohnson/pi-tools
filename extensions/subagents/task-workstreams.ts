@@ -674,7 +674,8 @@ export class WorkstreamsWidget implements Component {
           const marker =
             event.state === "active"
               ? WORKSTREAM_SPINNER_FRAMES[this.frame]
-              : event.state === "success"
+              : event.state === "success" ||
+                  (event.kind === "thinking" && event.state === "complete")
                 ? "✓"
                 : event.state === "failed"
                   ? "!"
