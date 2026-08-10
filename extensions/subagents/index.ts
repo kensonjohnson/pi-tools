@@ -3,7 +3,6 @@ import {
   CONFIG_DIR_NAME,
   type ExtensionAPI,
   type ExtensionContext,
-  type ImageContent,
   type InputEvent,
 } from "@earendil-works/pi-coding-agent";
 import { publishExtensionSettings } from "../../lib/pi-tools-config.ts";
@@ -40,7 +39,7 @@ import { registerSubagentWaitTool, SubagentWaitService } from "./wait-tools.ts";
 
 type DeferredUserInput = {
   text: string;
-  images?: ImageContent[];
+  images?: InputEvent["images"];
 };
 
 export const WAITING_ON_WORKERS_MESSAGE =
