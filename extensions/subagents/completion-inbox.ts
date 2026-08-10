@@ -12,6 +12,10 @@ export const COMPLETION_INBOX_MESSAGE_TYPE =
   "pi-tools:subagent-completion-inbox";
 const MAX_BATCH_RECORDS = 6;
 const MAX_BATCH_CHARS = 7_200;
+const MAX_STEER_CHARS = 2_400;
+export type CompletionInboxDeliveryTarget = "steer" | "nextTurn";
+export type CompletionInboxDeliveryTargetResolver =
+  () => CompletionInboxDeliveryTarget;
 type AgentMessage = AgentSession["messages"][number];
 
 export type CompletionInboxDeliveryState =
@@ -233,18 +237,28 @@ export class CompletionInboxDelivery {
   private readonly pi: Pick<ExtensionAPI, "sendMessage">;
   private readonly inbox: CompletionInbox;
   private scheduling?: Promise<boolean>;
+  private rescheduleTarget?: CompletionInboxDeliveryTargetResolver;
 
   constructor(pi: Pick<ExtensionAPI, "sendMessage">, inbox: CompletionInbox) {
     this.pi = pi;
     this.inbox = inbox;
   }
 
-  schedule(): Promise<boolean> {
-    if (!this.scheduling) {
-      this.scheduling = this.scheduleNext().finally(() => {
-        this.scheduling = undefined;
-      });
+  schedule(
+    target:
+      | CompletionInboxDeliveryTarget
+      | CompletionInboxDeliveryTargetResolver = "nextTurn",
+  ): Promise<boolean> {
+    const resolveTarget = toTargetResolver(target);
+    if (this.scheduling) {
+      // A completion can be recorded after the in-flight claim. Remember this
+      // request so that record is not stranded until a later parent turn.
+      this.rescheduleTarget = resolveTarget;
+      return this.scheduling;
     }
+    this.scheduling = this.scheduleAll(resolveTarget).finally(() => {
+      this.scheduling = undefined;
+    });
     return this.scheduling;
   }
 
@@ -254,37 +268,79 @@ export class CompletionInboxDelivery {
     return this.inbox.acknowledge(details.batchId, details.recordIds);
   }
 
-  private async scheduleNext(): Promise<boolean> {
-    const batch = await this.inbox.claimPending();
-    if (!batch) return false;
-    try {
-      this.pi.sendMessage(
-        {
-          customType: COMPLETION_INBOX_MESSAGE_TYPE,
-          content: formatBatch(batch.records),
-          display: true,
-          details: {
-            batchId: batch.id,
-            recordIds: batch.records.map((record) => record.id),
-          },
-        },
-        { deliverAs: "nextTurn" },
+  private async scheduleAll(
+    initialTargetResolver: CompletionInboxDeliveryTargetResolver,
+  ): Promise<boolean> {
+    let resolveTarget = initialTargetResolver;
+    let scheduled = false;
+    do {
+      this.rescheduleTarget = undefined;
+      scheduled = (await this.scheduleNext(resolveTarget)) || scheduled;
+      resolveTarget = this.rescheduleTarget ?? resolveTarget;
+    } while (this.rescheduleTarget);
+    return scheduled;
+  }
+
+  private async scheduleNext(
+    resolveTarget: CompletionInboxDeliveryTargetResolver,
+  ): Promise<boolean> {
+    // Reclaim if parent state changes while durable state is being claimed.
+    // This preserves the one-record direct handoff bound when it becomes busy,
+    // while an idle parent keeps the deferred next-turn batch behavior.
+    while (true) {
+      const claimedTarget = resolveTarget();
+      const batch = await this.inbox.claimPending(
+        claimedTarget === "steer" ? 1 : MAX_BATCH_RECORDS,
+        claimedTarget === "steer" ? MAX_STEER_CHARS : MAX_BATCH_CHARS,
       );
-      return true;
-    } catch (error) {
-      await this.inbox.release(batch);
-      throw error;
+      if (!batch) return false;
+
+      const deliveryTarget = resolveTarget();
+      if (deliveryTarget !== claimedTarget) {
+        await this.inbox.release(batch);
+        continue;
+      }
+      try {
+        this.pi.sendMessage(
+          {
+            customType: COMPLETION_INBOX_MESSAGE_TYPE,
+            content:
+              deliveryTarget === "steer"
+                ? batch.records[0]!.handoff.slice(0, MAX_STEER_CHARS)
+                : formatBatch(batch.records, MAX_BATCH_CHARS),
+            display: true,
+            details: {
+              batchId: batch.id,
+              recordIds: batch.records.map((record) => record.id),
+            },
+          },
+          { deliverAs: deliveryTarget },
+        );
+        return true;
+      } catch (error) {
+        await this.inbox.release(batch);
+        throw error;
+      }
     }
   }
 }
 
-function formatBatch(records: CompletionInboxRecord[]): string {
+function toTargetResolver(
+  target: CompletionInboxDeliveryTarget | CompletionInboxDeliveryTargetResolver,
+): CompletionInboxDeliveryTargetResolver {
+  return typeof target === "function" ? target : () => target;
+}
+
+function formatBatch(
+  records: CompletionInboxRecord[],
+  maximumChars: number,
+): string {
   return [
     "Worker completion inbox:",
     ...records.map((record) => record.handoff),
   ]
     .join("\n\n")
-    .slice(0, MAX_BATCH_CHARS);
+    .slice(0, maximumChars);
 }
 
 function inboxMessageDetails(

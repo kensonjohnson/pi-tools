@@ -115,7 +115,7 @@ test("consumes explicitly waited records so they cannot be scheduled later", asy
   }
 });
 
-test("batches only bounded pending records and never wakes or steers the parent", async () => {
+test("batches bounded pending records for an idle next-turn delivery", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-tools-completion-inbox-"));
   const sent: Array<{ message: any; options: any }> = [];
   try {
@@ -137,6 +137,118 @@ test("batches only bounded pending records and never wakes or steers the parent"
     assert.equal(sent[0]?.message.details.recordIds.length, 6);
     assert.deepEqual(sent[0]?.options, { deliverAs: "nextTurn" });
     assert.equal((await inbox.listUnconsumed()).length, 7);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("steers one bounded completion while the parent is active", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-tools-completion-inbox-"));
+  const sent: Array<{ message: any; options: any }> = [];
+  try {
+    const inbox = new CompletionInbox(root);
+    await Promise.all([createRecord(inbox, 1), createRecord(inbox, 2)]);
+    const delivery = new CompletionInboxDelivery(
+      {
+        sendMessage(message, options) {
+          sent.push({ message, options });
+        },
+      } as any,
+      inbox,
+    );
+
+    assert.equal(await delivery.schedule("steer"), true);
+    assert.equal(sent.length, 1);
+    assert.deepEqual(sent[0]?.options, { deliverAs: "steer" });
+    assert.equal(sent[0]?.message.details.recordIds.length, 1);
+    assert.ok(sent[0]?.message.content.length <= 2_400);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reschedules a completion created during an in-flight delivery claim", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-tools-completion-inbox-"));
+  const sent: Array<{ message: any; options: any }> = [];
+  try {
+    const inbox = new CompletionInbox(root);
+    await createRecord(inbox, 1);
+    const claimPending = inbox.claimPending.bind(inbox);
+    let releaseClaim: (() => void) | undefined;
+    const claimStarted = new Promise<void>((resolve) => {
+      releaseClaim = resolve;
+    });
+    let firstClaim = true;
+    (inbox as any).claimPending = async (...args: any[]) => {
+      if (firstClaim) {
+        firstClaim = false;
+        await claimStarted;
+      }
+      return claimPending(...args);
+    };
+    const delivery = new CompletionInboxDelivery(
+      {
+        sendMessage(message, options) {
+          sent.push({ message, options });
+        },
+      } as any,
+      inbox,
+    );
+
+    const first = delivery.schedule("steer");
+    await new Promise((resolve) => setImmediate(resolve));
+    await createRecord(inbox, 2);
+    const racing = delivery.schedule("steer");
+    releaseClaim?.();
+    await Promise.all([first, racing]);
+
+    assert.equal(sent.length, 2);
+    assert.deepEqual(
+      sent.map((entry) => entry.options),
+      [{ deliverAs: "steer" }, { deliverAs: "steer" }],
+    );
+    assert.equal((await inbox.listUnconsumed()).length, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("resolves idle delivery target immediately before sending", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-tools-completion-inbox-"));
+  const sent: Array<{ message: any; options: any }> = [];
+  try {
+    const inbox = new CompletionInbox(root);
+    await createRecord(inbox, 1);
+    const claimPending = inbox.claimPending.bind(inbox);
+    let releaseClaim: (() => void) | undefined;
+    const claimStarted = new Promise<void>((resolve) => {
+      releaseClaim = resolve;
+    });
+    let firstClaim = true;
+    (inbox as any).claimPending = async (...args: any[]) => {
+      if (firstClaim) {
+        firstClaim = false;
+        await claimStarted;
+      }
+      return claimPending(...args);
+    };
+    const delivery = new CompletionInboxDelivery(
+      {
+        sendMessage(message, options) {
+          sent.push({ message, options });
+        },
+      } as any,
+      inbox,
+    );
+    let target: "steer" | "nextTurn" = "steer";
+
+    const scheduling = delivery.schedule(() => target);
+    await new Promise((resolve) => setImmediate(resolve));
+    target = "nextTurn";
+    releaseClaim?.();
+    await scheduling;
+
+    assert.deepEqual(sent[0]?.options, { deliverAs: "nextTurn" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

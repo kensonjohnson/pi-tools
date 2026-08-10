@@ -3,7 +3,6 @@ import {
   CONFIG_DIR_NAME,
   type ExtensionAPI,
   type ExtensionContext,
-  type ImageContent,
   type InputEvent,
 } from "@earendil-works/pi-coding-agent";
 import { publishExtensionSettings } from "../../lib/pi-tools-config.ts";
@@ -35,12 +34,12 @@ import {
   CompletionInbox,
   CompletionInboxDelivery,
 } from "./completion-inbox.ts";
-import { WorkstreamSupervisor } from "./supervisor.ts";
+import { type WorkstreamEvent, WorkstreamSupervisor } from "./supervisor.ts";
 import { registerSubagentWaitTool, SubagentWaitService } from "./wait-tools.ts";
 
 type DeferredUserInput = {
   text: string;
-  images?: ImageContent[];
+  images?: InputEvent["images"];
 };
 
 export const WAITING_ON_WORKERS_MESSAGE =
@@ -60,12 +59,28 @@ The main agent is the primary orchestrator: choose and coordinate workers, decid
 Keep ownership of user intent, integration, consequential decisions, and acceptance. Give workers a narrow objective and scope, honor the shared concurrency cap, and use their bounded handoffs rather than importing detailed worker transcripts. Never delegate consequential external operations; stop and report those needs instead.
 `.trim();
 
+export function scheduleTerminalCompletionDelivery(
+  event: Pick<WorkstreamEvent, "type">,
+  schedule: (() => Promise<boolean>) | undefined,
+): Promise<boolean> | undefined {
+  if (
+    !schedule ||
+    (event.type !== "settled" &&
+      event.type !== "blocked" &&
+      event.type !== "needs_decision")
+  ) {
+    return undefined;
+  }
+  return schedule();
+}
+
 export default function (pi: ExtensionAPI) {
   let supervisor: WorkstreamSupervisor | undefined;
   let tasks: TaskWorkstreamService | undefined;
   let research: ResearchWorkstreamService | undefined;
   let inbox: CompletionInbox | undefined;
   let inboxDelivery: CompletionInboxDelivery | undefined;
+  let scheduleCompletionDelivery: (() => Promise<boolean>) | undefined;
   let wait: SubagentWaitService | undefined;
   let delegationMode: "manual" | "proactive" = "manual";
   let sessionActive = false;
@@ -111,6 +126,7 @@ export default function (pi: ExtensionAPI) {
     research = undefined;
     inbox = undefined;
     inboxDelivery = undefined;
+    scheduleCompletionDelivery = undefined;
     wait = undefined;
     delegationMode = "manual";
     if (!enabled) return;
@@ -121,15 +137,29 @@ export default function (pi: ExtensionAPI) {
 
     supervisor = new WorkstreamSupervisor({
       cwd: ctx.cwd,
-      onEvent: () => {
-        // Routine state remains in the widget and durable journal; only task
-        // completion policy may send a bounded main-agent handoff.
+      onEvent: (event) => {
+        // Routine state remains in the widget and durable journal. Terminal
+        // completion records are already durable when this fires, so an active
+        // parent can receive their bounded handoff at its current turn boundary.
         void tasks?.refreshWidget(ctx);
+        void scheduleTerminalCompletionDelivery(
+          event,
+          scheduleCompletionDelivery,
+        )?.catch(() => {});
       },
     });
     inbox = new CompletionInbox(supervisor.rootDirectory);
     await inbox.recoverScheduled();
     inboxDelivery = new CompletionInboxDelivery(pi, inbox);
+    scheduleCompletionDelivery = () => {
+      // A live wait atomically consumes its own snapshot reports. Do not queue
+      // an overlapping custom message that would duplicate that tool result.
+      if (activeWaitToolCallIds.size > 0) return Promise.resolve(false);
+      return (
+        inboxDelivery?.schedule(() => (ctx.isIdle() ? "nextTurn" : "steer")) ??
+        Promise.resolve(false)
+      );
+    };
     wait = new SubagentWaitService(supervisor, inbox, async () => {
       await tasks?.refreshWidget(ctx);
     });
@@ -167,7 +197,12 @@ export default function (pi: ExtensionAPI) {
       !isSubagentWorkerSession(ctx) &&
       activeWaitToolCallIds.delete(event.toolCallId)
     ) {
-      if (activeWaitToolCallIds.size === 0) waitMessageUI?.setWorkingMessage();
+      if (activeWaitToolCallIds.size === 0) {
+        waitMessageUI?.setWorkingMessage();
+        // A cancelled wait leaves records untouched; once it exits, deliver
+        // any completion that was deliberately held to avoid a duplicate.
+        void scheduleCompletionDelivery?.().catch(() => {});
+      }
     }
   });
 
@@ -195,7 +230,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", async (_event, ctx) => {
     if (!sessionActive || isSubagentWorkerSession(ctx)) return;
     waitAbortPending = false;
-    await inboxDelivery?.schedule();
+    await scheduleCompletionDelivery?.();
     await tasks?.refreshWidget(ctx);
     replayNextDeferredUserInput(
       pi,
@@ -239,6 +274,7 @@ export default function (pi: ExtensionAPI) {
     research = undefined;
     inbox = undefined;
     inboxDelivery = undefined;
+    scheduleCompletionDelivery = undefined;
     wait = undefined;
     delegationMode = "manual";
   });
