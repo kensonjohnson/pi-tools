@@ -4,7 +4,10 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { CompletionInbox } from "./completion-inbox.ts";
+import {
+  CompletionInbox,
+  CompletionInboxDelivery,
+} from "./completion-inbox.ts";
 import {
   CONFIG_FILE_NAME,
   SettingsRegistry,
@@ -20,7 +23,10 @@ import {
   SUBAGENT_SETTINGS,
   SUBAGENT_TOOL_NAMES,
 } from "./settings.ts";
-import { WAITING_ON_WORKERS_MESSAGE } from "./index.ts";
+import {
+  scheduleTerminalCompletionDelivery,
+  WAITING_ON_WORKERS_MESSAGE,
+} from "./index.ts";
 
 const parentModel = {
   provider: "parent",
@@ -109,6 +115,48 @@ test("inherits the parent model or resolves an available configured worker model
   );
 });
 
+test("routes terminal workstream events to completion delivery", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-tools-subagents-terminal-"));
+  const sent: Array<{ message: any; options: any }> = [];
+  try {
+    const inbox = new CompletionInbox(root);
+    await inbox.create({
+      workstreamId: "terminal-worker",
+      kind: "task",
+      terminalStatus: "settled",
+      handoff: "Terminal handoff.",
+      artifactReferences: [],
+      sourceCustomType: "pi-tools:subagent-task-handoff",
+      sourceDetails: { workstreamId: "terminal-worker" },
+    });
+    let idle = false;
+    const delivery = new CompletionInboxDelivery(
+      {
+        sendMessage(message, options) {
+          sent.push({ message, options });
+        },
+      } as any,
+      inbox,
+    );
+    const schedule = () =>
+      delivery.schedule(() => (idle ? "nextTurn" : "steer"));
+
+    assert.equal(
+      await scheduleTerminalCompletionDelivery({ type: "settled" }, schedule),
+      true,
+    );
+    assert.deepEqual(sent[0]?.options, { deliverAs: "steer" });
+    idle = true;
+    assert.equal(
+      scheduleTerminalCompletionDelivery({ type: "progress" }, schedule),
+      undefined,
+    );
+    assert.equal(sent.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("uses trusted project overrides and rejects disabled or untrusted launches", async () => {
   await withTemporaryConfig(async ({ cwd, agentDir }) => {
     const registry = new SettingsRegistry();
@@ -190,7 +238,7 @@ test("uses trusted project overrides and rejects disabled or untrusted launches"
   });
 });
 
-test("queues durable completion inbox records only after settlement and acknowledges matching messages", async () => {
+test("defers idle handoffs, steers active handoffs, and acknowledges matching messages", async () => {
   await withTemporaryConfig(async ({ cwd, agentDir }) => {
     await writeJson(join(agentDir, CONFIG_FILE_NAME), {
       version: 1,
@@ -221,9 +269,11 @@ test("queues durable completion inbox records only after settlement and acknowle
       appendEntry() {},
     };
     let widget: unknown;
+    let idle = true;
     const ctx = {
       cwd,
       isProjectTrusted: () => true,
+      isIdle: () => idle,
       ui: {
         setWidget(_id: string, next: unknown) {
           widget = next;
@@ -271,6 +321,21 @@ test("queues durable completion inbox records only after settlement and acknowle
     );
     assert.equal((await inbox.list())[0]?.deliveryState, "acknowledged");
     assert.equal(widget, undefined);
+
+    await inbox.create({
+      workstreamId: "settled-worker",
+      kind: "task",
+      terminalStatus: "settled",
+      handoff: "A later worker completion reaches an active parent directly.",
+      artifactReferences: ["tmp/subagents/settled-worker/reports/0002.json"],
+      sourceCustomType: "pi-tools:subagent-task-handoff",
+      sourceDetails: { workstreamId: "settled-worker" },
+    });
+    idle = false;
+    await handlers.get("agent_settled")?.({}, ctx);
+    assert.equal(sent.length, 2);
+    assert.deepEqual(sent[1]?.options, { deliverAs: "steer" });
+    assert.equal((await inbox.list())[1]?.deliveryState, "scheduled");
     await handlers.get("session_shutdown")?.({}, ctx);
   });
 });
