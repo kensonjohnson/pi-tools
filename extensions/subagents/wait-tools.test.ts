@@ -8,10 +8,15 @@ import type { SubagentLaunchPolicy } from "./launch-policy.ts";
 import {
   CompletionInbox,
   CompletionInboxDelivery,
+  type CompletionInboxRecord,
 } from "./completion-inbox.ts";
 import type { WorkerSession } from "./supervisor.ts";
 import { WorkstreamSupervisor } from "./supervisor.ts";
-import { registerSubagentWaitTool, SubagentWaitService } from "./wait-tools.ts";
+import {
+  formatWaitResult,
+  registerSubagentWaitTool,
+  SubagentWaitService,
+} from "./wait-tools.ts";
 
 class FakeWorkerSession {
   readonly sessionFile: string;
@@ -81,6 +86,32 @@ const plainTheme = {
   },
 };
 
+test("formats ready reports alongside non-error failed workstream details", () => {
+  const output = formatWaitResult({
+    workstreamIds: ["settled-worker", "failed-worker"],
+    reports: [
+      {
+        workstreamId: "settled-worker",
+        handoff: "Ready handoff.",
+      } as CompletionInboxRecord,
+    ],
+    failures: [
+      {
+        workstreamId: "failed-worker",
+        status: "failed",
+        detail: "intentional failure",
+      },
+    ],
+  });
+
+  assert.match(output, /Waited worker reports:/);
+  assert.match(output, /Ready handoff\./);
+  assert.match(
+    output,
+    /Failed subagent workstream 'failed-worker': intentional failure/,
+  );
+});
+
 test("renders an interrupted wait as a non-error outcome", async () => {
   let definition:
     | {
@@ -143,7 +174,7 @@ test("renders an interrupted wait as a non-error outcome", async () => {
   );
 });
 
-test("wait snapshots all live workers, returns bounded terminal reports, and consumes only that snapshot", async () => {
+test("wait returns when one snapshot worker is actionable and leaves later work untouched", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-tools-subagent-wait-"));
   const sessions: FakeWorkerSession[] = [];
   const inbox = new CompletionInbox(join(root, "subagents"));
@@ -197,31 +228,30 @@ test("wait snapshots all live workers, returns bounded terminal reports, and con
       policy,
     });
     sessions[0]?.settle();
-    sessions[1]?.settle();
     const result = await waiting;
 
+    assert.deepEqual(result.workstreamIds, [task.id]);
+    assert.equal(result.reports.length, 1);
     assert.deepEqual(
-      result.workstreamIds.sort(),
-      [task.id, research.id].sort(),
-    );
-    assert.equal(result.reports.length, 2);
-    assert.deepEqual(
-      consumedIds?.sort(),
-      result.reports.map((report) => report.id).sort(),
+      consumedIds,
+      result.reports.map((report) => report.id),
     );
     assert.deepEqual(
       result.reports.map((report) => report.deliveryState),
-      ["consumed", "consumed"],
+      ["consumed"],
     );
+    assert.equal(await supervisor.isLive(research.id), true);
+    assert.equal(await supervisor.isLive(later.id), true);
     assert.equal(
       (await inbox.list()).filter(
         (record) => record.deliveryState === "consumed",
       ).length,
-      2,
+      1,
     );
-    assert.equal(await supervisor.isLive(later.id), true);
 
+    sessions[1]?.settle();
     sessions[2]?.settle();
+    await supervisor.waitForSettlement(research.id);
     await supervisor.waitForSettlement(later.id);
     const delivery = new CompletionInboxDelivery(
       { sendMessage() {} } as any,
@@ -229,21 +259,19 @@ test("wait snapshots all live workers, returns bounded terminal reports, and con
     );
     assert.equal(await delivery.schedule(), true);
     const records = await inbox.list();
-    assert.equal(
-      records.filter((record) => record.deliveryState === "scheduled").length,
-      1,
-    );
-    assert.equal(
-      records.find((record) => record.deliveryState === "scheduled")
-        ?.workstreamId,
-      later.id,
+    assert.deepEqual(
+      records
+        .filter((record) => record.deliveryState === "scheduled")
+        .map((record) => record.workstreamId)
+        .sort(),
+      [research.id, later.id].sort(),
     );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("wait rejects unknown or non-live selections, returns blocked reports, and preserves workers on cancellation", async () => {
+test("wait handles paused, cancelled, failed, and interrupted snapshot workers", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-tools-subagent-wait-"));
   const sessions: FakeWorkerSession[] = [];
   const inbox = new CompletionInbox(join(root, "subagents"));
@@ -284,11 +312,12 @@ test("wait rejects unknown or non-live selections, returns blocked reports, and 
     await tick();
     sessions[0]?.settle();
     await supervisor.waitForSettlement(completed.id);
-    await assert.rejects(
-      wait.wait([completed.id]),
-      /not live; subagent_wait only accepts live/,
-    );
-    assert.equal((await inbox.listUnconsumed()).length, 1);
+    const readyResult = await wait.wait(undefined);
+    assert.deepEqual(readyResult.workstreamIds, [completed.id]);
+    assert.equal(readyResult.reports[0]?.workstreamId, completed.id);
+    assert.deepEqual(readyResult.failures, []);
+    assert.equal((await inbox.listUnconsumed()).length, 0);
+    await assert.rejects(wait.wait([completed.id]), /only accepts actionable/);
 
     const blocked = await supervisor.launch({
       kind: "task",
@@ -302,6 +331,42 @@ test("wait rejects unknown or non-live selections, returns blocked reports, and 
     const blockedResult = await blockedWait;
     assert.equal(blockedResult.reports[0]?.terminalStatus, "needs_decision");
 
+    const paused = await supervisor.launch({
+      kind: "task",
+      brief: "Require explicit resume after recovery.",
+      policy,
+    });
+    await tick();
+    await supervisor.pause(paused.id, "Simulated crash recovery.");
+    const pausedResult = await wait.wait(undefined);
+    assert.deepEqual(pausedResult.workstreamIds, [paused.id]);
+    assert.deepEqual(pausedResult.reports, []);
+    assert.equal((await inbox.listUnconsumed()).length, 0);
+
+    const cancelledDuringWait = await supervisor.launch({
+      kind: "task",
+      brief: "Cancel without a completion handoff.",
+      policy,
+    });
+    const reportAfterCancel = await supervisor.launch({
+      kind: "task",
+      brief: "Finish after its peer is cancelled.",
+      policy,
+    });
+    await tick();
+    const cancelWait = wait.wait([
+      cancelledDuringWait.id,
+      reportAfterCancel.id,
+    ]);
+    await supervisor.cancel(cancelledDuringWait.id);
+    sessions[4]?.settle();
+    const cancelResult = await cancelWait;
+    assert.deepEqual(cancelResult.workstreamIds, [reportAfterCancel.id]);
+    assert.deepEqual(
+      cancelResult.reports.map((report) => report.workstreamId),
+      [reportAfterCancel.id],
+    );
+
     const running = await supervisor.launch({
       kind: "task",
       brief: "Keep running when the parent stops waiting.",
@@ -309,16 +374,16 @@ test("wait rejects unknown or non-live selections, returns blocked reports, and 
     });
     await tick();
     const controller = new AbortController();
-    const cancelled = wait.wait([running.id], controller.signal);
+    const interrupted = wait.wait([running.id], controller.signal);
     await tick();
     controller.abort();
-    await assert.rejects(cancelled, /was cancelled/);
+    await assert.rejects(interrupted, /was cancelled/);
     assert.equal(await supervisor.isLive(running.id), true);
-    assert.equal((await inbox.listUnconsumed()).length, 1);
-    sessions[2]?.settle();
+    assert.equal((await inbox.listUnconsumed()).length, 0);
+    sessions[5]?.settle();
     await supervisor.waitForSettlement(running.id);
     assert.equal((await supervisor.get(running.id))?.status, "needs_decision");
-    assert.equal((await inbox.listUnconsumed()).length, 2);
+    assert.equal((await inbox.listUnconsumed()).length, 1);
     assert.equal(
       (await inbox.list()).find((record) => record.workstreamId === running.id)
         ?.deliveryState,
@@ -330,12 +395,27 @@ test("wait rejects unknown or non-live selections, returns blocked reports, and 
       brief: "Fail after the wait snapshot.",
       policy,
     });
+    const stillRunning = await supervisor.launch({
+      kind: "task",
+      brief: "Remain live when a peer fails.",
+      policy,
+    });
     await tick();
-    const failureWait = wait.wait([failing.id]);
+    const failureWait = wait.wait([failing.id, stillRunning.id]);
     await tick();
-    sessions[3]?.fail("intentional failure");
-    await assert.rejects(failureWait, /ended failed: intentional failure/);
+    sessions[6]?.fail("intentional failure");
+    const failureResult = await failureWait;
+    assert.deepEqual(failureResult.workstreamIds, [failing.id]);
+    assert.deepEqual(failureResult.reports, []);
+    assert.deepEqual(failureResult.failures, [
+      {
+        workstreamId: failing.id,
+        status: "failed",
+        detail: "intentional failure",
+      },
+    ]);
     assert.equal((await supervisor.get(failing.id))?.status, "failed");
+    assert.equal(await supervisor.isLive(stillRunning.id), true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

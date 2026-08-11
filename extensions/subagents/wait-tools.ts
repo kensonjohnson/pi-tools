@@ -13,21 +13,28 @@ const WaitParameters = Type.Object({
   workstreamIds: Type.Optional(
     Type.Array(
       Type.String({
-        description: "A live task-worker or research-job workstream ID.",
+        description: "An actionable task-worker or research-job workstream ID.",
         minLength: 1,
       }),
       {
         description:
-          "Live workers to wait for. Omit to snapshot every live worker now.",
+          "Live or paused workers to wait for. Omit to snapshot every actionable worker now.",
         minItems: 1,
       },
     ),
   ),
 });
 
+export type SubagentWaitFailure = {
+  workstreamId: string;
+  status: "failed";
+  detail: string;
+};
+
 export type SubagentWaitResult = {
   workstreamIds: string[];
   reports: CompletionInboxRecord[];
+  failures: SubagentWaitFailure[];
 };
 
 export class SubagentWaitService {
@@ -53,37 +60,17 @@ export class SubagentWaitService {
     workstreamIds: string[] | undefined,
     signal?: AbortSignal,
   ): Promise<SubagentWaitResult> {
-    const snapshot = await this.snapshot(workstreamIds);
     throwIfAborted(signal);
-    await waitWithCancellation(
-      Promise.all(
-        snapshot.map((workstream) =>
-          this.supervisor.waitForSettlement(workstream.id),
-        ),
-      ),
-      signal,
-    );
+    const snapshot = await this.snapshot(workstreamIds);
+    await this.waitForActionable(snapshot, signal);
 
-    const manifests = await Promise.all(
-      snapshot.map(async ({ id }) => {
-        const manifest = await this.supervisor.get(id);
-        if (!manifest) throw new Error(`Unknown subagent workstream '${id}'.`);
-        return manifest;
-      }),
-    );
-    const failures = manifests.filter(
-      (manifest) => !isReportTerminal(manifest),
-    );
-    if (failures.length > 0) {
-      throw new Error(
-        failures.map((manifest) => terminalError(manifest)).join(" "),
-      );
-    }
-
+    const manifests = await this.current(snapshot);
+    const actionable = manifests.filter(isWaitOutcome);
+    const failures = actionable.filter(isFailed).map(toWaitFailure);
     throwIfAborted(signal);
     const records = await this.inbox.list();
     throwIfAborted(signal);
-    const reports = manifests.map((manifest) => {
+    const reports = actionable.filter(isReportTerminal).map((manifest) => {
       const report = records
         .filter(
           (record) =>
@@ -114,9 +101,52 @@ export class SubagentWaitService {
     }
     await this.onConsumed?.(consumed);
     return {
-      workstreamIds: manifests.map((manifest) => manifest.id),
+      workstreamIds: actionable.map((manifest) => manifest.id),
       reports: consumed,
+      failures,
     };
+  }
+
+  private async waitForActionable(
+    snapshot: readonly WorkstreamManifest[],
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    const pending = new Map(
+      snapshot
+        .filter((manifest) => manifest.status !== "paused")
+        .map((manifest) => [
+          manifest.id,
+          this.supervisor
+            .waitForSettlement(manifest.id)
+            .then(() => manifest.id),
+        ]),
+    );
+    while (true) {
+      throwIfAborted(signal);
+      const manifests = await this.current(snapshot);
+      if (manifests.some(isWaitOutcome)) return;
+      for (const manifest of manifests) {
+        if (manifest.status === "cancelled") pending.delete(manifest.id);
+      }
+      if (pending.size === 0) return;
+      const settledId = await waitWithCancellation(
+        Promise.race(pending.values()),
+        signal,
+      );
+      pending.delete(settledId);
+    }
+  }
+
+  private async current(
+    snapshot: readonly WorkstreamManifest[],
+  ): Promise<WorkstreamManifest[]> {
+    return Promise.all(
+      snapshot.map(async ({ id }) => {
+        const manifest = await this.supervisor.get(id);
+        if (!manifest) throw new Error(`Unknown subagent workstream '${id}'.`);
+        return manifest;
+      }),
+    );
   }
 
   private async snapshot(
@@ -124,7 +154,7 @@ export class SubagentWaitService {
   ): Promise<WorkstreamManifest[]> {
     if (workstreamIds?.length === 0) {
       throw new Error(
-        "subagent_wait workstreamIds must include at least one live workstream ID.",
+        "subagent_wait workstreamIds must include at least one actionable workstream ID.",
       );
     }
     if (workstreamIds && new Set(workstreamIds).size !== workstreamIds.length) {
@@ -132,6 +162,9 @@ export class SubagentWaitService {
         "subagent_wait workstreamIds must not contain duplicates.",
       );
     }
+    const readyReportWorkstreamIds = new Set(
+      (await this.inbox.listUnconsumed()).map((report) => report.workstreamId),
+    );
     const manifests = workstreamIds
       ? await Promise.all(
           workstreamIds.map(async (id) => {
@@ -144,15 +177,21 @@ export class SubagentWaitService {
       : await this.supervisor.list();
     const snapshot: WorkstreamManifest[] = [];
     for (const manifest of manifests) {
-      if (!(await this.supervisor.isLive(manifest.id))) {
-        if (workstreamIds) {
-          throw new Error(
-            `Subagent workstream '${manifest.id}' is ${manifest.status}, not live; subagent_wait only accepts live workstreams.`,
-          );
-        }
+      if (
+        manifest.status === "paused" ||
+        manifest.status === "failed" ||
+        (isReportTerminal(manifest) &&
+          readyReportWorkstreamIds.has(manifest.id)) ||
+        (await this.supervisor.isLive(manifest.id))
+      ) {
+        snapshot.push(manifest);
         continue;
       }
-      snapshot.push(manifest);
+      if (workstreamIds) {
+        throw new Error(
+          `Subagent workstream '${manifest.id}' is ${manifest.status}, not live, paused, failed, or report-ready; subagent_wait only accepts actionable workstreams.`,
+        );
+      }
     }
     return snapshot;
   }
@@ -166,7 +205,7 @@ export function registerSubagentWaitTool(
     name: "subagent_wait",
     label: "Wait for subagents",
     description:
-      "Deliberately wait for selected live workers, or every worker live now, and return their bounded terminal reports without waking or interrupting the parent later.",
+      "Deliberately wait for selected actionable workstreams, or every actionable workstream now, and return ready reports and failure details without waking or interrupting the parent later.",
     parameters: WaitParameters,
     renderShell: "self",
     renderCall() {
@@ -198,6 +237,7 @@ export function registerSubagentWaitTool(
               terminalStatus: report.terminalStatus,
               artifactReferences: report.artifactReferences,
             })),
+            failures: result.failures,
           },
         };
       } catch (error) {
@@ -217,21 +257,58 @@ function isReportTerminal(manifest: WorkstreamManifest): boolean {
   );
 }
 
-function terminalError(manifest: WorkstreamManifest): string {
-  const detail = manifest.failure ? `: ${manifest.failure}` : "";
-  return `Subagent workstream '${manifest.id}' ended ${manifest.status}${detail}; no terminal completion report is available.`;
+function isWaitOutcome(manifest: WorkstreamManifest): boolean {
+  return (
+    manifest.status === "paused" ||
+    manifest.status === "failed" ||
+    isReportTerminal(manifest)
+  );
 }
 
-function formatWaitResult(result: SubagentWaitResult): string {
-  if (result.reports.length === 0) {
-    return "No live subagent workers were present in this wait snapshot.";
-  }
-  return [
-    "Waited worker reports:",
-    ...result.reports.map((report) => report.handoff),
-  ]
-    .join("\n\n")
-    .slice(0, MAX_WAIT_RESULT_CHARS);
+function isFailed(manifest: WorkstreamManifest): boolean {
+  return manifest.status === "failed";
+}
+
+function toWaitFailure(manifest: WorkstreamManifest): SubagentWaitFailure {
+  return {
+    workstreamId: manifest.id,
+    status: "failed",
+    detail: manifest.failure ?? "Worker session failed.",
+  };
+}
+
+export function formatWaitResult(result: SubagentWaitResult): string {
+  const reportIds = new Set(
+    result.reports.map((report) => report.workstreamId),
+  );
+  const failureIds = new Set(
+    result.failures.map((failure) => failure.workstreamId),
+  );
+  const pausedIds = result.workstreamIds.filter(
+    (id) => !reportIds.has(id) && !failureIds.has(id),
+  );
+  const sections = [
+    ...(result.reports.length > 0
+      ? [
+          "Waited worker reports:",
+          ...result.reports.map((report) => report.handoff),
+        ]
+      : []),
+    ...result.failures.map(
+      (failure) =>
+        `Failed subagent workstream '${failure.workstreamId}': ${failure.detail}`,
+    ),
+    ...(pausedIds.length > 0
+      ? [
+          `Paused subagent workstreams require explicit resume: ${pausedIds.join(", ")}.`,
+        ]
+      : []),
+  ];
+  return (
+    sections.length > 0
+      ? sections.join("\n\n")
+      : "No live subagent workers were present in this wait snapshot."
+  ).slice(0, MAX_WAIT_RESULT_CHARS);
 }
 
 function waitWithCancellation<T>(
