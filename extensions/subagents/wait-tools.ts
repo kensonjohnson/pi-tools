@@ -162,9 +162,6 @@ export class SubagentWaitService {
         "subagent_wait workstreamIds must not contain duplicates.",
       );
     }
-    const readyReportWorkstreamIds = new Set(
-      (await this.inbox.listUnconsumed()).map((report) => report.workstreamId),
-    );
     const manifests = workstreamIds
       ? await Promise.all(
           workstreamIds.map(async (id) => {
@@ -176,13 +173,28 @@ export class SubagentWaitService {
         )
       : await this.supervisor.list();
     const snapshot: WorkstreamManifest[] = [];
-    for (const manifest of manifests) {
+    for (const listed of manifests) {
+      const live = await this.supervisor.isLive(listed.id);
+      // A worker can settle after the manifest listing or inbox scan but before
+      // its liveness check. Re-read its manifest and inbox after that check so
+      // an implicit wait does not lose the completion and keep waiting on an
+      // unrelated snapshot worker.
+      const manifest = live
+        ? listed
+        : ((await this.supervisor.get(listed.id)) ?? listed);
+      const reportReady = isReportTerminal(manifest)
+        ? (await this.inbox.listUnconsumed()).some(
+            (report) => report.workstreamId === manifest.id,
+          )
+        : false;
+      const wasLiveWhenListed =
+        listed.status === "starting" || listed.status === "running";
       if (
         manifest.status === "paused" ||
         manifest.status === "failed" ||
-        (isReportTerminal(manifest) &&
-          readyReportWorkstreamIds.has(manifest.id)) ||
-        (await this.supervisor.isLive(manifest.id))
+        reportReady ||
+        live ||
+        wasLiveWhenListed
       ) {
         snapshot.push(manifest);
         continue;
