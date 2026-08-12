@@ -174,6 +174,95 @@ test("renders an interrupted wait as a non-error outcome", async () => {
   );
 });
 
+test("wait retains a completion that settles during its implicit snapshot", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-tools-subagent-wait-"));
+  const sessions: FakeWorkerSession[] = [];
+  const inbox = new CompletionInbox(join(root, "subagents"));
+  const supervisor = new WorkstreamSupervisor({
+    cwd: root,
+    rootDirectory: join(root, "subagents"),
+    createSession: async (options) => {
+      const session = new FakeWorkerSession(
+        join(options.sessionDirectory, `${sessions.length}.jsonl`),
+      );
+      sessions.push(session);
+      return session as unknown as WorkerSession;
+    },
+    observeGit: async () => ({}),
+  });
+  supervisor.setCompletionHandler(async ({ manifest }) => {
+    await inbox.create({
+      workstreamId: manifest.id,
+      kind: manifest.kind,
+      terminalStatus: "settled",
+      handoff: `Bounded ${manifest.kind} report for ${manifest.id}.`,
+      artifactReferences: [],
+      sourceCustomType: "pi-tools:subagent-test-handoff",
+      sourceDetails: { workstreamId: manifest.id },
+    });
+    return { status: "settled" };
+  });
+  const wait = new SubagentWaitService(supervisor, inbox);
+  const controller = new AbortController();
+  let waiting: Promise<Awaited<ReturnType<typeof wait.wait>>> | undefined;
+  let researchId: string | undefined;
+  let taskId: string | undefined;
+
+  try {
+    const research = await supervisor.launch({
+      kind: "research",
+      brief: "Complete while the parent snapshots.",
+      policy,
+    });
+    const task = await supervisor.launch({
+      kind: "task",
+      brief: "Remain live after research completes.",
+      policy,
+    });
+    researchId = research.id;
+    taskId = task.id;
+    await tick();
+
+    const isLive = supervisor.isLive.bind(supervisor);
+    let settleDuringSnapshot = true;
+    supervisor.isLive = async (id: string) => {
+      if (settleDuringSnapshot) {
+        settleDuringSnapshot = false;
+        sessions[0]?.settle();
+        await supervisor.waitForSettlement(research.id);
+      }
+      return isLive(id);
+    };
+
+    waiting = wait.wait(undefined, controller.signal);
+    const result = await Promise.race([
+      waiting.then((value) => ({ value })),
+      new Promise<{ timedOut: true }>((resolve) =>
+        setTimeout(() => resolve({ timedOut: true }), 100),
+      ),
+    ]);
+
+    assert.equal("timedOut" in result, false);
+    if (!("value" in result)) throw new Error("Wait unexpectedly timed out.");
+    assert.deepEqual(result.value.workstreamIds, [research.id]);
+    assert.deepEqual(
+      result.value.reports.map((report) => report.workstreamId),
+      [research.id],
+    );
+    assert.equal(await supervisor.isLive(task.id), true);
+    assert.equal((await inbox.listUnconsumed()).length, 0);
+  } finally {
+    controller.abort();
+    sessions.forEach((session) => session.settle());
+    await Promise.allSettled([
+      waiting ?? Promise.resolve(),
+      ...(researchId ? [supervisor.waitForSettlement(researchId)] : []),
+      ...(taskId ? [supervisor.waitForSettlement(taskId)] : []),
+    ]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("wait returns when one snapshot worker is actionable and leaves later work untouched", async () => {
   const root = await mkdtemp(join(tmpdir(), "pi-tools-subagent-wait-"));
   const sessions: FakeWorkerSession[] = [];
