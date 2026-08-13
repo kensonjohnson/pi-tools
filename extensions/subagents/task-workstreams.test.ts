@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -435,6 +435,183 @@ test("does not restore a queued row when acknowledgement overtakes an older widg
     assert.equal(widget, undefined);
   } finally {
     await supervisor.shutdown();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("keeps attention rows after delivery and clears them only after explicit resolution", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-tools-task-workstream-"));
+  const sessions: FakeWorkerSession[] = [];
+  const supervisor = new WorkstreamSupervisor({
+    cwd: root,
+    rootDirectory: join(root, "subagents"),
+    createSession: async (options) => {
+      const session = new FakeWorkerSession(
+        join(options.sessionDirectory, `${sessions.length}.jsonl`),
+      );
+      sessions.push(session);
+      return session as unknown as WorkerSession;
+    },
+    observeGit: async () => ({}),
+  });
+  const inbox = new CompletionInbox(join(root, "subagents"));
+  const sent: any[] = [];
+  const service = new TaskWorkstreamService(
+    {
+      appendEntry() {},
+      sendMessage(message) {
+        sent.push(message);
+      },
+    } as any,
+    supervisor,
+    root,
+    inbox,
+  );
+  const widgetContext = {
+    ui: {
+      setWidget(_key: string, content: unknown) {
+        widget = content;
+      },
+    },
+  } as any;
+  let widget: unknown;
+
+  const renderWidget = (): string => {
+    if (typeof widget !== "function") return "";
+    const instance = widget(
+      { requestRender() {} },
+      { fg: (_color: string, text: string) => text },
+    );
+    try {
+      return instance.render(240).join("\n");
+    } finally {
+      instance.dispose();
+    }
+  };
+
+  const completeAttentionWorkstream = async (outcome: string) => {
+    const workstream = await supervisor.launch({
+      kind: "task",
+      brief: buildTaskBrief({
+        objective: "Retain an attention-needed row.",
+        scope: "Explicit resolution regression coverage.",
+      }),
+      policy,
+    });
+    await Promise.resolve();
+    sessions.at(-1)!.messages = [assistantReport("needs-decision", outcome)];
+    sessions.at(-1)!.settle();
+    await supervisor.waitForSettlement(workstream.id);
+    return workstream;
+  };
+
+  try {
+    const acknowledged = await completeAttentionWorkstream(
+      "Acknowledge this decision handoff.",
+    );
+    const delivery = new CompletionInboxDelivery(
+      {
+        sendMessage(message) {
+          sent.push(message);
+        },
+      } as any,
+      inbox,
+    );
+    assert.equal(await delivery.schedule(), true);
+    assert.equal(sent.length, 1);
+    await service.refreshWidget(widgetContext);
+    assert.match(renderWidget(), /queued ·/);
+    assert.equal(
+      await delivery.acknowledgeMessage({
+        ...sent[0],
+        role: "custom",
+        timestamp: Date.now(),
+      } as AgentMessage),
+      1,
+    );
+    await service.refreshWidget(widgetContext);
+    assert.match(renderWidget(), /needs decision ·/);
+    assert.equal(
+      (await supervisor.get(acknowledged.id))?.status,
+      "needs_decision",
+    );
+
+    await service.control({} as any, {
+      workstreamId: acknowledged.id,
+      action: "resolve",
+      message: "Parent handled the acknowledged decision.",
+    });
+    await service.refreshWidget(widgetContext);
+    assert.equal(widget, undefined);
+    assert.equal((await supervisor.get(acknowledged.id))?.status, "settled");
+
+    const consumed = await completeAttentionWorkstream(
+      "Consume this decision handoff before resolution.",
+    );
+    const consumedRecord = (await inbox.listUnconsumed()).find(
+      (record) => record.workstreamId === consumed.id,
+    );
+    assert.ok(consumedRecord);
+    await inbox.consume([consumedRecord.id]);
+    await service.refreshWidget(widgetContext);
+    assert.match(renderWidget(), /needs decision ·/);
+    await service.control({} as any, {
+      workstreamId: consumed.id,
+      action: "resolve",
+      message: "Parent handled the consumed decision.",
+    });
+    await service.refreshWidget(widgetContext);
+    assert.equal(widget, undefined);
+
+    const pending = await completeAttentionWorkstream(
+      "Keep this unresolved handoff deliverable.",
+    );
+    await service.control({} as any, {
+      workstreamId: pending.id,
+      action: "resolve",
+      message: "Parent resolved while retaining delivery.",
+    });
+    const pendingRecord = (await inbox.listUnconsumed()).find(
+      (record) => record.workstreamId === pending.id,
+    );
+    assert.ok(pendingRecord);
+    assert.equal(pendingRecord.deliveryState, "pending");
+    await service.refreshWidget(widgetContext);
+    assert.match(renderWidget(), /queued ·/);
+
+    const report = await service.currentReport(acknowledged.id);
+    assert.equal(report.report?.sequence, 1);
+    assert.equal(report.report?.status, "needs-decision");
+    const journal = await readFile(
+      join(root, "subagents", acknowledged.id, "journal.md"),
+      "utf8",
+    );
+    assert.match(
+      journal,
+      /settled: Parent handled the acknowledged decision\./,
+    );
+
+    const reloadedSupervisor = new WorkstreamSupervisor({
+      cwd: root,
+      rootDirectory: join(root, "subagents"),
+      observeGit: async () => ({}),
+    });
+    const reloadedTasks = new TaskWorkstreamService(
+      { appendEntry() {} },
+      reloadedSupervisor,
+      root,
+      new CompletionInbox(join(root, "subagents")),
+    );
+    assert.equal(
+      (await reloadedSupervisor.get(acknowledged.id))?.status,
+      "settled",
+    );
+    await reloadedTasks.refreshWidget(widgetContext);
+    assert.match(renderWidget(), /queued ·/);
+    await inbox.consume([pendingRecord.id]);
+    await reloadedTasks.refreshWidget(widgetContext);
+    assert.equal(widget, undefined);
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

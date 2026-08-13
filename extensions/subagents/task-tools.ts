@@ -54,18 +54,20 @@ const TaskControlParameters = Type.Object({
       Type.Literal("checkpoint"),
       Type.Literal("pause"),
       Type.Literal("cancel"),
+      Type.Literal("resolve"),
       Type.Literal("resume"),
       Type.Literal("status"),
     ],
     {
       description:
-        "redirect steers current work; checkpoint snapshots recovery context; pause stops resumably; cancel is terminal; resume explicitly reopens a paused worker; status inspects state.",
+        "redirect steers current work; checkpoint snapshots recovery context; pause stops resumably; cancel is terminal; resolve records concise parent detail and settles a blocked or needs_decision worker without consuming its inbox; resume explicitly reopens a paused worker; status inspects state.",
     },
   ),
   message: Type.Optional(
     Type.String({
       description:
-        "Required for redirect; optional concise reason for checkpoint, pause, or cancel. It is saved in the durable journal.",
+        "Required for redirect and resolve; resolve applies only to blocked or needs_decision workers and records the concise parent detail in the durable journal. Optional concise reason for checkpoint, pause, or cancel.",
+      minLength: 1,
     }),
   ),
 });
@@ -139,7 +141,7 @@ export function registerTaskWorkstreamTools(
     name: "subagent_task_control",
     label: "Control task worker",
     description:
-      "Perform a deliberate task-worker lifecycle action. Redirect uses the live steer queue; pause and cancel never restart work automatically; only an explicit resume may reopen a paused worker.",
+      "Perform a deliberate task-worker lifecycle action. Redirect uses the live steer queue; resolve explicitly settles a blocked or needs_decision worker after recording parent detail and does not acknowledge or consume its inbox; pause and cancel never restart work automatically; only an explicit resume may reopen a paused worker.",
     parameters: TaskControlParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const service = getService();

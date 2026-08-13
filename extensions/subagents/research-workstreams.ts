@@ -61,7 +61,7 @@ export type ResearchLaunchInput = {
 };
 
 export type ResearchControlAction =
-  "checkpoint" | "pause" | "cancel" | "resume" | "status";
+  "checkpoint" | "pause" | "cancel" | "resolve" | "resume" | "status";
 
 export type ResearchControlInput = {
   workstreamId: string;
@@ -107,6 +107,10 @@ export class ResearchWorkstreamService {
     });
   }
 
+  async refreshWidget(ctx: Pick<ExtensionContext, "ui">): Promise<void> {
+    await this.tasks.refreshWidget(ctx);
+  }
+
   async currentReport(workstreamId: string): Promise<{
     manifest: WorkstreamManifest;
     report?: ResearchJobReport;
@@ -141,6 +145,11 @@ export class ResearchWorkstreamService {
         return this.supervisor.pause(manifest.id, message);
       case "cancel":
         return this.supervisor.cancel(manifest.id, message);
+      case "resolve":
+        if (!message) {
+          throw new Error("A concise parent resolution detail is required.");
+        }
+        return this.supervisor.resolve(manifest.id, message);
       case "resume": {
         const policy = await resolveSubagentLaunchPolicy(ctx, "research");
         return this.supervisor.resume(manifest.id, policy);
