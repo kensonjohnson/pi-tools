@@ -37,13 +37,15 @@ const ResearchControlParameters = Type.Object({
     Type.Literal("checkpoint"),
     Type.Literal("pause"),
     Type.Literal("cancel"),
+    Type.Literal("resolve"),
     Type.Literal("resume"),
     Type.Literal("status"),
   ]),
   message: Type.Optional(
     Type.String({
       description:
-        "Optional concise reason persisted for checkpoint, pause, or cancel.",
+        "Required concise parent detail for resolve; resolve applies only to blocked or needs_decision jobs and is persisted in the durable journal. Optional reason for checkpoint, pause, or cancel.",
+      minLength: 1,
     }),
   ),
 });
@@ -122,13 +124,14 @@ export function registerResearchWorkstreamTools(
     name: "subagent_research_control",
     label: "Control research job",
     description:
-      "Checkpoint, pause, cancel, explicitly resume, or inspect a fire-and-forget research job. Research jobs never restart automatically.",
+      "Checkpoint, pause, cancel, resolve, explicitly resume, or inspect a fire-and-forget research job. Resolve settles a blocked or needs_decision job after recording concise parent detail without acknowledging or consuming its inbox; research jobs never restart automatically.",
     parameters: ResearchControlParameters,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const service = getService();
       if (!service) return unavailable();
       try {
         const workstream = await service.control(ctx, params);
+        await service.refreshWidget?.(ctx);
         return {
           content: [
             {

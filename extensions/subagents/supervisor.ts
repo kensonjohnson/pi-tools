@@ -343,6 +343,15 @@ export class WorkstreamSupervisor {
     return this.transition(id, "needs_decision", "needs_decision", reason);
   }
 
+  async resolve(id: string, detail: string): Promise<WorkstreamManifest> {
+    const bounded = requiredParentResolutionDetail(detail);
+    return this.transition(id, "settled", "settled", bounded, undefined, {
+      allowedFrom: ["blocked", "needs_decision"],
+      invalidTransition: (manifest) =>
+        `Workstream '${id}' is ${manifest.status}; only blocked or needs_decision workstreams can be resolved.`,
+    });
+  }
+
   async followUp(id: string, prompt: string): Promise<WorkstreamManifest> {
     const session = this.sessions.get(id);
     if (!session) {
@@ -855,9 +864,22 @@ export class WorkstreamSupervisor {
     eventType: WorkstreamEvent["type"],
     detail: string | undefined,
     workerSessionFile?: string,
+    options: {
+      allowedFrom?: readonly WorkstreamStatus[];
+      invalidTransition?: (manifest: WorkstreamManifest) => string;
+    } = {},
   ): Promise<WorkstreamManifest> {
     return this.enqueue(id, async () => {
       const manifest = await this.requireManifest(id);
+      if (
+        options.allowedFrom &&
+        !options.allowedFrom.includes(manifest.status)
+      ) {
+        throw new Error(
+          options.invalidTransition?.(manifest) ??
+            `Workstream '${id}' is ${manifest.status} and cannot transition to ${status}.`,
+        );
+      }
       const at = new Date().toISOString();
       const next: WorkstreamManifest = {
         ...manifest,
@@ -1063,6 +1085,14 @@ function progressText(value: string): string {
 
 function boundDetail(detail: string): string {
   return detail.replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
+function requiredParentResolutionDetail(detail: string): string {
+  const bounded = typeof detail === "string" ? boundDetail(detail) : "";
+  if (!bounded) {
+    throw new Error("A concise parent resolution detail is required.");
+  }
+  return bounded;
 }
 
 function formatReasoningSummary(parts: readonly string[]): string {

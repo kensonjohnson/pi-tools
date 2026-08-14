@@ -118,7 +118,13 @@ export type TaskFollowUpInput = {
 };
 
 export type TaskControlAction =
-  "redirect" | "checkpoint" | "pause" | "cancel" | "resume" | "status";
+  | "redirect"
+  | "checkpoint"
+  | "pause"
+  | "cancel"
+  | "resolve"
+  | "resume"
+  | "status";
 
 export type TaskControlInput = {
   workstreamId: string;
@@ -230,6 +236,12 @@ export class TaskWorkstreamService {
         break;
       case "cancel":
         next = await this.supervisor.cancel(manifest.id, message);
+        break;
+      case "resolve":
+        if (!message) {
+          throw new Error("A concise parent resolution detail is required.");
+        }
+        next = await this.supervisor.resolve(manifest.id, message);
         break;
       case "resume": {
         const policy = await resolveSubagentLaunchPolicy(ctx, "task");

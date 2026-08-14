@@ -510,6 +510,99 @@ test("redirects, checkpoints, pauses, resumes, and cancels only on explicit pare
   });
 });
 
+test("resolves only blocked or needs-decision workstreams with durable parent detail", async () => {
+  await withSupervisor(async ({ root, supervisor, sessions, events }) => {
+    const blocked = await supervisor.launch({
+      kind: "task",
+      brief: "Wait for a parent decision.",
+      policy,
+    });
+    await supervisor.markBlocked(
+      blocked.id,
+      "Worker needs a product decision.",
+    );
+    const beforeMissingDetail = await supervisor.get(blocked.id);
+    const beforeMissingDetailJournal = await readFile(
+      join(root, "subagents", blocked.id, "journal.md"),
+      "utf8",
+    );
+    await assert.rejects(
+      supervisor.resolve(blocked.id, "  \n\t"),
+      /concise parent resolution detail is required/,
+    );
+    assert.deepEqual(await supervisor.get(blocked.id), beforeMissingDetail);
+    assert.equal(
+      await readFile(join(root, "subagents", blocked.id, "journal.md"), "utf8"),
+      beforeMissingDetailJournal,
+    );
+
+    const resolved = await supervisor.resolve(
+      blocked.id,
+      "Parent selected the compatible implementation.",
+    );
+    assert.equal(resolved.status, "settled");
+    assert.equal(events.at(-1), "settled");
+    assert.equal(sessions[0]?.disposed, false);
+    const journalAfterResolution = await readFile(
+      join(root, "subagents", blocked.id, "journal.md"),
+      "utf8",
+    );
+    assert.match(
+      journalAfterResolution,
+      /settled: Parent selected the compatible implementation\./,
+    );
+    await assert.rejects(
+      supervisor.resolve(blocked.id, "A second parent decision."),
+      /only blocked or needs_decision workstreams can be resolved/,
+    );
+    assert.equal(
+      await readFile(join(root, "subagents", blocked.id, "journal.md"), "utf8"),
+      journalAfterResolution,
+    );
+
+    sessions[0]?.settle();
+    await supervisor.waitForSettlement(blocked.id);
+    const needsDecision = await supervisor.launch({
+      kind: "research",
+      brief: "Wait for a research decision.",
+      policy,
+    });
+    await supervisor.markNeedsDecision(
+      needsDecision.id,
+      "Research needs a parent choice.",
+    );
+    const resolvedNeedsDecision = await supervisor.resolve(
+      needsDecision.id,
+      "Parent accepted the cited tradeoff.",
+    );
+    assert.equal(resolvedNeedsDecision.status, "settled");
+
+    const running = await supervisor.launch({
+      kind: "task",
+      brief: "Keep this worker running.",
+      policy,
+    });
+    const beforeInvalidStatus = await supervisor.get(running.id);
+    const beforeInvalidStatusJournal = await readFile(
+      join(root, "subagents", running.id, "journal.md"),
+      "utf8",
+    );
+    await assert.rejects(
+      supervisor.resolve(running.id, "This is not valid yet."),
+      /only blocked or needs_decision workstreams can be resolved/,
+    );
+    assert.deepEqual(await supervisor.get(running.id), beforeInvalidStatus);
+    assert.equal(
+      await readFile(join(root, "subagents", running.id, "journal.md"), "utf8"),
+      beforeInvalidStatusJournal,
+    );
+    sessions[1]?.settle();
+    sessions[2]?.settle();
+    await supervisor.waitForSettlement(needsDecision.id);
+    await supervisor.waitForSettlement(running.id);
+  });
+});
+
 test("recovers and reopens interrupted persisted worker sessions only after explicit resume", async () => {
   await withSupervisor(async ({ root, supervisor, sessions }) => {
     const workstream = await supervisor.launch({
