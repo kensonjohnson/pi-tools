@@ -13,6 +13,7 @@ import {
   MAIN_WORKING_SPINNER_SETTINGS,
   MainWorkingSpinnerPreview,
 } from "../extensions/main-working-spinner.ts";
+import { SUBAGENT_SETTINGS } from "../extensions/subagents/settings.ts";
 import extension from "../extensions/pi-tools-settings.ts";
 
 initTheme();
@@ -142,6 +143,253 @@ test(
         maxRetries: 3,
         retryDelay: 10,
       });
+    }
+  },
+);
+
+test(
+  "selects an available Pi model for an unscoped subagent worker",
+  { timeout: 2_000 },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-tools-settings-model-"));
+    const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+
+    try {
+      const handlers = new Map<string, Array<(data: unknown) => void>>();
+      let command:
+        { handler: (args: string, ctx: any) => Promise<void> } | undefined;
+      let component: CustomComponent | undefined;
+      let finishCustom!: () => void;
+      let readyCustom!: () => void;
+      const closed = new Promise<void>((resolve) => (finishCustom = resolve));
+      const ready = new Promise<void>((resolve) => (readyCustom = resolve));
+      const pi = {
+        events: {
+          emit(channel: string, data: unknown) {
+            for (const handler of handlers.get(channel) ?? []) handler(data);
+          },
+          on(channel: string, handler: (data: unknown) => void) {
+            const listeners = handlers.get(channel) ?? [];
+            listeners.push(handler);
+            handlers.set(channel, listeners);
+            return () =>
+              handlers.set(
+                channel,
+                listeners.filter((listener) => listener !== handler),
+              );
+          },
+        },
+        registerCommand(
+          name: string,
+          registration: { handler: (args: string, ctx: any) => Promise<void> },
+        ) {
+          if (name === "pi-tools") command = registration;
+        },
+      } as unknown as ExtensionAPI;
+      extension(pi);
+      pi.events.on(SETTINGS_DEFINITION_REQUEST_EVENT, () => {
+        pi.events.emit(SETTINGS_DEFINITION_EVENT, SUBAGENT_SETTINGS);
+      });
+
+      assert.ok(command, "expected the pi-tools command to register");
+      const open = command.handler("", {
+        mode: "tui",
+        cwd: join(root, "project"),
+        isProjectTrusted: () => true,
+        scopedModels: [],
+        modelRegistry: {
+          getAvailable: () => [
+            {
+              provider: "parent",
+              id: "parent-model",
+              name: "Parent model",
+            },
+            {
+              provider: "worker",
+              id: "worker-model",
+              name: "Worker model",
+            },
+          ],
+        },
+        reload: async () => {},
+        ui: {
+          notify() {},
+          custom: async (factory: any) => {
+            component = factory(
+              { requestRender() {} },
+              {
+                fg: (_color: string, text: string) => text,
+                bold: (text: string) => text,
+              },
+              {},
+              finishCustom,
+            );
+            readyCustom();
+            return closed;
+          },
+        },
+      });
+      await ready;
+      assert.ok(component, "expected the settings UI to open");
+
+      component.handleInput("\u001b[B");
+      component.handleInput("\r");
+      for (let index = 0; index < 4; index++) {
+        component.handleInput("\u001b[B");
+      }
+      component.handleInput("\r");
+      assert.match(visible(component), /Type to filter/);
+      component.handleInput("worker");
+      assert.match(visible(component), /worker\/worker-model/);
+      assert.doesNotMatch(visible(component), /parent\/parent-model/);
+      component.handleInput("\r");
+      await new Promise((resolve) => setImmediate(resolve));
+
+      component.handleInput("\u001b");
+      component.handleInput("\u001b");
+      await open;
+
+      const globalConfig = JSON.parse(
+        await readFile(join(root, "agent", CONFIG_FILE_NAME), "utf8"),
+      );
+      assert.deepEqual(globalConfig, {
+        version: 1,
+        extensions: {
+          subagents: { models: { task: "worker/worker-model" } },
+        },
+      });
+    } finally {
+      if (originalAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "shows scoped subagent model values with thinking levels in a picker",
+  { timeout: 2_000 },
+  async () => {
+    const root = await mkdtemp(
+      join(tmpdir(), "pi-tools-settings-model-scoped-"),
+    );
+    const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = join(root, "agent");
+
+    try {
+      const handlers = new Map<string, Array<(data: unknown) => void>>();
+      let command:
+        { handler: (args: string, ctx: any) => Promise<void> } | undefined;
+      let component: CustomComponent | undefined;
+      let finishCustom!: () => void;
+      let readyCustom!: () => void;
+      const closed = new Promise<void>((resolve) => (finishCustom = resolve));
+      const ready = new Promise<void>((resolve) => (readyCustom = resolve));
+      const pi = {
+        events: {
+          emit(channel: string, data: unknown) {
+            for (const handler of handlers.get(channel) ?? []) handler(data);
+          },
+          on(channel: string, handler: (data: unknown) => void) {
+            const listeners = handlers.get(channel) ?? [];
+            listeners.push(handler);
+            handlers.set(channel, listeners);
+            return () =>
+              handlers.set(
+                channel,
+                listeners.filter((listener) => listener !== handler),
+              );
+          },
+        },
+        registerCommand(
+          name: string,
+          registration: { handler: (args: string, ctx: any) => Promise<void> },
+        ) {
+          if (name === "pi-tools") command = registration;
+        },
+      } as unknown as ExtensionAPI;
+      extension(pi);
+      pi.events.on(SETTINGS_DEFINITION_REQUEST_EVENT, () => {
+        pi.events.emit(SETTINGS_DEFINITION_EVENT, SUBAGENT_SETTINGS);
+      });
+
+      assert.ok(command, "expected the pi-tools command to register");
+      const open = command.handler("", {
+        mode: "tui",
+        cwd: join(root, "project"),
+        isProjectTrusted: () => true,
+        scopedModels: [
+          {
+            model: { provider: "scoped", id: "scoped-model" },
+            thinkingLevel: "high",
+          },
+          {
+            model: { provider: "backup", id: "backup-model" },
+            thinkingLevel: "off",
+          },
+        ],
+        modelRegistry: {
+          getAvailable: () => [
+            {
+              provider: "fallback",
+              id: "fallback-model",
+              name: "Fallback model",
+            },
+          ],
+        },
+        reload: async () => {},
+        ui: {
+          notify() {},
+          custom: async (factory: any) => {
+            component = factory(
+              { requestRender() {} },
+              {
+                fg: (_color: string, text: string) => text,
+                bold: (text: string) => text,
+              },
+              {},
+              finishCustom,
+            );
+            readyCustom();
+            return closed;
+          },
+        },
+      });
+      await ready;
+      assert.ok(component, "expected the settings UI to open");
+
+      component.handleInput("\u001b[B");
+      component.handleInput("\r");
+      for (let index = 0; index < 5; index++) {
+        component.handleInput("\u001b[B");
+      }
+      component.handleInput("\r");
+      assert.match(visible(component), /scoped\/scoped-model:high/);
+      component.handleInput("scoped/");
+      assert.doesNotMatch(visible(component), /backup\/backup-model:off/);
+      component.handleInput("\r");
+      await new Promise((resolve) => setImmediate(resolve));
+
+      component.handleInput("\u001b");
+      component.handleInput("\u001b");
+      await open;
+
+      const globalConfig = JSON.parse(
+        await readFile(join(root, "agent", CONFIG_FILE_NAME), "utf8"),
+      );
+      assert.deepEqual(globalConfig, {
+        version: 1,
+        extensions: {
+          subagents: { models: { research: "scoped/scoped-model:high" } },
+        },
+      });
+    } finally {
+      if (originalAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+      await rm(root, { recursive: true, force: true });
     }
   },
 );

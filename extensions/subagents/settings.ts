@@ -1,4 +1,7 @@
-import type { ExtensionSettingsDefinition } from "../../lib/pi-tools-config.ts";
+import type {
+  ExtensionSettingsDefinition,
+  SettingsSelectContext,
+} from "../../lib/pi-tools-config.ts";
 
 export const SUBAGENTS_EXTENSION_ID = "subagents";
 
@@ -17,6 +20,26 @@ export const SUBAGENT_TOOL_NAMES = [
 
 export type SubagentWorkstreamKind = "task" | "research";
 export type SubagentDelegationMode = "manual" | "proactive";
+
+/**
+ * Returns Pi model picker values for this session. Scoped models preserve their
+ * pinned thinking level; an unscoped session can choose any available model.
+ */
+export function scopedModelSelectionValues(
+  context: SettingsSelectContext,
+): readonly string[] {
+  const values =
+    context.scopedModels.length > 0
+      ? context.scopedModels.map(({ model, thinkingLevel }) =>
+          thinkingLevel
+            ? `${model.provider}/${model.id}:${thinkingLevel}`
+            : `${model.provider}/${model.id}`,
+        )
+      : context.modelRegistry
+          .getAvailable()
+          .map((model) => `${model.provider}/${model.id}`);
+  return ["inherit", ...new Set(values)];
+}
 
 export const SUBAGENT_SETTINGS: ExtensionSettingsDefinition = {
   id: SUBAGENTS_EXTENSION_ID,
@@ -60,15 +83,15 @@ export const SUBAGENT_SETTINGS: ExtensionSettingsDefinition = {
       type: "string",
       default: "inherit",
       label: "Task-worker model",
-      description:
-        'Use "inherit" for the current parent model, or a Pi model pattern.',
+      description: 'Choose "inherit" or an available Pi model.',
+      selectValues: scopedModelSelectionValues,
     },
     "models.research": {
       type: "string",
       default: "inherit",
       label: "Research-job model",
-      description:
-        'Use "inherit" for the current parent model, or a Pi model pattern.',
+      description: 'Choose "inherit" or an available Pi model.',
+      selectValues: scopedModelSelectionValues,
     },
   },
   toolNames: SUBAGENT_TOOL_NAMES,
