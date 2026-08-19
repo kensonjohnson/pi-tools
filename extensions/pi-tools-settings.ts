@@ -1,5 +1,6 @@
 import {
   CONFIG_DIR_NAME,
+  getSelectListTheme,
   getSettingsListTheme,
   type ExtensionAPI,
   type ExtensionCommandContext,
@@ -9,6 +10,8 @@ import {
   Container,
   decodeKittyPrintable,
   Input,
+  SelectList,
+  type SelectItem,
   type SettingItem,
   SettingsList,
   Text,
@@ -24,6 +27,7 @@ import {
   type EffectiveSettings,
   type ExtensionSettingsDefinition,
   type SettingDefinition,
+  type SettingsSelectContext,
   type SettingsDetailPreview,
   type SettingValue,
   type WritableConfigScope,
@@ -139,10 +143,73 @@ function createTextSubmenu(
   };
 }
 
+function createValuePickerSubmenu(
+  label: string,
+  currentValue: string,
+  values: readonly string[],
+  done: (selectedValue?: string) => void,
+  theme: Theme,
+) {
+  const input = new Input();
+  input.focused = true;
+  const items = values.map((value) => ({ value, label: value }) as SelectItem);
+  const selectList = new SelectList(
+    items,
+    Math.min(items.length + 2, 15),
+    getSelectListTheme(),
+  );
+
+  const currentIndex = items.findIndex((item) => item.value === currentValue);
+  if (currentIndex >= 0) {
+    selectList.setSelectedIndex(currentIndex);
+  }
+
+  const container = new Container();
+  container.addChild(
+    new Text(theme.fg("accent", theme.bold(`Select ${label}`))),
+  );
+  container.addChild(input);
+  container.addChild(selectList);
+  container.addChild(
+    new Text(
+      theme.fg(
+        "dim",
+        "Type to filter · ↑/↓ to move · Enter to select · Esc to cancel",
+      ),
+    ),
+  );
+
+  selectList.onSelect = (item) => done(item.value);
+  selectList.onCancel = () => done();
+
+  return {
+    render(width: number): string[] {
+      return container.render(width);
+    },
+    invalidate(): void {
+      container.invalidate();
+    },
+    handleInput(data: string): void {
+      selectList.handleInput(data);
+      const before = input.getValue();
+      input.handleInput(data);
+      const after = input.getValue();
+      if (before !== after) {
+        selectList.setFilter(after);
+      }
+    },
+    dispose(): void {
+      selectList.onSelect = undefined;
+      selectList.onCancel = undefined;
+    },
+  };
+}
+
 function createSettingItem(
   field: RegisteredField,
   settings: EffectiveSettings,
   theme: Theme,
+  selectContext: SettingsSelectContext,
   label = field.setting.label ?? field.field,
 ): SettingItem {
   const value = getSettingValue(settings, field.definition.id, field.field);
@@ -167,14 +234,24 @@ function createSettingItem(
   } else if (field.setting.type === "enum") {
     item.values = [...field.setting.values];
   } else {
-    item.submenu = (currentValue, done) =>
-      createTextSubmenu(
-        label,
-        currentValue,
-        theme,
-        done,
-        field.setting.type === "string",
-      );
+    const selectValues =
+      field.setting.type === "string"
+        ? field.setting.selectValues?.(selectContext)
+        : undefined;
+    if (selectValues?.length) {
+      const values = [...new Set(selectValues)];
+      item.submenu = (currentValue, done) =>
+        createValuePickerSubmenu(label, currentValue, values, done, theme);
+    } else {
+      item.submenu = (currentValue, done) =>
+        createTextSubmenu(
+          label,
+          currentValue,
+          theme,
+          done,
+          field.setting.type === "string",
+        );
+    }
   }
 
   return item;
@@ -229,10 +306,11 @@ function createExtensionSettingsItems(
   registeredFields: RegisteredField[],
   settings: EffectiveSettings,
   theme: Theme,
+  selectContext: SettingsSelectContext,
 ): SettingItem[] {
   return registeredFields
     .filter((field) => field.definition.id === extensionId)
-    .map((field) => createSettingItem(field, settings, theme));
+    .map((field) => createSettingItem(field, settings, theme, selectContext));
 }
 
 function getDefaultScope(
@@ -374,6 +452,7 @@ async function openSettingsUI(
           registeredFields,
           settings,
           theme,
+          ctx,
         );
         const detailPreview = definition.detailPreview?.({
           values: Object.fromEntries(

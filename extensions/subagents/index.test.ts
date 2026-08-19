@@ -19,6 +19,7 @@ import {
   resolveSubagentOutputTailLines,
 } from "./launch-policy.ts";
 import {
+  scopedModelSelectionValues,
   SUBAGENTS_EXTENSION_ID,
   SUBAGENT_SETTINGS,
   SUBAGENT_TOOL_NAMES,
@@ -89,6 +90,24 @@ test("registers Subagents settings including an opt-in live output tail", () => 
   assert.equal(SUBAGENT_SETTINGS.fields.outputTailLines.integer, true);
   assert.equal(SUBAGENT_SETTINGS.fields["models.task"].default, "inherit");
   assert.equal(SUBAGENT_SETTINGS.fields["models.research"].default, "inherit");
+});
+
+test("uses scoped Pi models or unscoped available models for worker pickers", () => {
+  assert.deepEqual(scopedModelSelectionValues(modelContext()), [
+    "inherit",
+    "parent/parent-model",
+    "worker/worker-model",
+  ]);
+  assert.deepEqual(
+    scopedModelSelectionValues({
+      scopedModels: [
+        { model: parentModel },
+        { model: configuredModel, thinkingLevel: "high" },
+        { model: configuredModel, thinkingLevel: "high" },
+      ],
+    } as any),
+    ["inherit", "parent/parent-model", "worker/worker-model:high"],
+  );
 });
 
 test("inherits the parent model or resolves an available configured worker model", () => {

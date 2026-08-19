@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 
 export const CONFIG_FILE_NAME = "pi-tools.json";
@@ -34,9 +34,18 @@ export type NumberSettingDefinition = SettingMetadata & {
   integer?: boolean;
 };
 
+export type SettingsSelectContext = Pick<
+  ExtensionContext,
+  "modelRegistry" | "scopedModels"
+>;
+
 export type StringSettingDefinition = SettingMetadata & {
   type: "string";
   default: string;
+  /** Optional session-aware values for the settings UI; free-form config remains valid. */
+  selectValues?: (
+    context: SettingsSelectContext,
+  ) => readonly string[] | undefined;
 };
 
 export type EnumSettingDefinition = SettingMetadata & {
