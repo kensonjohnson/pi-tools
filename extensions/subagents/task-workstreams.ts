@@ -171,11 +171,16 @@ export class TaskWorkstreamService {
     return manifest;
   }
 
-  async followUp(input: TaskFollowUpInput): Promise<WorkstreamManifest> {
+  async followUp(
+    ctx: ExtensionContext,
+    input: TaskFollowUpInput,
+  ): Promise<WorkstreamManifest> {
     const manifest = await this.requireTask(input.workstreamId);
+    const policy = await resolveSubagentLaunchPolicy(ctx, "task");
     return this.supervisor.followUp(
       manifest.id,
       buildFocusedFollowUp(input.focus),
+      policy.maxConcurrentWorkers,
     );
   }
 

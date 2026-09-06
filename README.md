@@ -71,6 +71,14 @@ If you happen to be using a codex subscription, enable **Custom Stats Footer →
 
 The quota source is an undocumented ChatGPT endpoint, so the feature is best-effort. Access tokens and account identifiers are used only in memory and are never written or displayed by the extension.
 
+### `subagents`
+
+Persistent task workers and research jobs have independent model and thinking settings in `/pi-tools` → Subagents. Model pickers use Pi's scoped models when configured, otherwise available models. Choosing `inherit` for a model uses the parent's model.
+
+Set **Task-worker thinking** (`thinking.task`) and **Research-job thinking** (`thinking.research`) to `inherit`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Saving `inherit` copies the parent's current thinking when a worker session starts. Any saved thinking choice overrides a `:thinking` suffix in its model setting. If the thinking setting has never been saved, its default is `inherit`, but an existing model suffix still takes precedence for compatibility. Without a suffix it inherits parent thinking.
+
+Pi clamps thinking to the selected model's capabilities. These settings do not change the parent's model or thinking and apply only to new worker sessions; existing sessions retain their settings.
+
 ### `tool-output-compression`
 
 Observes configured text-only tool results and reports RTK-style estimated token savings in `/tool-output`. Token estimates use UTF-8 bytes ÷ 4 and are approximate.

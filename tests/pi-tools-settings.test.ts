@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -385,6 +385,175 @@ test(
           subagents: { models: { research: "scoped/scoped-model:high" } },
         },
       });
+    } finally {
+      if (originalAgentDir === undefined)
+        delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "saves independent subagent thinking without changing models or parent settings",
+  { timeout: 2_000 },
+  async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-tools-settings-thinking-"));
+    const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = join(root, "agent");
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+
+    try {
+      await mkdir(agentDir);
+      const models = {
+        task: "worker/task-model:high",
+        research: "worker/research-model:max",
+      };
+      await writeFile(
+        join(agentDir, CONFIG_FILE_NAME),
+        JSON.stringify({ version: 1, extensions: { subagents: { models } } }),
+      );
+      const parentSettings = JSON.stringify({
+        defaultProvider: "parent",
+        defaultModel: "parent-model",
+        defaultThinkingLevel: "medium",
+      });
+      await writeFile(join(agentDir, "settings.json"), parentSettings);
+
+      const handlers = new Map<string, Array<(data: unknown) => void>>();
+      let command:
+        { handler: (args: string, ctx: any) => Promise<void> } | undefined;
+      let component: CustomComponent | undefined;
+      let finishCustom!: () => void;
+      let readyCustom!: () => void;
+      let reloads = 0;
+      const closed = new Promise<void>((resolve) => (finishCustom = resolve));
+      const ready = new Promise<void>((resolve) => (readyCustom = resolve));
+      const pi = {
+        events: {
+          emit(channel: string, data: unknown) {
+            for (const handler of handlers.get(channel) ?? []) handler(data);
+          },
+          on(channel: string, handler: (data: unknown) => void) {
+            const listeners = handlers.get(channel) ?? [];
+            listeners.push(handler);
+            handlers.set(channel, listeners);
+            return () =>
+              handlers.set(
+                channel,
+                listeners.filter((listener) => listener !== handler),
+              );
+          },
+        },
+        registerCommand(
+          name: string,
+          registration: { handler: (args: string, ctx: any) => Promise<void> },
+        ) {
+          if (name === "pi-tools") command = registration;
+        },
+        setThinkingLevel() {
+          assert.fail("worker settings must not change parent thinking");
+        },
+        setModel() {
+          assert.fail("worker settings must not change the parent model");
+        },
+      } as unknown as ExtensionAPI;
+      extension(pi);
+      pi.events.on(SETTINGS_DEFINITION_REQUEST_EVENT, () => {
+        pi.events.emit(SETTINGS_DEFINITION_EVENT, SUBAGENT_SETTINGS);
+      });
+      const parentModel = Object.freeze({
+        provider: "parent",
+        id: "parent-model",
+      });
+      const ctx = {
+        mode: "tui",
+        cwd: join(root, "project"),
+        isProjectTrusted: () => true,
+        model: parentModel,
+        thinkingLevel: "medium",
+        scopedModels: [],
+        modelRegistry: { getAvailable: () => [parentModel] },
+        reload: async () => {
+          reloads += 1;
+        },
+        ui: {
+          notify() {},
+          custom: async (factory: any) => {
+            component = factory(
+              { requestRender() {} },
+              {
+                fg: (_color: string, text: string) => text,
+                bold: (text: string) => text,
+              },
+              {},
+              finishCustom,
+            );
+            readyCustom();
+            return closed;
+          },
+        },
+      };
+      assert.ok(command, "expected the pi-tools command to register");
+      const open = command.handler("", ctx);
+      await ready;
+      assert.ok(component, "expected the settings UI to open");
+      component.handleInput("\u001b[B");
+      component.handleInput("\r");
+      assert.match(visible(component), /Task-worker thinking/);
+      assert.match(visible(component), /Research-job thinking/);
+      for (let index = 0; index < 6; index++) {
+        component.handleInput("\u001b[B");
+      }
+      const waitForThinking = async (kind: string, value: string) => {
+        for (let attempt = 0; attempt < 100; attempt++) {
+          const saved = JSON.parse(
+            await readFile(join(agentDir, CONFIG_FILE_NAME), "utf8"),
+          );
+          if (saved.extensions.subagents.thinking?.[kind] === value) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        assert.fail(`thinking.${kind} did not save ${value}`);
+      };
+      component.handleInput("\r"); // task: inherit -> off
+      await waitForThinking("task", "off");
+      component.handleInput("\u001b[B");
+      for (const value of [
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ]) {
+        component.handleInput("\r");
+        await waitForThinking("research", value);
+      }
+      component.handleInput("\u001b");
+      assert.equal(reloads, 0, "reload waits for settings UI closure");
+      component.handleInput("\u001b");
+      await open;
+
+      assert.equal(reloads, 1);
+      assert.deepEqual(
+        JSON.parse(await readFile(join(agentDir, CONFIG_FILE_NAME), "utf8")),
+        {
+          version: 1,
+          extensions: {
+            subagents: { models, thinking: { task: "off", research: "max" } },
+          },
+        },
+      );
+      assert.equal(
+        await readFile(join(agentDir, "settings.json"), "utf8"),
+        parentSettings,
+      );
+      assert.equal(ctx.model, parentModel);
+      assert.equal(ctx.thinkingLevel, "medium");
     } finally {
       if (originalAgentDir === undefined)
         delete process.env.PI_CODING_AGENT_DIR;

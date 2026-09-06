@@ -93,6 +93,40 @@ export const SUBAGENT_SETTINGS: ExtensionSettingsDefinition = {
       description: 'Choose "inherit" or an available Pi model.',
       selectValues: scopedModelSelectionValues,
     },
+    "thinking.task": {
+      type: "enum",
+      default: "inherit",
+      values: [
+        "inherit",
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ],
+      label: "Task-worker thinking",
+      description:
+        'Thinking for new task sessions. Saved "inherit" uses parent thinking; saved levels override model suffixes. Unset preserves legacy suffixes. Pi clamps to model support.',
+    },
+    "thinking.research": {
+      type: "enum",
+      default: "inherit",
+      values: [
+        "inherit",
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ],
+      label: "Research-job thinking",
+      description:
+        'Thinking for new research sessions. Saved "inherit" uses parent thinking; saved levels override model suffixes. Unset preserves legacy suffixes. Pi clamps to model support.',
+    },
   },
   toolNames: SUBAGENT_TOOL_NAMES,
 };

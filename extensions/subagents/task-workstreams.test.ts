@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +10,8 @@ import type {
 
 type AgentMessage = AgentSession["messages"][number];
 import type { SubagentLaunchPolicy } from "./launch-policy.ts";
+import { settingsRegistry } from "../../lib/pi-tools-config.ts";
+import { SUBAGENT_SETTINGS } from "./settings.ts";
 import {
   CompletionInbox,
   CompletionInboxDelivery,
@@ -622,10 +624,16 @@ test("retains task detail locally and creates one durable inbox handoff per comp
   const entries: Array<{ type: string; data: unknown }> = [];
   const messages: Array<{ content: string; options: unknown }> = [];
   let widget: unknown;
+  let createdSessions = 0;
   const supervisor = new WorkstreamSupervisor({
     cwd: root,
     rootDirectory: join(root, "subagents"),
-    createSession: async () => session as unknown as WorkerSession,
+    createSession: async () =>
+      (++createdSessions === 1
+        ? session
+        : new FakeWorkerSession(
+            join(root, "blocker.jsonl"),
+          )) as unknown as WorkerSession,
     observeGit: async () => ({ branch: "main", commit: "abc123" }),
   });
   const inbox = new CompletionInbox(join(root, "subagents"));
@@ -710,7 +718,44 @@ test("retains task detail locally and creates one durable inbox handoff per comp
       "Choose the smallest compatible design.",
     );
     assert.match(followUp, /existing task context/);
-    await service.followUp({
+    settingsRegistry.register(SUBAGENT_SETTINGS);
+    await mkdir(join(root, ".pi"), { recursive: true });
+    await writeFile(
+      join(root, ".pi", "pi-tools.json"),
+      JSON.stringify({
+        version: 1,
+        extensions: {
+          subagents: {
+            enabled: true,
+            maxConcurrentWorkers: 1,
+            models: { task: "inherit" },
+          },
+        },
+      }),
+    );
+    const followUpContext = {
+      cwd: root,
+      isProjectTrusted: () => true,
+      model: policy.model.model,
+    } as any;
+    const blocker = await supervisor.launch({
+      kind: "research",
+      brief: "Occupy the configured worker slot.",
+      policy: { ...policy, maxConcurrentWorkers: 1 },
+    });
+    await assert.rejects(
+      service.followUp(followUpContext, {
+        workstreamId: workstream.id,
+        focus: "Must not exceed the project limit.",
+      }),
+      /concurrency limit \(1\)/,
+    );
+    assert.equal(
+      (await supervisor.get(workstream.id))?.status,
+      "needs_decision",
+    );
+    await supervisor.cancel(blocker.id);
+    await service.followUp(followUpContext, {
       workstreamId: workstream.id,
       focus: "Choose the smallest compatible design.",
     });

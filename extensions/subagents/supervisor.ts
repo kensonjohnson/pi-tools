@@ -210,6 +210,7 @@ export class WorkstreamSupervisor {
   private readonly completionHandlers: WorkstreamCompletionHandler[] = [];
   private readonly sessions = new Map<string, WorkerSession>();
   private readonly activeWorkstreams = new Set<string>();
+  private readonly reservedWorkstreams = new Set<string>();
   private readonly runs = new Map<string, Promise<void>>();
   private readonly writes = new Set<Promise<unknown>>();
   private readonly queues = new Map<string, Promise<void>>();
@@ -240,63 +241,65 @@ export class WorkstreamSupervisor {
   }
 
   async launch(input: LaunchWorkstreamInput): Promise<WorkstreamManifest> {
-    if (this.runningCount() >= input.policy.maxConcurrentWorkers) {
-      throw new Error(
-        `Subagent concurrency limit (${input.policy.maxConcurrentWorkers}) is reached; no worker was started.`,
-      );
-    }
-
     const id = randomUUID();
-    const workstreamDirectory = join(this.rootDirectory, id);
-    const workerSessionDirectory = join(workstreamDirectory, "session");
-    const now = new Date().toISOString();
-    const manifest: WorkstreamManifest = {
-      version: WORKSTREAM_SCHEMA_VERSION,
-      id,
-      kind: input.kind,
-      status: "starting",
-      brief: input.brief,
-      ...(input.linkedTaskWorkstreamId
-        ? { linkedTaskWorkstreamId: input.linkedTaskWorkstreamId }
-        : {}),
-      createdAt: now,
-      updatedAt: now,
-      workerSessionDirectory,
-      git: await this.observeGit(this.cwd),
-    };
-    await this.createWorkstream(manifest);
-    this.activeWorkstreams.add(id);
-
-    let session: WorkerSession;
+    this.reserveSlot(id, input.policy.maxConcurrentWorkers, "started");
+    let session: WorkerSession | undefined;
     try {
-      session = await this.createSession({
-        cwd: this.cwd,
-        sessionDirectory: workerSessionDirectory,
-        model: input.policy.model,
-        roleContract: roleContractFor(input.kind),
-      });
-    } catch (error) {
-      this.activeWorkstreams.delete(id);
-      return this.transition(
-        manifest.id,
-        "failed",
-        "failed",
-        errorMessage(error),
+      const workstreamDirectory = join(this.rootDirectory, id);
+      const workerSessionDirectory = join(workstreamDirectory, "session");
+      const now = new Date().toISOString();
+      const manifest: WorkstreamManifest = {
+        version: WORKSTREAM_SCHEMA_VERSION,
+        id,
+        kind: input.kind,
+        status: "starting",
+        brief: input.brief,
+        ...(input.linkedTaskWorkstreamId
+          ? { linkedTaskWorkstreamId: input.linkedTaskWorkstreamId }
+          : {}),
+        createdAt: now,
+        updatedAt: now,
+        workerSessionDirectory,
+        git: await this.observeGit(this.cwd),
+      };
+      await this.createWorkstream(manifest);
+
+      try {
+        session = await this.createSession({
+          cwd: this.cwd,
+          sessionDirectory: workerSessionDirectory,
+          model: input.policy.model,
+          roleContract: roleContractFor(input.kind),
+        });
+      } catch (error) {
+        return await this.transition(
+          id,
+          "failed",
+          "failed",
+          errorMessage(error),
+        );
+      }
+
+      this.sessions.set(id, session);
+      session.subscribe((event) => this.handleSessionEvent(id, event));
+      const running = await this.transition(
+        id,
+        "running",
+        "started",
+        undefined,
+        session.sessionFile,
+        { allowedFrom: ["starting"] },
       );
+
+      this.startRun(id, session, input.brief);
+      return running;
+    } catch (error) {
+      this.sessions.delete(id);
+      session?.dispose();
+      throw error;
+    } finally {
+      this.reservedWorkstreams.delete(id);
     }
-
-    this.sessions.set(id, session);
-    session.subscribe((event) => this.handleSessionEvent(id, event));
-    const running = await this.transition(
-      id,
-      "running",
-      "started",
-      undefined,
-      session.sessionFile,
-    );
-
-    this.startRun(id, session, input.brief);
-    return running;
   }
 
   async get(id: string): Promise<WorkstreamManifest | undefined> {
@@ -352,7 +355,11 @@ export class WorkstreamSupervisor {
     });
   }
 
-  async followUp(id: string, prompt: string): Promise<WorkstreamManifest> {
+  async followUp(
+    id: string,
+    prompt: string,
+    maxConcurrentWorkers?: number,
+  ): Promise<WorkstreamManifest> {
     const session = this.sessions.get(id);
     if (!session) {
       throw new Error(
@@ -380,15 +387,27 @@ export class WorkstreamSupervisor {
       return this.requireManifest(id);
     }
 
-    this.activeWorkstreams.add(id);
-    const running = await this.transition(
-      id,
-      "running",
-      "started",
-      "Focused follow-up started.",
-    );
-    this.startRun(id, session, prompt);
-    return running;
+    // Without a limit this is live-only delivery, never permission to restart.
+    if (maxConcurrentWorkers === undefined) {
+      throw new Error(
+        `Task worker '${id}' is not running; no follow-up was sent.`,
+      );
+    }
+    this.reserveSlot(id, maxConcurrentWorkers, "restarted");
+    try {
+      const running = await this.transition(
+        id,
+        "running",
+        "started",
+        "Focused follow-up started.",
+        undefined,
+        { allowedFrom: ["settled", "blocked", "needs_decision", "failed"] },
+      );
+      this.startRun(id, session, prompt);
+      return running;
+    } finally {
+      this.reservedWorkstreams.delete(id);
+    }
   }
 
   async recordDelivery(
@@ -530,40 +549,47 @@ export class WorkstreamSupervisor {
         `Task worker '${id}' is ${manifest.status}; only paused workstreams can resume.`,
       );
     }
-    if (this.runningCount() >= policy.maxConcurrentWorkers) {
-      throw new Error(
-        `Subagent concurrency limit (${policy.maxConcurrentWorkers}) is reached; no worker was resumed.`,
-      );
-    }
-
-    let session = this.sessions.get(id);
-    if (!session) {
-      if (!manifest.workerSessionFile) {
-        throw new Error(
-          `Task worker '${id}' has no persisted worker session to resume.`,
-        );
+    this.reserveSlot(id, policy.maxConcurrentWorkers, "resumed");
+    let restoredSession: WorkerSession | undefined;
+    try {
+      let session = this.sessions.get(id);
+      if (!session) {
+        if (!manifest.workerSessionFile) {
+          throw new Error(
+            `Task worker '${id}' has no persisted worker session to resume.`,
+          );
+        }
+        session = await this.createSession({
+          cwd: this.cwd,
+          sessionDirectory: manifest.workerSessionDirectory,
+          resumeSessionFile: manifest.workerSessionFile,
+          model: policy.model,
+          roleContract: roleContractFor(manifest.kind),
+        });
+        restoredSession = session;
+        this.sessions.set(id, session);
+        session.subscribe((event) => this.handleSessionEvent(id, event));
       }
-      session = await this.createSession({
-        cwd: this.cwd,
-        sessionDirectory: manifest.workerSessionDirectory,
-        resumeSessionFile: manifest.workerSessionFile,
-        model: policy.model,
-        roleContract: roleContractFor(manifest.kind),
-      });
-      this.sessions.set(id, session);
-      session.subscribe((event) => this.handleSessionEvent(id, event));
-    }
 
-    this.activeWorkstreams.add(id);
-    const running = await this.transition(
-      id,
-      "running",
-      "resumed",
-      "Explicit resume started from the persisted worker session.",
-      session.sessionFile,
-    );
-    this.startRun(id, session, buildResumeBrief(running));
-    return running;
+      const running = await this.transition(
+        id,
+        "running",
+        "resumed",
+        "Explicit resume started from the persisted worker session.",
+        session.sessionFile,
+        { allowedFrom: ["paused"] },
+      );
+      this.startRun(id, session, buildResumeBrief(running));
+      return running;
+    } catch (error) {
+      if (restoredSession) {
+        this.sessions.delete(id);
+        restoredSession.dispose();
+      }
+      throw error;
+    } finally {
+      this.reservedWorkstreams.delete(id);
+    }
   }
 
   async recoverInterrupted(): Promise<WorkstreamManifest[]> {
@@ -629,11 +655,35 @@ export class WorkstreamSupervisor {
     await Promise.all([...this.writes]);
   }
 
-  private runningCount(): number {
-    return this.activeWorkstreams.size;
+  private reserveSlot(
+    id: string,
+    maxConcurrentWorkers: number,
+    action: "started" | "resumed" | "restarted",
+  ): void {
+    if (this.reservedWorkstreams.has(id) || this.activeWorkstreams.has(id)) {
+      throw new Error(`Workstream '${id}' is already starting or running.`);
+    }
+    if (
+      !Number.isSafeInteger(maxConcurrentWorkers) ||
+      maxConcurrentWorkers < 1
+    ) {
+      throw new Error("Subagent concurrency limit must be a positive integer.");
+    }
+    // Check and reserve synchronously; Git, disk, and SDK setup must follow.
+    if (
+      this.activeWorkstreams.size + this.reservedWorkstreams.size >=
+      maxConcurrentWorkers
+    ) {
+      throw new Error(
+        `Subagent concurrency limit (${maxConcurrentWorkers}) is reached; no worker was ${action}.`,
+      );
+    }
+    this.reservedWorkstreams.add(id);
   }
 
   private startRun(id: string, session: WorkerSession, prompt: string): void {
+    this.activeWorkstreams.add(id);
+    this.reservedWorkstreams.delete(id);
     const run = Promise.resolve()
       .then(() => session.prompt(prompt))
       .then(() => this.settleIfRunning(id))
