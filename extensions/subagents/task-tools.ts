@@ -120,7 +120,7 @@ export function registerTaskWorkstreamTools(
       const service = getService();
       if (!service) return unavailable();
       try {
-        const workstream = await service.followUp(params);
+        const workstream = await service.followUp(ctx, params);
         await service.refreshWidget(ctx);
         return {
           content: [
