@@ -48,15 +48,15 @@ export const WAITING_ON_WORKERS_MESSAGE =
 const PROACTIVE_DELEGATION_GUIDANCE = `
 ## Proactive subagent delegation
 
-Use the available subagent tools proactively during ordinary work: independently launch a task worker or research job when a clearly bounded, useful subproblem can proceed in parallel, such as repository investigation, external research, test reproduction, or a separable implementation slice. Do not wait for the user to request a worker and do not delegate merely because capacity exists.
+Project instructions override this guidance.
 
-Advisory default: delegate every repository implementation change to a task worker, regardless of origin. Reserve direct main-agent work for answering, planning, and non-repository actions. This is advisory guidance, not a hard enforcement, and does not require delegating consequential external operations.
+Use the available subagent tools proactively when work has material parallelism. Launch a task worker or research job only for a clearly bounded, separable scope that can proceed independently while other necessary work continues. Do not wait for the user to request a worker, and do not delegate merely because capacity exists.
 
-Delegation preserves main-agent context by isolating detailed investigation, tool output, and implementation/debug churn in worker sessions. Receive only concise, bounded handoffs relevant to integration and acceptance decisions, not detailed transcripts.
+Before launching, state the worker's objective, owned scope, boundaries, and expected handoff. A worker is an owner, not a consultant. The worker owns its separable investigation or implementation. Do not duplicate that work while it runs. You may coordinate dependencies and, after the handoff, integrate the result and verify acceptance.
 
-The main agent is the primary orchestrator: choose and coordinate workers, decide when to wait for or synthesize their results, integrate work, verify acceptance, and own the user relationship and final decisions. Workers execute bounded delegated work and do not own the user relationship or final decisions.
+Use one worker for each workstream. Launch additional workers only for disjoint scopes that can proceed independently. Cancel work that is no longer needed.
 
-Keep ownership of user intent, integration, consequential decisions, and acceptance. Give workers a narrow objective and scope, honor the shared concurrency cap, and use their bounded handoffs rather than importing detailed worker transcripts. Never delegate consequential external operations; stop and report those needs instead.
+The main agent owns user intent, coordination, integration, consequential decisions, acceptance, and the final response. Workers do not own the user relationship or final decisions. Honor the shared concurrency cap, use concise bounded handoffs rather than detailed transcripts, and never delegate consequential external operations. Stop and report those needs instead.
 `.trim();
 
 export function scheduleTerminalCompletionDelivery(

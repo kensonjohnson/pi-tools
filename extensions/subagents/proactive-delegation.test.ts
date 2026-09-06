@@ -59,35 +59,22 @@ test("injects proactive delegation guidance only for an enabled trusted main ses
     const systemPrompt =
       (result as { systemPrompt?: string })?.systemPrompt ?? "";
     assert.match(systemPrompt, /Proactive subagent delegation/);
+    assert.match(systemPrompt, /Project instructions override this guidance\./);
+    assert.match(systemPrompt, /work has material parallelism/);
     assert.match(systemPrompt, /Do not wait for the user/);
     assert.match(
       systemPrompt,
-      /Advisory default: delegate every repository implementation change to a task worker, regardless of origin\./,
+      /objective, owned scope, boundaries, and expected handoff/,
     );
+    assert.match(systemPrompt, /A worker is an owner, not a consultant\./);
+    assert.match(systemPrompt, /Do not duplicate that work while it runs\./);
     assert.match(
       systemPrompt,
-      /Reserve direct main-agent work for answering, planning, and non-repository actions\./,
+      /after the handoff, integrate the result and verify acceptance/,
     );
-    assert.match(
-      systemPrompt,
-      /This is advisory guidance, not a hard enforcement/,
-    );
-    assert.match(
-      systemPrompt,
-      /preserves main-agent context by isolating detailed investigation, tool output, and implementation\/debug churn/,
-    );
-    assert.match(
-      systemPrompt,
-      /concise, bounded handoffs relevant to integration and acceptance decisions, not detailed transcripts/,
-    );
-    assert.match(
-      systemPrompt,
-      /The main agent is the primary orchestrator: choose and coordinate workers, decide when to wait for or synthesize their results, integrate work, verify acceptance, and own the user relationship and final decisions\./,
-    );
-    assert.match(
-      systemPrompt,
-      /Workers execute bounded delegated work and do not own the user relationship or final decisions\./,
-    );
+    assert.match(systemPrompt, /Use one worker for each workstream\./);
+    assert.match(systemPrompt, /additional workers only for disjoint scopes/);
+    assert.match(systemPrompt, /Cancel work that is no longer needed\./);
   } finally {
     await handlers.get("session_shutdown")?.({}, ctx);
     await rm(root, { recursive: true, force: true });
