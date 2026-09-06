@@ -120,9 +120,25 @@ export async function resolveSubagentLaunchPolicy(
     SUBAGENTS_EXTENSION_ID,
     modelFieldForWorkstream(kind),
   );
+  const model = resolveSubagentModel(ctx, kind, configuredModel);
+  const thinkingField = `thinking.${kind}`;
+  const configuredThinking = getSettingValue<
+    "inherit" | NonNullable<ResolvedSubagentModel["thinkingLevel"]>
+  >(settings, SUBAGENTS_EXTENSION_ID, thinkingField);
+  const thinkingSource =
+    settings.sources[SUBAGENTS_EXTENSION_ID]?.[thinkingField];
+  // Preserve legacy model suffixes only until a thinking setting is saved.
+  // Explicit "inherit" overrides a suffix just as an explicit level does.
+  const hasThinkingOverride =
+    thinkingSource === "global" || thinkingSource === "project";
+  let thinkingLevel = model.thinkingLevel ?? ctx.thinkingLevel;
+  if (hasThinkingOverride) {
+    thinkingLevel =
+      configuredThinking === "inherit" ? ctx.thinkingLevel : configuredThinking;
+  }
   return {
     maxConcurrentWorkers,
-    model: resolveSubagentModel(ctx, kind, configuredModel),
+    model: { ...model, thinkingLevel },
   };
 }
 

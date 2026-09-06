@@ -74,14 +74,19 @@ async function writeJson(path: string, value: unknown): Promise<void> {
 }
 
 test("registers Subagents settings including an opt-in live output tail", () => {
-  assert.deepEqual(Object.keys(SUBAGENT_SETTINGS.fields), [
-    "enabled",
-    "delegationMode",
-    "maxConcurrentWorkers",
-    "outputTailLines",
-    "models.task",
-    "models.research",
-  ]);
+  assert.deepEqual(
+    Object.keys(SUBAGENT_SETTINGS.fields).sort(),
+    [
+      "enabled",
+      "delegationMode",
+      "maxConcurrentWorkers",
+      "outputTailLines",
+      "models.task",
+      "models.research",
+      "thinking.task",
+      "thinking.research",
+    ].sort(),
+  );
   assert.equal(SUBAGENT_SETTINGS.fields.enabled.default, true);
   assert.equal(SUBAGENT_SETTINGS.fields.delegationMode.default, "proactive");
   assert.equal(SUBAGENT_SETTINGS.fields.maxConcurrentWorkers.default, 2);
@@ -90,6 +95,23 @@ test("registers Subagents settings including an opt-in live output tail", () => 
   assert.equal(SUBAGENT_SETTINGS.fields.outputTailLines.integer, true);
   assert.equal(SUBAGENT_SETTINGS.fields["models.task"].default, "inherit");
   assert.equal(SUBAGENT_SETTINGS.fields["models.research"].default, "inherit");
+  for (const kind of ["task", "research"]) {
+    const field = SUBAGENT_SETTINGS.fields[`thinking.${kind}`];
+    assert.equal(field.default, "inherit");
+    assert.equal(field.type, "enum");
+    if (field.type === "enum") {
+      assert.deepEqual(field.values, [
+        "inherit",
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ]);
+    }
+  }
 });
 
 test("uses scoped Pi models or unscoped available models for worker pickers", () => {
@@ -132,6 +154,118 @@ test("inherits the parent model or resolves an available configured worker model
     () => resolveSubagentModel(ctx, "task", "missing/model"),
     /Configured task worker model 'missing\/model' is unavailable/,
   );
+});
+
+test("resolves independent thinking levels while preserving legacy model suffixes", async () => {
+  await withTemporaryConfig(async ({ cwd, agentDir }) => {
+    const registry = new SettingsRegistry();
+    registry.register(SUBAGENT_SETTINGS);
+    const ctx = { ...modelContext(), cwd, isProjectTrusted: () => true };
+    const cases = [
+      { model: "inherit", thinking: undefined, expected: "high" },
+      { model: "worker/worker-model", thinking: undefined, expected: "high" },
+      {
+        model: "worker/worker-model:max",
+        thinking: undefined,
+        expected: "max",
+      },
+      {
+        model: "worker/worker-model:off",
+        thinking: undefined,
+        expected: "off",
+      },
+      {
+        model: "worker/worker-model:max",
+        thinking: "inherit",
+        expected: "high",
+      },
+      { model: "worker/worker-model:low", thinking: "max", expected: "max" },
+      { model: "inherit", thinking: "max", expected: "max" },
+      ...["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(
+        (thinking) => ({
+          model: "worker/worker-model",
+          thinking,
+          expected: thinking,
+        }),
+      ),
+    ];
+    for (const kind of ["task", "research"] as const) {
+      const otherKind = kind === "task" ? "research" : "task";
+      for (const entry of cases) {
+        await writeJson(join(agentDir, CONFIG_FILE_NAME), {
+          version: 1,
+          extensions: {
+            subagents: {
+              models: { [kind]: entry.model },
+              thinking: { [kind]: entry.thinking },
+            },
+          },
+        });
+        const policy = await resolveSubagentLaunchPolicy(ctx, kind, {
+          registry,
+        });
+        assert.equal(
+          policy.model.thinkingLevel,
+          entry.expected,
+          JSON.stringify({ kind, ...entry }),
+        );
+        assert.equal(
+          policy.model.model,
+          entry.model === "inherit" ? parentModel : configuredModel,
+        );
+        const other = await resolveSubagentLaunchPolicy(ctx, otherKind, {
+          registry,
+        });
+        assert.equal(other.model.thinkingLevel, "high");
+        assert.equal(other.model.model, parentModel);
+        assert.equal(ctx.thinkingLevel, "high");
+        assert.equal(ctx.model, parentModel);
+      }
+    }
+  });
+});
+
+test("applies trusted thinking overrides and rejects invalid setting values through config validation", async () => {
+  await withTemporaryConfig(async ({ cwd, agentDir }) => {
+    const registry = new SettingsRegistry();
+    registry.register(SUBAGENT_SETTINGS);
+    const ctx = { ...modelContext(), cwd, isProjectTrusted: () => true };
+    await writeJson(join(agentDir, CONFIG_FILE_NAME), {
+      version: 1,
+      extensions: {
+        subagents: {
+          models: { task: "worker/worker-model:low" },
+          thinking: { task: "max", research: "off" },
+        },
+      },
+    });
+    for (const value of ["inherit", "medium", "auto", 42]) {
+      await writeJson(join(cwd, ".pi", CONFIG_FILE_NAME), {
+        version: 1,
+        extensions: { subagents: { thinking: { task: value } } },
+      });
+      const policy = await resolveSubagentLaunchPolicy(ctx, "task", {
+        registry,
+      });
+      assert.equal(
+        policy.model.thinkingLevel,
+        value === "inherit" ? "high" : value === "medium" ? "medium" : "max",
+      );
+      assert.equal(
+        (await resolveSubagentLaunchPolicy(ctx, "research", { registry })).model
+          .thinkingLevel,
+        "off",
+      );
+    }
+    await assert.rejects(
+      resolveSubagentLaunchPolicy(
+        { ...ctx, isProjectTrusted: () => false },
+        "task",
+        { registry },
+      ),
+      /trusted project/,
+    );
+  });
 });
 
 test("routes terminal workstream events to completion delivery", async () => {

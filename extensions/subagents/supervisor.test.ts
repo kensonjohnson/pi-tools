@@ -211,6 +211,55 @@ test("starts persistent SDK workstreams with a manifest, journal, and Git observ
   });
 });
 
+test("passes thinking policy to new sessions without changing retained workers on resume", async () => {
+  await withSupervisor(async ({ root }) => {
+    const sessions: FakeWorkerSession[] = [];
+    const received: WorkerSessionFactoryOptions[] = [];
+    const options = {
+      cwd: root,
+      rootDirectory: join(root, "thinking-policy"),
+      observeGit: async () => ({}),
+      createSession: async (input: WorkerSessionFactoryOptions) => {
+        received.push(input);
+        return createFakeSession(input, sessions);
+      },
+    };
+    const supervisor = new WorkstreamSupervisor(options);
+    const maxPolicy: SubagentLaunchPolicy = {
+      ...policy,
+      model: { ...policy.model, thinkingLevel: "max" },
+    };
+    const highPolicy: SubagentLaunchPolicy = {
+      ...policy,
+      model: { ...policy.model, thinkingLevel: "high" },
+    };
+    const workstream = await supervisor.launch({
+      kind: "task",
+      brief: "Use worker thinking.",
+      policy: maxPolicy,
+    });
+    assert.equal(received[0].model.thinkingLevel, "max");
+    await supervisor.pause(workstream.id);
+    await supervisor.waitForSettlement(workstream.id);
+    await supervisor.resume(workstream.id, highPolicy);
+    assert.equal(
+      received.length,
+      1,
+      "Retained sessions keep their original policy.",
+    );
+    await supervisor.shutdown();
+    await supervisor.waitForSettlement(workstream.id);
+
+    const reloaded = new WorkstreamSupervisor(options);
+    await reloaded.resume(workstream.id, highPolicy);
+    assert.equal(received.length, 2);
+    assert.equal(received[1].model.thinkingLevel, "high");
+    assert.ok(received[1].resumeSessionFile);
+    sessions[1].settle();
+    await reloaded.waitForSettlement(workstream.id);
+  });
+});
+
 test("captures bounded thinking and tool lifecycle progress without tool results", async () => {
   await withSupervisor(async ({ supervisor, sessions }) => {
     const workstream = await supervisor.launch({
