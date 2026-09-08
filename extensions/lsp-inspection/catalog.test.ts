@@ -19,6 +19,8 @@ test("catalog is an immutable reviewed TypeScript, Go, and Python allowlist", ()
     assert.equal(Object.isFrozen(descriptor), true);
     assert.equal(Object.isFrozen(descriptor.source), true);
     assert.equal(Object.isFrozen(descriptor.executable.arguments), true);
+    assert.equal(Object.isFrozen(descriptor.healthProbe), true);
+    assert.equal(Object.isFrozen(descriptor.healthProbe.arguments), true);
     assert.match(descriptor.version, /^v?\d+\.\d+\.\d+$/);
     assert.equal(
       Object.keys(descriptor).some((key) => /url|command|path/i.test(key)),
@@ -27,6 +29,12 @@ test("catalog is an immutable reviewed TypeScript, Go, and Python allowlist", ()
   }
 
   const python = getLspCatalogDescriptor("python");
+  assert.deepEqual(python.executable.arguments, ["--stdio"]);
+  assert.equal(
+    python.healthProbe.executableRelativePath,
+    "node_modules/.bin/pyright",
+  );
+  assert.deepEqual(python.healthProbe.arguments, ["--version"]);
   assert.equal(python.version, "1.1.411");
   assert.deepEqual(python.source, {
     kind: "npm",

@@ -62,7 +62,10 @@ export function renderLspDiagnostics(
   const header = renderHeader(result, diagnostics.length);
   if (result.status !== "ok" && result.status !== "partial") {
     return {
-      text: fitText(`${header}\n${renderAvailability(availability)}`, limit),
+      text: fitText(
+        `${header}\n${renderAvailability(availability, result.mode)}`,
+        limit,
+      ),
       details: {
         status: result.status,
         mode: result.mode,
@@ -154,7 +157,9 @@ function renderSuccess(
     sections.push(
       `Partial: ${result.unavailable.join(", ") || "unavailable"} server result${result.unavailable.length === 1 ? " is" : "s are"} unavailable.`,
     );
-    sections.push(renderAvailability(normalizedAvailability(result)));
+    sections.push(
+      renderAvailability(normalizedAvailability(result), result.mode),
+    );
   }
   if (!diagnostics.length && !omitted && result.status === "ok") {
     sections.push("Clean: no diagnostics returned.");
@@ -195,16 +200,20 @@ function normalizedAvailability(
 
 function renderAvailability(
   details: readonly LspInspectionAvailabilityDetail[],
+  mode: LspInspectionResult["mode"],
 ): string {
   return details
     .map((detail) => {
       const subject = detail.catalogId ?? "managed server";
-      return `Availability: ${subject} (${detail.status}): ${detail.message ?? availabilityMessage(detail.status)}`;
+      return `Availability: ${subject} (${detail.status}): ${detail.message ?? availabilityMessage(detail.status, mode)}`;
     })
     .join("\n");
 }
 
-function availabilityMessage(status: LspInspectAvailability): string {
+function availabilityMessage(
+  status: LspInspectAvailability,
+  mode: LspInspectionResult["mode"],
+): string {
   switch (status) {
     case "unconfigured":
       return "No reviewed managed language server is configured for this request.";
@@ -219,7 +228,9 @@ function availabilityMessage(status: LspInspectAvailability): string {
     case "timeout":
       return "The language server request timed out.";
     case "unsupported":
-      return "The language server does not support this diagnostic request.";
+      return mode === "workspace"
+        ? "The language server does not support workspace diagnostics; inspect a specific source file with mode='file' and its root-relative path."
+        : "The language server does not support diagnostics for this file.";
     case "cancelled":
       return "The language server request was cancelled.";
   }

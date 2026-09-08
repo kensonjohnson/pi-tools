@@ -6,7 +6,11 @@ import type {
   WorkspaceDiagnosticReport,
 } from "vscode-languageserver-protocol/node";
 import type { LspCatalogId } from "./catalog.ts";
-import type { LspOutcome, LspRequestOptions } from "./lsp-client.ts";
+import {
+  normalizeFullDiagnosticReport,
+  type LspOutcome,
+  type LspRequestOptions,
+} from "./lsp-client.ts";
 
 export type LspInspectMode = "file" | "workspace";
 export type LspInspectAvailability =
@@ -164,13 +168,17 @@ export class LspDiagnosticInspector implements LspInspectionService {
     );
     if (report.status !== "ok") {
       return unavailable("file", mapClientReason(report.reason), metadata, [
-        { status: mapClientReason(report.reason), catalogId: server.catalogId },
+        {
+          status: mapClientReason(report.reason),
+          catalogId: server.catalogId,
+          message: report.message,
+        },
       ]);
     }
-    const diagnostics =
-      report.value.kind === "full"
-        ? report.value.items
-        : server.client.getDiagnostics(uri);
+    const fullReport = normalizeFullDiagnosticReport(report.value);
+    const diagnostics = fullReport
+      ? fullReport.items
+      : server.client.getDiagnostics(uri);
     return {
       status: "ok",
       mode: "file",
@@ -210,16 +218,17 @@ export class LspDiagnosticInspector implements LspInspectionService {
           normalizeAvailabilityDetail({
             status: mapClientReason(report.reason),
             catalogId: server.catalogId,
+            message: report.message,
           }),
         );
         continue;
       }
       successful += 1;
       for (const item of report.value.items) {
-        const itemDiagnostics =
-          item.kind === "full"
-            ? item.items
-            : server.client.getDiagnostics(item.uri);
+        const fullReport = normalizeFullDiagnosticReport(item);
+        const itemDiagnostics = fullReport
+          ? fullReport.items
+          : server.client.getDiagnostics(item.uri);
         diagnostics.push(
           ...itemDiagnostics.map((diagnostic) => ({
             uri: item.uri,

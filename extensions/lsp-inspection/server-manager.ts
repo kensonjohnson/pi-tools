@@ -38,6 +38,7 @@ export type LspServerManagerOptions = {
   clock?: LspClock;
   requestTimeoutMs?: number;
   pushDiagnosticQuietMs?: number;
+  dynamicRegistrationWaitMs?: number;
 };
 
 type ConnectionRecord = {
@@ -56,12 +57,14 @@ export class LspServerManager {
   #clock: LspClock | undefined;
   #requestTimeoutMs: number | undefined;
   #pushDiagnosticQuietMs: number | undefined;
+  #dynamicRegistrationWaitMs: number | undefined;
 
   constructor(options: LspServerManagerOptions = {}) {
     this.#launcher = options.launcher ?? defaultLauncher;
     this.#clock = options.clock;
     this.#requestTimeoutMs = options.requestTimeoutMs;
     this.#pushDiagnosticQuietMs = options.pushDiagnosticQuietMs;
+    this.#dynamicRegistrationWaitMs = options.dynamicRegistrationWaitMs;
   }
 
   async getOrStart(
@@ -143,6 +146,7 @@ export class LspServerManager {
       requestTimeoutMs: this.#requestTimeoutMs,
       initializationOptions: initializationOptionsFor(request.descriptor),
       pushDiagnosticQuietMs: this.#pushDiagnosticQuietMs,
+      dynamicRegistrationWaitMs: this.#dynamicRegistrationWaitMs,
     });
     const initialized = await client.initialize();
     if (initialized.status !== "ok") {

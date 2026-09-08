@@ -229,6 +229,21 @@ test("integrity, offline, probe, and cancelled failures leave inventory untouche
   });
 });
 
+test("Python probes use the CLI executable instead of the stdio LSP entrypoint", async () => {
+  await withState(async (paths) => {
+    const runner = new FakeRunner();
+    const result = await new ManagedLspProvisioner({ paths, runner }).ensure(
+      "python",
+    );
+    assertAvailable(result, "installed");
+    assert.equal(
+      runner.commands[1]!.command,
+      join(runner.stageDirectories[0]!, "node_modules/.bin/pyright"),
+    );
+    assert.deepEqual(runner.commands[1]!.arguments, ["--version"]);
+  });
+});
+
 test("install command accepts a descriptor only and has no shell expansion", () => {
   const python = getLspCatalogDescriptor("python");
   const command = installCommand(python, "/private/lsp/stage");

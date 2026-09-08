@@ -58,7 +58,7 @@ export function registerLspInspectTool(
     name: "lsp_inspect",
     label: "LSP Inspect",
     description:
-      "Inspect current file contents or explicit workspace diagnostics through reviewed managed language servers.",
+      "Inspect one root-relative source file using its current contents, or request workspace diagnostics only from servers that support them. For Go, use mode='file' with the .go path.",
     parameters: LspInspectParameters,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const runtime = getRuntime();

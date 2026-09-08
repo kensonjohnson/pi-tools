@@ -256,7 +256,7 @@ export class ManagedLspProvisioner {
   ): Promise<{ ok: true } | LspProvisioningResult> {
     try {
       const result = await this.#runner.run({
-        command: executablePath,
+        command: healthProbeExecutablePath(descriptor, executablePath),
         arguments: descriptor.healthProbe.arguments,
         signal,
       });
@@ -445,6 +445,18 @@ function sourceVersion(descriptor: LspCatalogDescriptor): string {
   return descriptor.source.kind === "npm"
     ? descriptor.source.packages[0].version
     : descriptor.source.version;
+}
+
+function healthProbeExecutablePath(
+  descriptor: LspCatalogDescriptor,
+  executablePath: string,
+): string {
+  const relativePath = descriptor.healthProbe.executableRelativePath;
+  let installationRoot = executablePath;
+  for (const _segment of descriptor.executable.relativePath.split("/")) {
+    installationRoot = dirname(installationRoot);
+  }
+  return join(installationRoot, ...relativePath.split("/"));
 }
 
 function containsExpectedVersion(output: string, expected: string): boolean {

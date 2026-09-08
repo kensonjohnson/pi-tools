@@ -27,6 +27,8 @@ export type LspCatalogDescriptor = {
     arguments: readonly string[];
   };
   healthProbe: {
+    /** Immutable catalog-relative executable used only for version probing. */
+    executableRelativePath: string;
     arguments: readonly string[];
     expectedVersion: string;
   };
@@ -59,7 +61,11 @@ const TYPESCRIPT_DESCRIPTOR: LspCatalogDescriptor = {
     relativePath: "node_modules/.bin/typescript-language-server",
     arguments: ["--stdio"],
   },
-  healthProbe: { arguments: ["--version"], expectedVersion: "5.3.0" },
+  healthProbe: {
+    executableRelativePath: "node_modules/.bin/typescript-language-server",
+    arguments: ["--version"],
+    expectedVersion: "5.3.0",
+  },
 };
 
 // Review evidence: https://pkg.go.dev/golang.org/x/tools/gopls@v0.23.0
@@ -74,7 +80,11 @@ const GO_DESCRIPTOR: LspCatalogDescriptor = {
     version: "v0.23.0",
   },
   executable: { relativePath: "bin/gopls", arguments: ["serve"] },
-  healthProbe: { arguments: ["version"], expectedVersion: "v0.23.0" },
+  healthProbe: {
+    executableRelativePath: "bin/gopls",
+    arguments: ["version"],
+    expectedVersion: "v0.23.0",
+  },
 };
 
 // Review evidence: https://www.npmjs.com/package/pyright/v/1.1.411
@@ -91,7 +101,11 @@ const PYTHON_DESCRIPTOR: LspCatalogDescriptor = {
     relativePath: "node_modules/.bin/pyright-langserver",
     arguments: ["--stdio"],
   },
-  healthProbe: { arguments: ["--version"], expectedVersion: "1.1.411" },
+  healthProbe: {
+    executableRelativePath: "node_modules/.bin/pyright",
+    arguments: ["--version"],
+    expectedVersion: "1.1.411",
+  },
 };
 
 /**
