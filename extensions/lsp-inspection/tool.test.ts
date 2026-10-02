@@ -41,8 +41,11 @@ function client(
   options: {
     document?: readonly Diagnostic[];
     workspace?: readonly { uri: string; diagnostics: readonly Diagnostic[] }[];
-    documentReason?: "timeout" | "unsupported";
-    workspaceReason?: "timeout" | "unsupported";
+    emptyWorkspaceKind?: boolean;
+    documentReason?: "timeout" | "unsupported" | "unavailable";
+    documentMessage?: string;
+    workspaceReason?: "timeout" | "unsupported" | "unavailable";
+    workspaceMessage?: string;
   } = {},
 ): LspDiagnosticsClient {
   return {
@@ -51,7 +54,13 @@ function client(
     getDiagnostics: () => [],
     async documentDiagnostics() {
       if (options.documentReason)
-        return { status: "unavailable", reason: options.documentReason };
+        return {
+          status: "unavailable",
+          reason: options.documentReason,
+          ...(options.documentMessage
+            ? { message: options.documentMessage }
+            : {}),
+        };
       return {
         status: "ok",
         value: { kind: "full", items: [...(options.document ?? [])] },
@@ -59,12 +68,19 @@ function client(
     },
     async workspaceDiagnostics() {
       if (options.workspaceReason)
-        return { status: "unavailable", reason: options.workspaceReason };
+        return {
+          status: "unavailable",
+          reason: options.workspaceReason,
+          ...(options.workspaceMessage
+            ? { message: options.workspaceMessage }
+            : {}),
+        };
       return {
         status: "ok",
         value: {
           items: (options.workspace ?? []).map((entry) => ({
-            kind: "full" as const,
+            // gopls v0.23 can send its zero-value full-report enum as "".
+            kind: (options.emptyWorkspaceKind ? "" : "full") as "full",
             uri: entry.uri,
             version: null,
             items: [...entry.diagnostics],
@@ -270,6 +286,33 @@ test("workspace results are partial when a server is unavailable and unsupported
   assert.equal(unsupported.status, "unsupported");
 });
 
+test("empty-kind workspace reports render their diagnostics", async () => {
+  const available = client({
+    emptyWorkspaceKind: true,
+    workspace: [{ uri, diagnostics: [diagnostic(4, "workspace rangeint")] }],
+  });
+  const inspector = new LspDiagnosticInspector(
+    resolver({
+      async resolveWorkspace() {
+        return [
+          {
+            status: "ok",
+            server: { catalogId: "typescript", client: available },
+          },
+        ];
+      },
+    }),
+  );
+
+  const result = await inspector.inspect(root, { mode: "workspace" });
+  assert.equal(result.status, "ok");
+  if (result.status !== "ok") return;
+  assert.deepEqual(
+    result.diagnostics.map(({ diagnostic }) => diagnostic.message),
+    ["workspace rangeint"],
+  );
+});
+
 test("availability details preserve catalog-specific provisioning failures for file and partial workspace reports", async () => {
   const repeatedFailure =
     "npm install could not reach the reviewed registry. ".repeat(30);
@@ -345,6 +388,44 @@ test("availability details preserve catalog-specific provisioning failures for f
   ]);
 });
 
+test("server response details are reported with the inspection availability limit", async () => {
+  const message = "no package metadata for file source.go. ".repeat(30);
+  const unavailableClient = client({
+    documentReason: "unavailable",
+    documentMessage: message,
+  });
+  const inspector = new LspDiagnosticInspector(
+    resolver({
+      async resolveFile() {
+        return {
+          status: "ok",
+          server: { catalogId: "go", client: unavailableClient },
+        };
+      },
+    }),
+  );
+
+  const result = await inspector.inspect(root, {
+    mode: "file",
+    path: "source.go",
+    contents: "package source\n",
+  });
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.availability?.[0]?.catalogId, "go");
+  assert.ok(
+    Buffer.byteLength(result.availability?.[0]?.message ?? "", "utf8") <=
+      MAX_LSP_AVAILABILITY_MESSAGE_BYTES,
+  );
+  assert.match(
+    renderLspDiagnostics(result, {
+      rootPath: root,
+      maxCount: 10,
+      maxBytes: 4_096,
+    }).text,
+    /Availability: go \(unavailable\): no package metadata for file source\.go\./,
+  );
+});
+
 test("availability states never render as a clean report", () => {
   for (const status of [
     "unconfigured",
@@ -367,7 +448,25 @@ test("availability states never render as a clean report", () => {
     );
     assert.match(rendered.text, new RegExp(`: ${status};`));
     assert.doesNotMatch(rendered.text, /Clean: no diagnostics returned/);
+    if (status === "unsupported") {
+      assert.match(rendered.text, /does not support diagnostics for this file/);
+    }
   }
+});
+
+test("unsupported diagnostics explain the requested mode", () => {
+  const workspace = renderLspDiagnostics(
+    {
+      status: "unsupported",
+      mode: "workspace",
+      diagnostics: [],
+      metadata: { freshness: "workspace-pull", servers: [] },
+      unavailable: ["unsupported"],
+    },
+    { rootPath: root, maxCount: 10, maxBytes: 4_096 },
+  );
+  assert.match(workspace.text, /does not support workspace diagnostics/);
+  assert.match(workspace.text, /mode='file'/);
 });
 
 test("registered tool reads root-contained current file contents before inspection", async () => {

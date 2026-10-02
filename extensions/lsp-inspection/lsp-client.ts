@@ -5,6 +5,7 @@ import {
   CancellationTokenSource,
   createProtocolConnection,
   DidChangeTextDocumentNotification,
+  DidCloseTextDocumentNotification,
   DidOpenTextDocumentNotification,
   DocumentDiagnosticRequest,
   ExitNotification,
@@ -16,8 +17,10 @@ import {
   UnregistrationRequest,
   DiagnosticRefreshRequest,
   WorkspaceDiagnosticRequest,
+  ResponseError,
   type Diagnostic,
   type DocumentDiagnosticReport,
+  type FullDocumentDiagnosticReport,
   type InitializeResult,
   type ProtocolConnection,
   type WorkspaceDiagnosticReport,
@@ -35,7 +38,12 @@ export type LspAvailabilityReason =
 
 export type LspOutcome<T> =
   | { status: "ok"; value: T }
-  | { status: "unavailable"; reason: LspAvailabilityReason };
+  | {
+      status: "unavailable";
+      reason: LspAvailabilityReason;
+      /** Server response detail, bounded when exposed by inspection. */
+      message?: string;
+    };
 
 export type LspClientState = "starting" | "ready" | "broken" | "closed";
 
@@ -76,6 +84,8 @@ export type LspClientOptions = {
   initializationOptions?: Record<string, unknown>;
   /** Debounce period after a push update before exposing it as fresh. */
   pushDiagnosticQuietMs?: number;
+  /** Maximum wait for a server's dynamic diagnostic registration. */
+  dynamicRegistrationWaitMs?: number;
 };
 
 type PushDiagnosticRecord = {
@@ -93,6 +103,38 @@ const SYSTEM_CLOCK: LspClock = {
 // didChange, then adds its own 50ms publication debounce. Keep listening past
 // that window so a delayed old-content result cannot be returned as current.
 const DEFAULT_PUSH_DIAGNOSTIC_QUIET_MS = 900;
+const DEFAULT_DYNAMIC_REGISTRATION_WAIT_MS = 250;
+
+type DiagnosticReportLike = {
+  kind?: unknown;
+  items?: unknown;
+  resultId?: unknown;
+};
+
+/**
+ * gopls v0.23 serializes its zero-value full-report enum as an empty string.
+ * Treat only that form, or an omitted kind, with an items array as a full report.
+ */
+export function normalizeFullDiagnosticReport<T extends DiagnosticReportLike>(
+  report: T,
+): (T & FullDocumentDiagnosticReport) | undefined {
+  if (
+    (report.kind !== "full" &&
+      report.kind !== "" &&
+      report.kind !== undefined) ||
+    !Array.isArray(report.items)
+  ) {
+    return undefined;
+  }
+  return {
+    ...report,
+    kind: "full",
+    items: report.items,
+    ...(typeof report.resultId === "string"
+      ? { resultId: report.resultId }
+      : {}),
+  } as T & FullDocumentDiagnosticReport;
+}
 
 /** Spawns a stdio server without a shell and consumes launch errors immediately. */
 export function launchLspServer(
@@ -127,13 +169,17 @@ export class LspClient {
   #diagnosticRefreshGeneration = 0;
   #dynamicDocumentDiagnosticRegistrations = new Set<string>();
   #dynamicWorkspaceDiagnosticRegistrations = new Set<string>();
+  #dynamicRegistrationWaiters = new Set<() => void>();
   #pushDiagnostics = new Map<string, PushDiagnosticRecord>();
   #pushDiagnosticWaiters = new Set<() => void>();
   #pushDiagnosticGeneration = 0;
+  #documentDiagnosticQueue: Promise<void> = Promise.resolve();
+  #documentDiagnosticWaiters = new Set<() => void>();
   #clock: LspClock;
   #requestTimeoutMs: number;
   #initializationOptions: Record<string, unknown> | undefined;
   #pushDiagnosticQuietMs: number;
+  #dynamicRegistrationWaitMs: number;
   #closing = false;
 
   constructor(options: LspClientOptions) {
@@ -144,6 +190,8 @@ export class LspClient {
     this.#initializationOptions = options.initializationOptions;
     this.#pushDiagnosticQuietMs =
       options.pushDiagnosticQuietMs ?? DEFAULT_PUSH_DIAGNOSTIC_QUIET_MS;
+    this.#dynamicRegistrationWaitMs =
+      options.dynamicRegistrationWaitMs ?? DEFAULT_DYNAMIC_REGISTRATION_WAIT_MS;
 
     this.process.on("error", () => this.#markBroken());
     this.process.once("exit", () => {
@@ -219,6 +267,7 @@ export class LspClient {
           this.#dynamicWorkspaceDiagnosticRegistrations.delete(registration.id);
         }
       }
+      for (const wake of this.#dynamicRegistrationWaiters) wake();
     });
     connection.onRequest(UnregistrationRequest.type, (params) => {
       for (const registration of params.unregisterations) {
@@ -229,8 +278,8 @@ export class LspClient {
       }
     });
     connection.onRequest(DiagnosticRefreshRequest.type, () => {
-      // A refresh invalidates all pull result ids. The next request must not be
-      // allowed to receive an unchanged response for a now-stale result.
+      // A refresh invalidates all pull result ids. The next request must not
+      // receive an unchanged response for a now-stale result.
       this.#diagnosticRefreshGeneration += 1;
       this.#documentResultIds.clear();
     });
@@ -329,43 +378,121 @@ export class LspClient {
     document: LspDocument,
     options: LspRequestOptions = {},
   ): Promise<LspOutcome<DocumentDiagnosticReport>> {
-    // Record the push generation before didOpen/didChange so an old cached
-    // notification can never be mistaken for diagnostics of these contents.
-    const pushGeneration = this.#pushDiagnosticGeneration;
-    const synchronized = await this.synchronizeDocument(document);
-    if (synchronized.status !== "ok") return synchronized;
-
-    if (!this.supportsDocumentDiagnostics) {
-      const pushed = await this.#waitForFreshPushDiagnostics(
+    if (this.#closing || this.#state === "closed") {
+      return unavailable("closed");
+    }
+    const controller = new AbortController();
+    let timedOut = false;
+    const abort = () => controller.abort();
+    options.signal?.addEventListener("abort", abort, { once: true });
+    if (options.signal?.aborted) abort();
+    const timeoutMs = options.timeoutMs;
+    const timeout =
+      timeoutMs !== undefined && Number.isFinite(timeoutMs) && timeoutMs >= 0
+        ? this.#clock.setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+          }, timeoutMs)
+        : undefined;
+    const requestOptions = { ...options, signal: controller.signal };
+    const previous = this.#documentDiagnosticQueue;
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.#documentDiagnosticQueue = previous.then(() => current);
+    try {
+      const turn = await this.#waitForDocumentDiagnosticTurn(
+        previous,
+        requestOptions,
+      );
+      if (turn.status !== "ok") {
+        return timedOut ? unavailable("timeout") : turn;
+      }
+      if (this.#closing || this.#state === "closed") {
+        return unavailable("closed");
+      }
+      const result = await this.#runDocumentDiagnostics(
         document,
-        pushGeneration,
+        requestOptions,
+      );
+      return timedOut &&
+        result.status === "unavailable" &&
+        result.reason === "cancelled"
+        ? unavailable("timeout")
+        : result;
+    } finally {
+      release();
+      if (timeout !== undefined) this.#clock.clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", abort);
+    }
+  }
+
+  async #runDocumentDiagnostics(
+    document: LspDocument,
+    options: LspRequestOptions,
+  ): Promise<LspOutcome<DocumentDiagnosticReport>> {
+    // Record the push generation immediately before synchronization so an old
+    // cached notification can never be mistaken for diagnostics of these
+    // contents. The whole synchronization/request transaction is queued per
+    // client because gopls can return empty results when those operations
+    // overlap across files. Release the document before the next queued turn
+    // opens another transient file.
+    const pushGeneration = this.#pushDiagnosticGeneration;
+    let synchronized = false;
+    try {
+      const synchronizedResult = await this.synchronizeDocument(document);
+      if (synchronizedResult.status !== "ok") return synchronizedResult;
+      synchronized = true;
+      if (this.#closing || this.#state === "closed") {
+        return unavailable("closed");
+      }
+
+      if (!this.supportsDocumentDiagnostics) {
+        const registration = await this.#waitForDynamicCapability(
+          () => this.supportsDocumentDiagnostics,
+          options,
+        );
+        if (registration.status !== "ok") return registration;
+      }
+
+      if (!this.supportsDocumentDiagnostics) {
+        const pushed = await this.#waitForFreshPushDiagnostics(
+          document,
+          pushGeneration,
+          options,
+        );
+        if (pushed.status !== "ok") return pushed;
+        return {
+          status: "ok",
+          value: { kind: "full", items: [...pushed.value] },
+        };
+      }
+
+      const refreshGeneration = this.#diagnosticRefreshGeneration;
+      const result = await this.#request<DocumentDiagnosticReport>(
+        DocumentDiagnosticRequest.type,
+        {
+          textDocument: { uri: document.uri },
+          previousResultId: this.#documentResultIds.get(document.uri),
+        },
         options,
       );
-      if (pushed.status !== "ok") return pushed;
-      return {
-        status: "ok",
-        value: { kind: "full", items: [...pushed.value] },
-      };
+      if (result.status !== "ok") return result;
+      const report = normalizeFullDiagnosticReport(result.value);
+      if (refreshGeneration === this.#diagnosticRefreshGeneration) {
+        if (report) {
+          if (report.resultId) {
+            this.#documentResultIds.set(document.uri, report.resultId);
+          }
+        } else {
+          this.#documentResultIds.set(document.uri, result.value.resultId);
+        }
+      }
+      return report ? { status: "ok", value: report } : result;
+    } finally {
+      if (synchronized) await this.#closeDocument(document);
     }
-
-    const refreshGeneration = this.#diagnosticRefreshGeneration;
-    const result = await this.#request<DocumentDiagnosticReport>(
-      DocumentDiagnosticRequest.type,
-      {
-        textDocument: { uri: document.uri },
-        previousResultId: this.#documentResultIds.get(document.uri),
-      },
-      options,
-    );
-    if (
-      result.status === "ok" &&
-      result.value.kind === "full" &&
-      result.value.resultId &&
-      refreshGeneration === this.#diagnosticRefreshGeneration
-    ) {
-      this.#documentResultIds.set(document.uri, result.value.resultId);
-    }
-    return result;
   }
 
   async workspaceDiagnostics(
@@ -373,17 +500,30 @@ export class LspClient {
   ): Promise<LspOutcome<WorkspaceDiagnosticReport>> {
     const ready = this.#ready();
     if (ready) return ready;
+    const registration = await this.#waitForDynamicCapability(
+      () => this.supportsWorkspaceDiagnostics,
+      options,
+    );
+    if (registration.status !== "ok") return registration;
     if (!this.supportsWorkspaceDiagnostics) return unavailable("unsupported");
-    return this.#request<WorkspaceDiagnosticReport>(
+    const result = await this.#request<WorkspaceDiagnosticReport>(
       WorkspaceDiagnosticRequest.type,
       { previousResultIds: [] },
       options,
     );
+    if (result.status !== "ok") return result;
+    const items = result.value.items.map(
+      (item) => normalizeFullDiagnosticReport(item) ?? item,
+    );
+    return { status: "ok", value: { ...result.value, items } };
   }
 
   async close(): Promise<void> {
     if (this.#state === "closed") return;
     this.#closing = true;
+    for (const wake of this.#documentDiagnosticWaiters) wake();
+    for (const wake of this.#dynamicRegistrationWaiters) wake();
+    for (const wake of this.#pushDiagnosticWaiters) wake();
     try {
       if (this.#state === "ready" && this.#connection) {
         await this.#request<void>(ShutdownRequest.type, undefined, {
@@ -396,6 +536,8 @@ export class LspClient {
     } finally {
       this.#connection?.end();
       this.#connection?.dispose();
+      this.#documents.clear();
+      this.#documentResultIds.clear();
       this.#state = "closed";
       try {
         this.process.kill();
@@ -406,8 +548,114 @@ export class LspClient {
   }
 
   #ready(): LspOutcome<never> | undefined {
-    if (this.#state === "ready") return undefined;
-    return unavailable(this.#state === "closed" ? "closed" : "broken");
+    if (this.#state === "ready" && !this.#closing) return undefined;
+    return unavailable(
+      this.#state === "closed" || this.#closing ? "closed" : "broken",
+    );
+  }
+
+  async #closeDocument(document: LspDocument): Promise<void> {
+    const current = this.#documents.get(document.uri);
+    if (!current || current.version !== document.version) return;
+    try {
+      if (!this.#closing && this.#state === "ready" && this.#connection) {
+        await this.#connection.sendNotification(
+          DidCloseTextDocumentNotification.type,
+          { textDocument: { uri: document.uri } },
+        );
+      }
+    } catch {
+      this.#markBroken();
+    } finally {
+      const stillCurrent = this.#documents.get(document.uri);
+      if (stillCurrent?.version === document.version) {
+        this.#documents.delete(document.uri);
+        // A result id belongs to the open document transaction.
+        this.#documentResultIds.delete(document.uri);
+      }
+    }
+  }
+
+  #waitForDocumentDiagnosticTurn(
+    previous: Promise<void>,
+    options: LspRequestOptions,
+  ): Promise<LspOutcome<undefined>> {
+    if (this.#closing || this.#state === "closed") {
+      return Promise.resolve(unavailable("closed"));
+    }
+    if (options.signal?.aborted) {
+      return Promise.resolve(unavailable("cancelled"));
+    }
+    return new Promise<LspOutcome<undefined>>((resolve) => {
+      let settled = false;
+      let abortListener: (() => void) | undefined;
+      const observeClose = () => finish(unavailable("closed"));
+      const finish = (result: LspOutcome<undefined>) => {
+        if (settled) return;
+        settled = true;
+        if (abortListener)
+          options.signal?.removeEventListener("abort", abortListener);
+        this.#documentDiagnosticWaiters.delete(observeClose);
+        resolve(result);
+      };
+      const observeReady = () => finish({ status: "ok", value: undefined });
+      abortListener = () => finish(unavailable("cancelled"));
+      options.signal?.addEventListener("abort", abortListener, { once: true });
+      this.#documentDiagnosticWaiters.add(observeClose);
+      void previous.then(observeReady, observeReady);
+    });
+  }
+
+  async #waitForDynamicCapability(
+    supports: () => boolean,
+    options: LspRequestOptions,
+  ): Promise<LspOutcome<undefined>> {
+    if (supports()) return { status: "ok", value: undefined };
+    if (options.signal?.aborted) return unavailable("cancelled");
+
+    const requestedWaitMs = options.timeoutMs;
+    const waitMs =
+      Number.isFinite(requestedWaitMs) && requestedWaitMs !== undefined
+        ? Math.min(
+            Math.max(requestedWaitMs, 0),
+            this.#dynamicRegistrationWaitMs,
+          )
+        : this.#dynamicRegistrationWaitMs;
+    return new Promise<LspOutcome<undefined>>((resolve) => {
+      let settled = false;
+      let timer: unknown;
+      let abortListener: (() => void) | undefined;
+      const observe = () => {
+        if (this.#closing || this.#state === "closed") {
+          finish(unavailable("closed"));
+          return;
+        }
+        if (this.#state === "broken") {
+          finish(unavailable("broken"));
+          return;
+        }
+        if (supports()) finish({ status: "ok", value: undefined });
+      };
+      const finish = (result: LspOutcome<undefined>) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) this.#clock.clearTimeout(timer);
+        if (abortListener)
+          options.signal?.removeEventListener("abort", abortListener);
+        this.#dynamicRegistrationWaiters.delete(observe);
+        resolve(result);
+      };
+      abortListener = () => finish(unavailable("cancelled"));
+      options.signal?.addEventListener("abort", abortListener, { once: true });
+      this.#dynamicRegistrationWaiters.add(observe);
+      observe();
+      if (!settled) {
+        timer = this.#clock.setTimeout(
+          () => finish({ status: "ok", value: undefined }),
+          waitMs,
+        );
+      }
+    });
   }
 
   async #waitForFreshPushDiagnostics(
@@ -433,6 +681,14 @@ export class LspClient {
         resolve(result);
       };
       const observe = () => {
+        if (this.#closing || this.#state === "closed") {
+          finish(unavailable("closed"));
+          return;
+        }
+        if (this.#state === "broken") {
+          finish(unavailable("broken"));
+          return;
+        }
         const record = this.#pushDiagnostics.get(document.uri);
         if (
           !record ||
@@ -475,11 +731,13 @@ export class LspClient {
     const request = this.#connection
       .sendRequest(type as never, params as never, cancellation.token)
       .then((value) => ({ status: "ok", value: value as T }) as LspOutcome<T>)
-      .catch(() => {
-        if (!cancelledByClient) this.#markBroken();
-        return unavailable(
-          cancelledByClient ? "cancelled" : "broken",
-        ) as LspOutcome<T>;
+      .catch((error: unknown) => {
+        if (cancelledByClient) return unavailable("cancelled") as LspOutcome<T>;
+        if (error instanceof ResponseError) {
+          return unavailable("unavailable", error.message) as LspOutcome<T>;
+        }
+        this.#markBroken();
+        return unavailable("broken") as LspOutcome<T>;
       });
 
     return new Promise<LspOutcome<T>>((resolve) => {
@@ -512,7 +770,10 @@ export class LspClient {
   }
 
   #markBroken(): void {
-    if (!this.#closing && this.#state !== "closed") this.#state = "broken";
+    if (this.#closing || this.#state === "closed") return;
+    this.#state = "broken";
+    for (const wake of this.#dynamicRegistrationWaiters) wake();
+    for (const wake of this.#pushDiagnosticWaiters) wake();
   }
 }
 
@@ -525,6 +786,9 @@ function registrationProvidesWorkspaceDiagnostics(value: unknown): boolean {
   );
 }
 
-function unavailable(reason: LspAvailabilityReason): LspOutcome<never> {
-  return { status: "unavailable", reason };
+function unavailable(
+  reason: LspAvailabilityReason,
+  message?: string,
+): LspOutcome<never> {
+  return { status: "unavailable", reason, ...(message ? { message } : {}) };
 }
