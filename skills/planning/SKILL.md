@@ -1,11 +1,11 @@
 ---
 name: planning
-description: Plan and carry multi-session work from either an unclear initiative or a settled goal through detailed, dependency-linked Markdown tickets and focused execution. Use for features, refactors, migrations, and architectural changes that need scope control or coordination across sessions.
+description: Plan and carry multi-session work from either an unclear initiative or a settled goal through detailed, dependency-linked tickets in the project's configured store and focused execution. Use for features, refactors, migrations, and architectural changes that need scope control or coordination across sessions.
 ---
 
 # Planning
 
-Planning is the durable system for work that cannot be safely completed from a short conversation. It replaces phase-based feature planning with an initiative map and dependency-linked Markdown tickets.
+Planning is the durable system for work that cannot be safely completed from a short conversation. It replaces phase-based feature planning with an initiative map and dependency-linked tickets. The workflow is independent of the ticket store.
 
 A ticket is the unit of thought and execution. It gives every discovered item an explicit home, so it cannot disappear into chat history, a vague phase, or session notes.
 
@@ -15,7 +15,7 @@ Planning includes implementation detail. For an unclear initiative, it first res
 
 - **Initiative**: one bounded body of work with a destination.
 - **Map**: low-resolution index for an initiative: destination, scope, fog, ticket links, decisions, and frontier.
-- **Ticket**: one durable Markdown file that owns a question, research task, prototype, unblocking task, or independently verifiable implementation slice.
+- **Ticket**: one durable record with a stable identifier that owns a question, research task, prototype, unblocking task, or independently verifiable implementation slice.
 - **Fog**: an in-scope area that is not yet precise enough to become a ticket.
 - **Frontier**: open, unclaimed tickets whose blockers are complete. This is the only pool from which work should normally be taken.
 - **Dependency**: a real prerequisite, not merely a preferred ordering.
@@ -30,34 +30,28 @@ Keep work types distinct:
 
 Do not use tickets as renamed horizontal phases. Prefer a narrow vertical slice that produces observable behaviour. A broad mechanical refactor is an exception: use expand → migrate in green batches → contract.
 
-## Storage
+## Ticket store
 
-Planning artifacts are repository-local working files, not committed documentation:
+Before planning, read [Ticket store configuration and contract](references/ticket-store.md). Resolve the project's Planning section in its applicable `AGENTS.md` instructions, then read the configured store before creating or changing planning records.
 
-```text
-tmp/planning/<initiative-slug>/
-├── map.md
-└── tickets/
-    ├── 01-<slug>.md
-    ├── 02-<slug>.md
-    └── ...
-```
+- Use the configured store as the single authority for initiative maps and tickets.
+- Default to local Markdown only when no store is configured. Never silently fall back when an explicitly configured store is unavailable or incomplete.
+- Discover available tools and storage capabilities; follow the integration's own safety instructions. Do not invent identifiers, tool names, fields, or relations.
+- Keep the logical model below unchanged across stores. Map its fields and sections to supported capabilities or explicit structured text, and record necessary mappings in project configuration.
 
-Use zero-padded sequential numbers. Numbers are stable identifiers; refer to tickets by their linked title in prose. Do not reuse a number.
-
-Before creating a new initiative, check `tmp/planning/*/map.md`:
+Before creating a new initiative, inspect active initiatives in the selected destination:
 
 - If one active map matches the work, resume it.
 - If several active maps exist and the request does not identify one, show them and ask which to use.
 - If no map applies, create one only after the destination and initial frontier are understood.
 
-The map is the navigational index. A ticket is canonical for its own detail, status, resolution, and progress. Never duplicate a resolution in full on the map; link and summarize it in one line.
+The map is the navigational index. A ticket is canonical for its own detail, status, resolution, and progress. Never duplicate a resolution in full on the map; link and summarize it in one line. Derive ready, blocked, and active work from canonical ticket state and dependencies, not independently maintained duplicate records.
 
-These files are the working record only while an initiative is active. Git commits are the durable record of completed implementation. Create or update committed ADRs, release notes, or other documentation only when the user asks to preserve a high-level decision or lesson; never commit the ticket archive by default.
+Git commits are the durable record of completed code changes; planning records preserve the work's decisions and progress in their selected store. Create or update committed ADRs, release notes, or other documentation only when the user asks to preserve a high-level decision or lesson. Do not commit local planning archives by default.
 
 ## Ticket format
 
-Every ticket has this frontmatter and the sections appropriate to its type:
+Every ticket preserves these logical fields and the sections appropriate to its type. The following is the local Markdown representation. For another store, use its configured mapping; literal frontmatter is not required:
 
 ```markdown
 ---
@@ -100,12 +94,14 @@ Rules:
 
 - `status: open` can be on the frontier or blocked; derive blocked state from `blocked_by` rather than maintaining a second status.
 - A blocker is complete when its decision/research/prototype is `resolved`, or its task/implementation ticket is `done`.
-- Set `status: active` before beginning substantive work. This is the claim and prevents concurrent sessions taking the same ticket.
+- Verify current state and blockers, then set `status: active` before beginning substantive work. This records the claim so other sessions can see it; use atomic or conditional claiming when supported.
 - A decision, research, or prototype ticket is `resolved`; task and implementation tickets are `done` only after their acceptance criteria and verification are complete.
 - A cancelled ticket must state why in `## Resolution`, then be recorded under map out-of-scope or superseded work.
 - Keep progress entries short. The current ticket's `## Progress` replaces a separate per-session log.
 
 ## Map format
+
+The initiative map preserves the following information. The example uses local relative links; use canonical record links or identifiers in other stores. Lists and the ticket index may be derived from store queries rather than copied into a separate document.
 
 ```markdown
 # <Initiative title>
@@ -151,11 +147,11 @@ Rules:
 | [Ticket title](tickets/01-example.md) | decision | open   | —          |
 ```
 
-Update the map whenever a ticket is created, claimed, resolved/completed, cancelled, or unblocked. The Ticket index provides complete coverage; Frontier, Blocked, and Active are the concise operational view.
+Refresh the map's operational view whenever a ticket is created, claimed, resolved/completed, cancelled, or unblocked. The Ticket index provides complete coverage; Frontier, Blocked, and Active are the concise operational view. Persist map-owned information in the selected store and refresh any stored summaries from canonical tickets.
 
 ## Start an initiative
 
-Use this for any work expected to span sessions or that benefits from explicit scope, dependencies, and tickets. Select the entry mode from the state of the work; both modes produce the same map and ticket graph.
+Use this for any work expected to span sessions or that benefits from explicit scope, dependencies, and tickets. Resolve the ticket store first. Select the entry mode from the state of the work; both modes produce the same map and ticket graph in that store.
 
 ### Discovery mode: route is unclear
 
@@ -163,7 +159,7 @@ Use this for any work expected to span sessions or that benefits from explicit s
 2. **Explore known facts.** Read relevant code and docs. Research facts rather than asking the user for information the repository or authoritative sources can answer.
 3. **Map breadth before depth.** Surface the major decision areas, constraints, investigations, and likely implementation seams. Do not produce a phase plan yet.
 4. **Classify each discovered item.** Create a ticket only when its objective/question can be stated precisely now. Record the rest under Not yet specified; it is fog, not an incomplete ticket.
-5. **Create and wire tickets.** Write all initial ticket files, then add `blocked_by` edges after their numbers are known. Tickets with no unfinished blockers are the initial frontier.
+5. **Create and wire tickets.** Create all initial ticket records in the selected store, then add `blocked_by` edges after their stable identifiers are known. Read back records and links to verify successful creation. Tickets with no unfinished blockers are the initial frontier.
 6. **Handoff from discovery.** Present the map, frontier, and any remaining fog. When enough uncertainty is resolved to draft concrete implementation slices, explicitly say that discovery is complete for the next slice and ask to begin delivery planning; if the user has already authorized that next stage, proceed. Do not silently begin resolving a discovery ticket in the same charting pass.
 
 ### Delivery-planning mode: route is clear
@@ -184,7 +180,7 @@ For a small but explicitly planned effort, create one implementation ticket rath
 
 ## Work an existing initiative
 
-1. Read `map.md`, then the selected active or frontier ticket. Load other ticket detail only when it affects this ticket.
+1. Resolve the configured store and read the initiative map, then the selected active or frontier ticket. Load other ticket detail only when it affects this ticket.
 2. If no ticket was named, select the first frontier ticket in map order. Tell the user which ticket is being taken.
 3. Claim it by setting `status: active` before substantive work.
 4. Resolve or complete exactly one non-research ticket per session unless the user explicitly requests otherwise. Research may run in parallel only when subagents are available; otherwise treat it as a normal AFK ticket.
@@ -212,9 +208,11 @@ Implementation tickets can be grouped with optional `phase` metadata for readabi
 When a repository has `tmp/SESSION_CONTEXT.md`, `docs/SESSION_CONTEXT.md`, or a feature plan from the prior workflow:
 
 1. Read it; do not overwrite or discard it.
-2. With the user's approval, create an initiative map under `tmp/planning/` and convert each still-relevant phase or task into dependency-linked implementation tickets.
+2. With the user's approval, create an initiative map in the selected store and convert each still-relevant phase or task into dependency-linked implementation tickets.
 3. Preserve important decisions, constraints, verification commands, and incomplete work in the relevant tickets.
-4. Mark the old working plan as superseded with a link to the map. Do not maintain both systems as live sources of truth.
+4. Verify the destination records, then mark the old working plan as superseded with a link to the map. Do not maintain both systems as live sources of truth.
+
+Changing ticket stores also requires user approval. Follow the migration rules in [Ticket store configuration and contract](references/ticket-store.md); changing configuration alone does not migrate existing work.
 
 ## Guardrails
 
@@ -223,4 +221,6 @@ When a repository has `tmp/SESSION_CONTEXT.md`, `docs/SESSION_CONTEXT.md`, or a 
 - Do not create a ticket merely because work is anticipated. Precision, not certainty, is the threshold.
 - Do not implement work blocked by an unresolved decision without explicit user direction.
 - Do not add unrelated fixes to the current ticket; create a ticket or record it as fog/out of scope.
-- Update the Markdown artifacts as work changes. Chat history is never the system of record.
+- Update canonical planning records in the selected store as work changes. Chat history is never the system of record.
+- Keep store configuration and necessary field mappings in project instructions, not duplicate ticket content. Never put credentials in planning records or project configuration.
+- If the configured store cannot be read, written, or mapped without losing required semantics, report the blocker and ask how to proceed. Do not create a second store.
