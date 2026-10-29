@@ -53,6 +53,11 @@ export interface MemoryMovePrecondition {
   snapshots: Record<MemoryCategory, CategorySnapshot>;
 }
 
+/** Capture all categories before generating an automatic add proposal. */
+export interface MemoryAddPrecondition {
+  snapshots: Record<MemoryCategory, CategorySnapshot>;
+}
+
 interface MoveJournal {
   version: 1;
   expected: MemoryWritePrecondition;
@@ -393,12 +398,30 @@ export class NdjsonMemoryStore {
     });
   }
 
+  /** Unconditional when expected is omitted; reviewers must pass a captured precondition. */
   async remember(
     category: MemoryCategory,
     content: string,
+    expected?: MemoryAddPrecondition,
   ): Promise<{ memory: StoredMemoryLine; created: boolean }> {
     return this.withCategoryLock(category, async () => {
       const snapshots = await this.snapshots();
+      if (
+        expected !== undefined &&
+        (!expected?.snapshots ||
+          !MEMORY_CATEGORIES.every((entry) => {
+            const prior = expected.snapshots[entry];
+            const current = snapshots.get(entry)!;
+            return (
+              prior &&
+              prior.contents === current.contents &&
+              prior.mode === current.mode
+            );
+          }))
+      )
+        throw new Error(
+          "Memory add conflict: proposal snapshots changed or are missing",
+        );
       const normalized = normalizeText(content);
       const existing = snapshots
         .get(category)!
@@ -427,6 +450,21 @@ export class NdjsonMemoryStore {
         `${snapshot.contents}${prefix}${serializeMemoryLine(memory)}\n`,
       );
       return { memory, created: true };
+    });
+  }
+
+  /** Capture before creating an automatic add proposal, not immediately before applying it. */
+  async captureAddPrecondition(): Promise<MemoryAddPrecondition> {
+    return this.withCategoryLock("knowledge", async () => {
+      const snapshots = await this.snapshots();
+      return {
+        snapshots: Object.fromEntries(
+          MEMORY_CATEGORIES.map((entry) => {
+            const { contents, mode } = snapshots.get(entry)!;
+            return [entry, { contents, mode }];
+          }),
+        ) as MemoryAddPrecondition["snapshots"],
+      };
     });
   }
 
@@ -1554,12 +1592,18 @@ export class MemoryManager {
     await this.index.close();
   }
 
+  async captureAddPrecondition(): Promise<MemoryAddPrecondition> {
+    await this.initialize();
+    return this.store.captureAddPrecondition();
+  }
+
   async remember(
     category: MemoryCategory,
     content: string,
+    expected?: MemoryAddPrecondition,
   ): Promise<{ memory: StoredMemoryLine; created: boolean }> {
     await this.initialize();
-    const result = await this.store.remember(category, content);
+    const result = await this.store.remember(category, content, expected);
     await this.reconcile();
     return result;
   }
