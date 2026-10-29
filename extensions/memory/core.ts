@@ -4,8 +4,9 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
   access,
-  chmod,
+  lstat,
   mkdir,
+  open,
   readFile,
   readdir,
   rename,
@@ -45,9 +46,22 @@ export interface MemoryWritePrecondition {
   rawLine: string;
 }
 
-interface CategorySnapshot {
+export interface CategorySnapshot {
   contents: string;
   mode: number;
+}
+
+/** Capture all categories before generating a move proposal, not at application time. */
+export interface MemoryMovePrecondition {
+  record: MemoryWritePrecondition;
+  snapshots: Record<MemoryCategory, CategorySnapshot>;
+}
+
+interface MoveJournal {
+  version: 1;
+  expected: MemoryWritePrecondition;
+  destination: MemoryCategory;
+  snapshots: Record<MemoryCategory, CategorySnapshot>;
 }
 
 export interface MemoryHit extends StoredMemoryLine {
@@ -282,23 +296,30 @@ function combineRecoveryResults(
 export class NdjsonMemoryStore {
   private memoryDirName: string;
   private readonly beforeReplace?: () => Promise<void>;
+  private readonly moveCheckpoint?: (
+    phase: "journal" | "destination" | "source",
+  ) => Promise<void>;
   readonly memoryDir: string;
 
   constructor(
     cwd: string,
     memoryDirName: string,
     beforeReplace?: () => Promise<void>,
+    moveCheckpoint?: (
+      phase: "journal" | "destination" | "source",
+    ) => Promise<void>,
   ) {
     this.memoryDirName = memoryDirName;
     this.memoryDir = join(cwd, memoryDirName);
     this.beforeReplace = beforeReplace;
+    this.moveCheckpoint = moveCheckpoint;
   }
 
   async ensureReady(): Promise<void> {
     await mkdir(this.memoryDir, { recursive: true });
     const gitignorePath = join(this.memoryDir, ".gitignore");
     const current = await readFile(gitignorePath, "utf8").catch(() => "");
-    const wanted = ["*.db", "*.db-journal"];
+    const wanted = ["*.db", "*.db-journal", ".runtime/"];
     const lines = new Set(current.split(/\r?\n/).filter(Boolean));
     let changed = current.length === 0;
     for (const line of wanted) {
@@ -326,16 +347,13 @@ export class NdjsonMemoryStore {
   }
 
   async list(category?: MemoryCategory): Promise<StoredMemoryLine[]> {
-    await this.ensureReady();
-
-    if (category) {
-      return this.readCategory(category);
-    }
-
-    const all = await Promise.all(
-      MEMORY_CATEGORIES.map((entry) => this.readCategory(entry)),
-    );
-    return all.flat().sort((a, b) => a.created.localeCompare(b.created));
+    return this.withCategoryLock("knowledge", async () => {
+      if (category) return this.readCategory(category);
+      const all = await Promise.all(
+        MEMORY_CATEGORIES.map((entry) => this.readCategory(entry)),
+      );
+      return all.flat().sort((a, b) => a.created.localeCompare(b.created));
+    });
   }
 
   async remember(
@@ -410,6 +428,103 @@ export class NdjsonMemoryStore {
       }
       return null;
     });
+  }
+
+  /** Retain all category bytes and modes before generating a move proposal. */
+  async captureMovePrecondition(
+    id: string,
+  ): Promise<MemoryMovePrecondition | null> {
+    return this.withCategoryLock("knowledge", async () => {
+      const snapshots = await this.snapshots();
+      for (const category of MEMORY_CATEGORIES) {
+        const lines =
+          snapshots.get(category)!.contents.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+        const rawLine = lines.find(
+          (line) => parseMemoryLine(line, category)?.id === id,
+        );
+        if (rawLine !== undefined)
+          return {
+            record: { id, category, rawLine },
+            snapshots: Object.fromEntries(
+              MEMORY_CATEGORIES.map((entry) => {
+                const { contents, mode } = snapshots.get(entry)!;
+                return [entry, { contents, mode }];
+              }),
+            ) as MemoryMovePrecondition["snapshots"],
+          };
+      }
+      return null;
+    });
+  }
+
+  /** Moves require all category snapshots captured before proposing the move. */
+  async move(
+    precondition: MemoryMovePrecondition,
+    destination: MemoryCategory,
+  ): Promise<StoredMemoryLine> {
+    if (!MEMORY_CATEGORIES.includes(destination))
+      throw new Error("Memory move conflict: invalid destination");
+    return this.withCategoryLock("knowledge", async () => {
+      const snapshots = await this.snapshots();
+      if (
+        !precondition?.record ||
+        !precondition.snapshots ||
+        !MEMORY_CATEGORIES.every((category) => {
+          const prior = precondition.snapshots[category];
+          const current = snapshots.get(category)!;
+          return (
+            prior &&
+            prior.contents === current.contents &&
+            prior.mode === current.mode
+          );
+        })
+      )
+        throw new Error(
+          "Memory move conflict: proposal snapshots changed or are missing",
+        );
+      const expected = precondition.record;
+      const source = snapshots.get(expected.category);
+      const memory = source?.memories.find((item) => item.id === expected.id);
+      const line = source?.contents
+        .match(/[^\n]*\n|[^\n]+$/g)
+        ?.find(
+          (item) =>
+            parseMemoryLine(item, expected.category)?.id === expected.id,
+        );
+      if (!memory || line !== expected.rawLine)
+        throw new Error(
+          `Memory move conflict: ${expected.id} changed or was deleted`,
+        );
+      if (expected.category === destination) return memory;
+      const journal: MoveJournal = {
+        version: 1,
+        expected,
+        destination,
+        snapshots: Object.fromEntries(
+          MEMORY_CATEGORIES.map((category) => {
+            const { contents, mode } = snapshots.get(category)!;
+            return [category, { contents, mode }];
+          }),
+        ) as MoveJournal["snapshots"],
+      };
+      const raw = JSON.stringify(journal);
+      const file = await open(this.moveJournalPath(), "wx", 0o600);
+      try {
+        await file.writeFile(raw, "utf8");
+        await file.sync();
+      } finally {
+        await file.close();
+      }
+      await this.syncDirectory(this.runtimeDir());
+      await this.moveCheckpoint?.("journal");
+      await this.recoverMoveLocked();
+      return { ...memory, category: destination };
+    });
+  }
+
+  /** Replays a valid interrupted move or throws an explicit conflict without overwriting edits. */
+  async recoverMove(): Promise<void> {
+    await this.withCategoryLock("knowledge", async () => {});
   }
 
   private async mutate(
@@ -494,18 +609,19 @@ export class NdjsonMemoryStore {
   }
 
   async categoryCounts(): Promise<Record<MemoryCategory, number>> {
-    const entries = await Promise.all(
-      MEMORY_CATEGORIES.map(async (category) => [
-        category,
-        (await this.readCategory(category)).length,
-      ]),
-    );
-
-    return Object.fromEntries(entries) as Record<MemoryCategory, number>;
+    return this.withCategoryLock("knowledge", async () => {
+      const entries = await Promise.all(
+        MEMORY_CATEGORIES.map(async (category) => [
+          category,
+          (await this.readCategory(category)).length,
+        ]),
+      );
+      return Object.fromEntries(entries) as Record<MemoryCategory, number>;
+    });
   }
 
   async buildPromptContext(): Promise<string> {
-    const knowledge = await this.readCategory("knowledge");
+    const knowledge = await this.list("knowledge");
     if (knowledge.length === 0) return "";
 
     return [
@@ -565,20 +681,214 @@ export class NdjsonMemoryStore {
     return result;
   }
 
+  private runtimeDir(): string {
+    return join(this.memoryDir, ".runtime");
+  }
+  private moveJournalPath(): string {
+    return join(this.runtimeDir(), "move-transaction.json");
+  }
+
+  private async ensurePrivateRuntime(): Promise<void> {
+    const path = this.runtimeDir();
+    let created = false;
+    try {
+      await mkdir(path, { mode: 0o700 });
+      created = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const info = await lstat(path);
+    if (
+      !info.isDirectory() ||
+      (info.mode & 0o777) !== 0o700 ||
+      (typeof process.getuid === "function" && info.uid !== process.getuid())
+    )
+      throw new Error(
+        "Memory runtime conflict: private runtime directory is unsafe",
+      );
+    const ignore = join(path, ".gitignore");
+    try {
+      await writeFile(ignore, "*\n", { flag: "wx", mode: 0o600 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    const ignoreInfo = await lstat(ignore);
+    if (!ignoreInfo.isFile() || (await readFile(ignore, "utf8")) !== "*\n")
+      throw new Error("Memory runtime conflict: invalid runtime gitignore");
+    if (created) {
+      await this.syncDirectory(path);
+      await this.syncDirectory();
+    }
+  }
+
+  private async cleanRuntimeTemps(): Promise<void> {
+    let removed = false;
+    for (const name of await readdir(this.runtimeDir())) {
+      if (
+        !/^replace-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/.test(
+          name,
+        )
+      )
+        continue;
+      const path = join(this.runtimeDir(), name);
+      if (!(await lstat(path)).isFile())
+        throw new Error("Memory runtime conflict: unsafe temporary entry");
+      await unlink(path);
+      removed = true;
+    }
+    if (removed) await this.syncDirectory(this.runtimeDir());
+  }
+
+  private async syncDirectory(path = this.memoryDir): Promise<void> {
+    const dir = await open(path, "r");
+    try {
+      await dir.sync();
+    } finally {
+      await dir.close();
+    }
+  }
+
+  private async recoverMoveLocked(): Promise<void> {
+    const path = this.moveJournalPath();
+    let raw: string;
+    try {
+      raw = await readFile(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    let journal: MoveJournal;
+    try {
+      journal = JSON.parse(raw);
+      if (
+        journal.version !== 1 ||
+        !journal.expected ||
+        typeof journal.expected.id !== "string" ||
+        typeof journal.expected.rawLine !== "string" ||
+        !MEMORY_CATEGORIES.includes(journal.expected.category) ||
+        !MEMORY_CATEGORIES.includes(journal.destination) ||
+        journal.destination === journal.expected.category ||
+        !journal.snapshots
+      )
+        throw new Error("invalid fields");
+      const ids = new Set<string>();
+      for (const category of MEMORY_CATEGORIES) {
+        const s = journal.snapshots[category];
+        if (
+          !s ||
+          typeof s.contents !== "string" ||
+          !Number.isInteger(s.mode) ||
+          s.mode < 0 ||
+          s.mode > 0o7777
+        )
+          throw new Error("invalid snapshot");
+        for (const line of s.contents.match(/[^\n]*\n|[^\n]+$/g) ?? []) {
+          if (!line.trim()) continue;
+          const item = parseMemoryLine(line, category);
+          if (!item || ids.has(item.id)) throw new Error("invalid records");
+          ids.add(item.id);
+        }
+      }
+      const lines =
+        journal.snapshots[journal.expected.category].contents.match(
+          /[^\n]*\n|[^\n]+$/g,
+        ) ?? [];
+      const matching = lines.filter(
+        (line) =>
+          parseMemoryLine(line, journal.expected.category)?.id ===
+          journal.expected.id,
+      );
+      if (matching.length !== 1 || matching[0] !== journal.expected.rawLine)
+        throw new Error("invalid source");
+    } catch {
+      throw new Error(
+        "Memory move conflict: malformed or ambiguous transaction journal",
+      );
+    }
+
+    const { expected, destination, snapshots } = journal;
+    const source = expected.category;
+    const sourceAfter = (
+      snapshots[source].contents.match(/[^\n]*\n|[^\n]+$/g) ?? []
+    )
+      .filter((line) => line !== expected.rawLine)
+      .join("");
+    const destBefore = snapshots[destination].contents;
+    const prefix = destBefore && !destBefore.endsWith("\n") ? "\n" : "";
+    const destAfter =
+      destBefore +
+      prefix +
+      expected.rawLine +
+      (expected.rawLine.endsWith("\n") ? "" : "\n");
+    const before = new Map(
+      MEMORY_CATEGORIES.map((category) => [category, snapshots[category]]),
+    );
+    const afterDestination = new Map(before);
+    afterDestination.set(destination, {
+      ...snapshots[destination],
+      contents: destAfter,
+    });
+    const afterSource = new Map(afterDestination);
+    afterSource.set(source, { ...snapshots[source], contents: sourceAfter });
+    const actual = await this.rawSnapshots();
+    const matches = (state: Map<MemoryCategory, CategorySnapshot>) =>
+      MEMORY_CATEGORIES.every(
+        (category) =>
+          actual.get(category)!.contents === state.get(category)!.contents &&
+          actual.get(category)!.mode === state.get(category)!.mode,
+      );
+    const checkJournal = async () => {
+      if ((await readFile(path, "utf8")) !== raw)
+        throw new Error("Memory move conflict: transaction journal changed");
+    };
+    if (matches(before)) {
+      await checkJournal();
+      await this.replace(destination, before, destAfter);
+      await this.moveCheckpoint?.("destination");
+    } else if (!matches(afterDestination) && !matches(afterSource)) {
+      throw new Error(
+        "Memory move conflict: files changed during interrupted transaction; preserve journal and resolve manually",
+      );
+    }
+    if (!matches(afterSource)) {
+      await checkJournal();
+      await this.replace(source, afterDestination, sourceAfter);
+      await this.moveCheckpoint?.("source");
+    }
+    await checkJournal();
+    // Check once more before removing the only recovery record.
+    const final = await this.rawSnapshots();
+    if (
+      !MEMORY_CATEGORIES.every(
+        (category) =>
+          final.get(category)!.contents ===
+            afterSource.get(category)!.contents &&
+          final.get(category)!.mode === afterSource.get(category)!.mode,
+      )
+    )
+      throw new Error(
+        "Memory move conflict: files changed before transaction cleanup",
+      );
+    await unlink(path);
+    await this.syncDirectory(this.runtimeDir());
+  }
+
   private async replace(
     category: MemoryCategory,
     expected: Map<MemoryCategory, CategorySnapshot>,
     body: string,
   ): Promise<void> {
     const filePath = join(this.memoryDir, categoryFileName(category));
-    const temporaryPath = `${filePath}.${uuidv7()}.tmp`;
+    const temporaryPath = join(this.runtimeDir(), `replace-${uuidv7()}.tmp`);
     try {
-      await writeFile(temporaryPath, body, {
-        encoding: "utf8",
-        flag: "wx",
-        mode: 0o600,
-      });
-      await chmod(temporaryPath, expected.get(category)!.mode);
+      const temporary = await open(temporaryPath, "wx", 0o600);
+      try {
+        await temporary.writeFile(body, "utf8");
+        await temporary.chmod(expected.get(category)!.mode);
+        await temporary.sync();
+      } finally {
+        await temporary.close();
+      }
       await this.beforeReplace?.();
       for (const entry of MEMORY_CATEGORIES) {
         const file = join(this.memoryDir, categoryFileName(entry));
@@ -591,6 +901,8 @@ export class NdjsonMemoryStore {
       }
       // A non-cooperating editor can still write between these checks and rename.
       await rename(temporaryPath, filePath);
+      await this.syncDirectory(this.runtimeDir());
+      await this.syncDirectory();
     } finally {
       await unlink(temporaryPath).catch(() => {});
     }
@@ -622,6 +934,9 @@ export class NdjsonMemoryStore {
         }
       }
       try {
+        await this.ensurePrivateRuntime();
+        await this.cleanRuntimeTemps();
+        await this.recoverMoveLocked();
         return await operation();
       } finally {
         db.exec("ROLLBACK");
@@ -1173,6 +1488,29 @@ export class MemoryManager {
   ): Promise<MemoryWritePrecondition | null> {
     await this.initialize();
     return this.store.captureWritePrecondition(id);
+  }
+
+  async captureMovePrecondition(
+    id: string,
+  ): Promise<MemoryMovePrecondition | null> {
+    await this.initialize();
+    return this.store.captureMovePrecondition(id);
+  }
+
+  async move(
+    expected: MemoryMovePrecondition,
+    destination: MemoryCategory,
+  ): Promise<StoredMemoryLine> {
+    await this.initialize();
+    const moved = await this.store.move(expected, destination);
+    await this.index.upsertMemory(moved);
+    return moved;
+  }
+
+  async recoverMove(): Promise<void> {
+    await this.store.recoverMove();
+    await this.initialize();
+    await this.index.syncMemories(await this.store.list());
   }
 
   async update(
