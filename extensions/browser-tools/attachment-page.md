@@ -1,0 +1,13 @@
+# Experimental selected-page CDP client
+
+`AttachedPage` is a standalone experiment, not a registered browser tool. It connects directly to one explicitly supplied Chromium page target ID. It does not create a Playwright `Page` or use Playwright's browser-level CDP attachment, which can dismiss dialogs on unrelated tabs. This is a direct-CDP backend and does not satisfy the current Playwright-only backend policy without a separate decision.
+
+Cooperating processes must use the same private lease root. A target ID is locked across endpoint aliases and processes. The caller must obtain explicit user authorization for the exact target; discovery and knowing an ID are not authorization. Target IDs can become stale. The client never chooses a foreground or fallback page.
+
+The experiment supports title reads, bounded main-document DOM text inspection, HTTP(S) navigation, and opt-in selected-page console/network metadata. Title metadata is capped at 1,024 UTF-16 code units, replaces control and bidirectional formatting characters, and reports whether it was truncated. Inspection returns at most 16,000 UTF-16 code units of raw text, scans at most 1,000 nodes, and includes hidden or script text. Navigation waits for a load event matching its returned frame and loader IDs. Same-document navigation or missing loader identity is unsupported and quarantines ownership after dispatch. There is no automatic replay.
+
+Diagnostics retain at most 100 records with a dropped count. Console records contain only levels, never arguments. Network records contain methods, sanitized HTTP(S) URLs, and response status, not headers or bodies. Non-HTTP and excessively long URLs are replaced with placeholders. Child frame and worker coverage is not guaranteed. This is not the existing Playwright diagnostics contract. DOM output and URL paths can contain sensitive data.
+
+Cancellation, timeout, transport loss, or a failed CDP operation disconnects and quarantines the lease. Disconnect during an operation is uncertain. Recovery requires independently verifying no agent operation can still run, then manually resolving the durable marker. Do not close the external browser as a recovery step. Normal disconnect closes only the CDP transport and clears retained diagnostics.
+
+The loopback bridge rejects redirects and caps each uncompressed WebSocket message at 32 MiB. It does not bound cumulative traffic or every browser/Node allocation. Actions, snapshots, screenshots, downloads, recording, dialogs, and unrestricted evaluation are unsupported. No production integration or claim of complete page isolation is made by this experiment.

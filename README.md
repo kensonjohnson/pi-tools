@@ -1,7 +1,7 @@
 # pi-tools
 
 A [pi](https://github.com/badlogic/pi-mono) package.
-Adds web search using Brave Search API and browser tooling via Chrome DevTools Protocol.
+Adds web search using Brave Search API and managed browser tooling.
 
 _**I use Mac, feel free to fork and tweak for Windows/Linux!**_
 
@@ -32,20 +32,39 @@ Requires `BRAVE_API_KEY` environment variable to be set.
 
 ### `browser-tools`
 
-Interactive browser automation via Chrome DevTools Protocol.
+Browser Tools manages Playwright Chromium sessions on macOS. It uses the Chromium version pinned by the package, not your installed Brave or Chrome. If the matching browser is missing, automatic installation requires a trusted project and `browser-tools.autoInstall` enabled. If automatic installation is disabled, install the matching Chromium with the package's pinned Playwright CLI. `/pi-tools` controls these settings; project overrides apply only to trusted projects.
 
-Connects to Brave Browser on `localhost:9222`.
+#### Sessions and login
 
-| Tool                 | Description                                                                                                                           |
-| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `browser_start`      | Launch Brave with remote debugging on `:9222`. Pass `profile: true` to copy your default Brave profile (cookies, logins, extensions). |
-| `browser_stop`       | Kill the spawned Brave process                                                                                                        |
-| `browser_navigate`   | Navigate to a URL (new tab or current tab)                                                                                            |
-| `browser_eval`       | Execute JavaScript in the active tab                                                                                                  |
-| `browser_screenshot` | Capture viewport or full page to a PNG                                                                                                |
-| `browser_content`    | Return raw page HTML (un-truncated)                                                                                                   |
-| `browser_cookies`    | List cookies for the current tab                                                                                                      |
-| `browser_pick`       | Interactive element picker — click to select                                                                                          |
+The agent can start a visible session with `browser_session` arguments `{"action":"start"}` or a headless session with `{"action":"start","headless":true}`. Sessions are visible by default and disposable unless a string `profile` name is supplied. `browser_session` also lists sessions, creates and selects tabs, closes tabs, and stops sessions. Tools accept session and tab IDs; selections and owned sessions are scoped to the creating Pi session. Stop owned sessions when finished.
+
+For reusable login, start a visible session with a named profile, for example `{"action":"start","profile":"work"}`. Named profiles live under `~/.pi/agent/browser-profiles` and retain login data. They are exclusively leased across cooperating sessions; contention waits up to `profileWaitTimeoutMs`, and uncertain ownership fails closed. They are separate from your personal browser profiles. The toolkit does not copy or delete those profiles, and the old `profile: true` option is not a migration path.
+
+Use `browser_handoff` with `action: "pause"` for a human login or MFA step. Automation pauses until the user sends the exact `browser-resume` instruction returned by the tool in interactive Pi or an RPC client with UI. Diagnostic history is discarded and capture suspended during handoff. Download capture remains suspended after confirmation until explicitly resumed with `browser_download` and risk acknowledgment; delayed human downloads may then be captured. A headless named-profile session can request a visible restart with separate user consent, but open tabs, unsaved forms and in-memory state may be lost. Old IDs expire. A disposable headless session cannot be converted this way.
+
+#### Tools and data
+
+| Tool                                                                           | Purpose                                                                                                                                                                                                                            |
+| ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `browser_session`, `browser_navigate`                                          | Manage owned sessions and tabs; navigate the selected or explicitly addressed tab.                                                                                                                                                 |
+| `browser_snapshot`, `browser_snapshot_ref`, `browser_action`                   | Inspect bounded semantic records, validate or click retained references, and perform scoped actions. References expire on navigation or the next snapshot. Actions can have uncertain outcomes and are not automatically replayed. |
+| `browser_handoff`, `browser_pick`                                              | Pause for a human or collect visual selections in a visible session. Picker results are non-actionable metadata, not selectors; frame changes cancel selection.                                                                    |
+| `browser_content`, `browser_eval`, `browser_extract`                           | Inspect main-document HTML, evaluate a main-frame expression, or extract readable content. HTML excludes iframe documents and shadow roots and may not reflect runtime form state.                                                 |
+| `browser_upload`, `browser_dialog`                                             | Upload explicitly listed local files or inspect and resolve owned-page dialogs.                                                                                                                                                    |
+| `browser_screenshot`, `browser_viewport`                                       | Set viewport dimensions and capture viewport, full-page, or snapshot-reference element PNGs. Screenshots return image content and artifact metadata.                                                                               |
+| `browser_diagnostics`, `browser_diagnostic_headers`, `browser_diagnostic_body` | Read bounded console/network history, explicitly reveal selected sensitive headers, or configure body capture.                                                                                                                     |
+| `browser_download`, `browser_recording`, `browser_artifact`                    | Manage captured downloads, traces and video, and read, export or clean managed artifacts.                                                                                                                                          |
+| `browser_attachment`                                                           | Experimental, limited direct CDP access to an explicitly selected external page.                                                                                                                                                   |
+
+`browser_start`, `browser_stop`, `browser_cookies`, and `browser_logs` are removed. Use `browser_session` and `browser_diagnostics` instead where applicable. `browser_navigate` no longer accepts the old `newTab` or `reload` parameters; create or select a tab through `browser_session`. `browser_screenshot` now returns PNG image content rather than a temporary filename.
+
+Diagnostics capture bounded console and network metadata by default. Console text, page content, URLs and explicitly revealed headers can contain secrets. With diagnostics enabled, body capture is on by default for `development` sessions, the default purpose, and off by default for `research` sessions. Use `browser_diagnostic_body` with `action: "configure"` to enable or disable capture for future requests. Captured bodies may contain secrets. Response bodies are best effort for completed, declared-small uncompressed responses. Retained bytes are bounded, but transient browser, transport and Node memory are not strictly bounded. Requests are never replayed for capture. History is cleared when its tab or session is invalidated.
+
+Large inspection results, screenshots, downloads, recordings and explicitly saved bodies can produce private artifacts under `~/.pi/agent/browser-artifacts`. IDs are scoped to the creating Pi session. `browser_artifact` reads bounded text or base64 binary chunks, exports to a new absolute path without overwriting, or runs cleanup. Default quota is 256 MiB and retention is one hour; cleanup is opportunistic, so do not rely on immediate deletion. Traces and video can contain sensitive page data. Recording has a default five-minute deadline, but native temporary recording files are not size-capped by the artifact quota.
+
+For an existing Chromium browser, `browser_attachment` requires a trusted project, an explicit literal-loopback CDP endpoint, and selection of an explicitly discovered target ID. The tool does not enforce a separate user confirmation; obtain the user's approval before selecting a page. It leases one selected page and supports bounded title and DOM text reads, HTTP(S) navigation, and opt-in console-level and network metadata. DOM text may include hidden content and secrets. It does not support actions, screenshots, uploads, dialogs, recordings or full Playwright access. Disconnect closes the attachment, not the external tab or browser. Failed or uncertain operations can quarantine the lease; do not assume they were replayed or completed.
+
+Settings include `autoInstall`, diagnostic history limits, startup and navigation deadlines, upload and screenshot limits, artifact quota and retention, and the recording deadline. See `/pi-tools` for defaults and permitted ranges. Browser state and artifacts may contain credentials; protect the local account and exported files.
 
 ### `code-search`
 
