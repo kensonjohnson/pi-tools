@@ -134,6 +134,21 @@ export default function (pi: ExtensionAPI) {
         default: true,
         label: "Enabled",
       },
+      "models.reviewer": {
+        type: "string",
+        default: "",
+        label: "Memory reviewer model",
+        description:
+          "Explicit provider/model for memory review. Selected session text and repository evidence may be sent to this provider; empty disables review.",
+        selectValues: (context) => [
+          ...new Set(
+            (context.scopedModels.length
+              ? context.scopedModels.map(({ model }) => model)
+              : context.modelRegistry.getAvailable()
+            ).map((model) => `${model.provider}/${model.id}`),
+          ),
+        ],
+      },
     },
     toolNames: MEMORY_TOOL_NAMES,
   });

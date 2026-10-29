@@ -101,7 +101,7 @@ test("incremental acknowledgements, restart, active append, branch and fork", ()
     const forkScan = review().discover();
     assert.match(
       forkScan.issues.map((x) => x.reason).join(),
-      /copied history is not independently verified/,
+      /fork copied history verified/,
     );
     const forkBatch = forkScan.batches.find((x) => x.path === fork)!;
     assert.ok(forkBatch.parentSession);

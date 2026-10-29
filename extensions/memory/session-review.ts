@@ -15,6 +15,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import Database from "better-sqlite3";
+import { isDeepStrictEqual } from "node:util";
 
 type Entry = {
   type: string;
@@ -60,6 +61,46 @@ export type ReviewOptions = {
 };
 
 const hash = (data: Buffer) => createHash("sha256").update(data).digest("hex");
+
+/**
+ * Pi forkFrom copies a physical source prefix; createBranchedSession copies a
+ * source branch, dropping labels and rechaining parent IDs. The fork header has
+ * no immutable boundary: this checks known copied entries, not hostile forgery
+ * of a novel ID after the verified prefix.
+ */
+export function verifyForkCopy(child: Entry[], parent: Entry[]): boolean {
+  if (!child.length || !parent.length) return false;
+  const byId = new Map(parent.map((entry) => [entry.id, entry]));
+  const ownSuffix = (start: number) =>
+    child.slice(start).every((entry) => !byId.has(entry.id));
+  let direct = 0;
+  while (
+    direct < child.length &&
+    direct < parent.length &&
+    isDeepStrictEqual(child[direct], parent[direct])
+  )
+    direct++;
+  if (direct > 0 && ownSuffix(direct)) return true;
+
+  let copied = 0;
+  let previous: string | null = null;
+  while (copied < child.length) {
+    const entry = child[copied];
+    const original = byId.get(entry.id);
+    if (!original) break;
+    if (original.type === "label" || entry.parentId !== previous) return false;
+    const { parentId: _childParent, ...childRest } = entry;
+    const { parentId: _parentParent, ...parentRest } = original;
+    if (!isDeepStrictEqual(childRest, parentRest)) return false;
+    let ancestor = original.parentId;
+    while (ancestor !== null && byId.get(ancestor)?.type === "label")
+      ancestor = byId.get(ancestor)!.parentId;
+    if (ancestor !== previous) return false;
+    previous = entry.id;
+    copied++;
+  }
+  return copied > 0 && ownSuffix(copied);
+}
 function textOf(content: unknown, role: string): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content) || (role === "user" && content.length === 0))
@@ -149,7 +190,15 @@ function snapshot(path: string, limit: number) {
       current = entry.parentId;
     }
     branch.reverse();
-    return { bytes, header, branch, leaf, dev: before.dev, ino: before.ino };
+    return {
+      bytes,
+      header,
+      entries: entries as Entry[],
+      branch,
+      leaf,
+      dev: before.dev,
+      ino: before.ino,
+    };
   } finally {
     closeSync(fd);
   }
@@ -368,6 +417,7 @@ export class SessionReview {
           bytes: Buffer;
         }> = [];
         const visited = new Set([resolve(path)]);
+        let childEntries = s.entries;
         let parent = s.header.parentSession;
         while (parent !== undefined) {
           if (
@@ -417,6 +467,11 @@ export class SessionReview {
           bytes += ancestor.bytes.length;
           if (resolve(ancestor.header.cwd) !== this.project)
             throw new Error("cross-project fork provenance; excluded");
+          if (!verifyForkCopy(childEntries, ancestor.entries))
+            throw new Error(
+              "fork copied history is unverifiable or tampered; excluded",
+            );
+          childEntries = ancestor.entries;
           parents.push({
             path: parentPath,
             dev: ancestor.dev,
@@ -430,7 +485,7 @@ export class SessionReview {
           issues.push({
             path,
             reason:
-              "fork ancestry project headers match; copied history is not independently verified",
+              "fork copied history verified against same-project ancestors; novel suffix treated as fork activity",
           });
         const previous = state.sessions[path];
         let start = 0;
