@@ -30,7 +30,11 @@ import {
   reviewProjectSessions,
   type SchedulerOptions,
 } from "./scheduler.ts";
-import { createConfiguredPiMemoryReviewer } from "./reviewer.ts";
+import {
+  createConfiguredPiMemoryReviewer,
+  type ReviewerStore,
+} from "./reviewer.ts";
+import { reviewAllMemories } from "./manual-review.ts";
 import {
   getRuntimeSettings,
   isExtensionEnabled,
@@ -47,6 +51,7 @@ const MEMORY_TOOL_NAMES = [
   "memory_repair",
   "memory_learn",
   "memory_consolidate",
+  "memory_review",
   "memory_list",
 ] as const;
 
@@ -102,6 +107,52 @@ function isRememberResultDetails(
   );
 }
 
+export function createTrackedReviewStore(
+  manager: MemoryManager,
+  changes: Array<{ id: string; detail: string }>,
+): ReviewerStore {
+  const text = (content: string) =>
+    content.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 120);
+  return {
+    captureAddPrecondition: () => manager.captureAddPrecondition(),
+    remember: async (...args) => {
+      const result = await manager.remember(...args);
+      if (result.created)
+        changes.push({
+          id: result.memory.id,
+          detail: `Added [${result.memory.category}]: ${text(result.memory.content)}`,
+        });
+      return result;
+    },
+    update: async (...args) => {
+      const result = await manager.update(...args);
+      if (result)
+        changes.push({
+          id: result.id,
+          detail: `Updated [${result.category}]: ${text(result.content)}`,
+        });
+      return result;
+    },
+    forget: async (...args) => {
+      const result = await manager.forget(...args);
+      if (result)
+        changes.push({
+          id: result.id,
+          detail: `Removed [${result.category}]: ${text(result.content)}`,
+        });
+      return result;
+    },
+    move: async (...args) => {
+      const result = await manager.move(...args);
+      changes.push({
+        id: result.id,
+        detail: `Moved [${args[0].record.category} -> ${result.category}]: ${text(result.content)}`,
+      });
+      return result;
+    },
+  };
+}
+
 function textResult(text: string, details?: unknown) {
   return {
     content: [{ type: "text" as const, text }],
@@ -114,6 +165,29 @@ export default function (pi: ExtensionAPI) {
   const injectedSessions = new Set<string>();
   let scheduler: MemoryScheduler | undefined;
   let schedulerBoot: { activity(): void; stop(): Promise<void> } | undefined;
+  let backgroundEnabled = false;
+  let feedbackTimer: ReturnType<typeof setTimeout> | undefined;
+  let feedbackUI: ExtensionContext["ui"] | undefined;
+  let feedbackGeneration = 0;
+  function showFeedback(ctx: ExtensionContext, status: string) {
+    if (!ctx.hasUI || typeof ctx.ui.setStatus !== "function") return;
+    if (feedbackTimer) clearTimeout(feedbackTimer);
+    feedbackUI = ctx.ui;
+    try {
+      ctx.ui.setStatus("memory-review", `Memory review: ${status}`);
+    } catch {
+      feedbackUI = undefined;
+      return;
+    }
+    feedbackTimer = setTimeout(() => {
+      feedbackTimer = undefined;
+      try {
+        feedbackUI?.setStatus("memory-review", undefined);
+      } catch {}
+      feedbackUI = undefined;
+    }, 5000);
+    feedbackTimer.unref();
+  }
 
   async function getReadyManager(
     ctx: ExtensionContext,
@@ -130,6 +204,155 @@ export default function (pi: ExtensionAPI) {
     }
     const ready = await manager;
     return (await ready.isReady()) ? ready : undefined;
+  }
+
+  async function getReviewControl(
+    ctx: ExtensionContext,
+  ): Promise<MemoryScheduler | undefined> {
+    if (!ctx.isProjectTrusted()) return undefined;
+    const manager = await getReadyManager(ctx);
+    if (!manager) return undefined;
+    if (!scheduler && backgroundEnabled && schedulerBoot)
+      throw new Error("review scheduler is starting; try again shortly");
+    if (!scheduler) {
+      const sessionDir = ctx.sessionManager?.getSessionDir?.() || ctx.cwd;
+      scheduler = new MemoryScheduler({
+        project: ctx.cwd,
+        runtimeDir: join(
+          ctx.cwd,
+          CONFIG_DIR_NAME,
+          "memory",
+          ".runtime",
+          "review-scheduler",
+        ),
+        sessionDir,
+        automatic: false,
+        // An on-demand control must not start history review when it was disabled.
+        work: async () => ({ status: "pending" }),
+        onStatus: (status) => showFeedback(ctx, status),
+      });
+    }
+    return scheduler;
+  }
+
+  async function reviewOperation(
+    action: "status" | "full" | "resume" | "cancel",
+    ctx: ExtensionContext,
+    signal?: AbortSignal,
+    options?: { restart?: boolean },
+  ) {
+    if (!ctx.isProjectTrusted())
+      return textResult("Memory review requires a trusted project.", {
+        available: false,
+      });
+    const manager = await getReadyManager(ctx);
+    if (!manager) return textResult(NOT_ENABLED_MESSAGE, { available: false });
+    let control: MemoryScheduler | undefined;
+    try {
+      control = await getReviewControl(ctx);
+      if (!control)
+        return textResult("Memory review is unavailable.", {
+          available: false,
+        });
+      if (action === "cancel") {
+        const result = control.cancel();
+        return textResult(
+          result.mayContinue
+            ? "Cancellation requested; in-flight work may still finish. Pending work remains paused; inspect before resuming."
+            : "Memory review cancelled; pending work remains paused.",
+          { action, ...result },
+        );
+      }
+      if (action === "resume") {
+        control.resume({ schedule: backgroundEnabled });
+        return textResult(
+          "Memory review resumed after explicit acknowledgement.",
+          { action },
+        );
+      }
+      if (action === "full") {
+        const changes: Array<{ id: string; detail: string }> = [];
+        const result = await control.runManual(
+          async (runSignal, progress) => {
+            try {
+              const reviewer = await createConfiguredPiMemoryReviewer(
+                ctx,
+                createTrackedReviewStore(manager, changes),
+                progress.resumePermit,
+              );
+              const outcome = await reviewAllMemories({
+                reviewer,
+                signal: runSignal,
+                fullOffset: progress.current?.offset,
+                fullSnapshot: progress.current?.snapshot,
+                onProgress: (cursor) => {
+                  if (cursor) progress.advance(cursor);
+                  else progress.clear();
+                },
+              });
+              return changes.length ? { ...outcome, changes } : outcome;
+            } catch (error) {
+              if (changes.length)
+                return {
+                  status: "uncertain",
+                  detail:
+                    "Review stopped after applying changes; inspect before retrying.",
+                  changes,
+                };
+              throw error;
+            }
+          },
+          signal,
+          { restart: options?.restart },
+        );
+        const text = `Full memory review ${result.status}: ${result.detail ?? ""}${result.nextOffset === undefined ? "" : ` Progress saved at offset ${result.nextOffset}; run /memory-review full to continue.`}`;
+        return textResult(text, { action, result });
+      }
+      const settings = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);
+      const raw = control.report();
+      const report = {
+        status: raw.status,
+        configuredModel:
+          getSettingValue<string>(
+            settings,
+            MEMORY_EXTENSION_ID,
+            "models.reviewer",
+          ) || null,
+        historyEnabled:
+          getSettingValue<boolean>(
+            settings,
+            MEMORY_EXTENSION_ID,
+            "historyReview.enabled",
+          ) === true,
+        events: raw.events.slice(0, 8).map((event) => ({
+          ...event,
+          detail: event.detail.slice(0, 400),
+          changes: event.changes.slice(0, 5).map((change) => ({
+            ...change,
+            detail: change.detail.slice(0, 150),
+          })),
+          changesOmitted: Math.max(
+            0,
+            event.changesTotal - Math.min(5, event.changes.length),
+          ),
+        })),
+      };
+      return textResult(
+        `Memory review report:\n${JSON.stringify(report, null, 2)}`,
+        { action, report },
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "unknown error";
+      if (action === "full" && control) {
+        try {
+          control.noteManualFailure(detail);
+        } catch {}
+      }
+      return textResult(`Memory review ${action} failed: ${detail}`, {
+        action,
+        failed: true,
+      });
+    }
   }
 
   async function injectMemoryMessage(ctx: ExtensionContext) {
@@ -258,6 +481,7 @@ export default function (pi: ExtensionAPI) {
       ".runtime",
       "review-scheduler",
     );
+    backgroundEnabled = true;
     const schedulerOptions: SchedulerOptions = {
       project: ctx.cwd,
       runtimeDir,
@@ -301,34 +525,32 @@ export default function (pi: ExtensionAPI) {
             detail:
               "The explicitly opened session filename is not JSONL; activity remains pending.",
           };
-        const reviewer = await createConfiguredPiMemoryReviewer(ctx, manager);
-        return reviewProjectSessions({
-          project: ctx.cwd,
-          sessionDir: directory,
-          checkpointFile: join(runtimeDir, "session-progress.json"),
-          reviewer,
-          signal,
-        });
+        const changes: Array<{ id: string; detail: string }> = [];
+        const reviewer = await createConfiguredPiMemoryReviewer(
+          ctx,
+          createTrackedReviewStore(manager, changes),
+        );
+        try {
+          const outcome = await reviewProjectSessions({
+            project: ctx.cwd,
+            sessionDir: directory,
+            checkpointFile: join(runtimeDir, "session-progress.json"),
+            reviewer,
+            signal,
+          });
+          return changes.length ? { ...outcome, changes } : outcome;
+        } catch (error) {
+          if (changes.length)
+            return {
+              status: "uncertain",
+              detail:
+                "Review stopped after applying changes; inspect before retrying.",
+              changes,
+            };
+          throw error;
+        }
       },
-      onStatus: (status: string) => {
-        if (
-          ctx.hasUI &&
-          [
-            "error",
-            "uncertain",
-            "unresolved",
-            "interrupted-uncertain",
-            "activity-persist-pending",
-            "unsupported-session",
-          ].includes(status)
-        )
-          ctx.ui.notify(
-            status === "unsupported-session"
-              ? "Memory review cannot inspect an explicitly opened non-JSONL session; its activity remains pending."
-              : `Memory review ${status}; pending work was retained.`,
-            "warning",
-          );
-      },
+      onStatus: (status: string) => showFeedback(ctx, status),
     };
     // SQLite initialization can encounter a project writer. Retry without blocking
     // the lifecycle hook; activity is spooled independently while initialization waits.
@@ -410,6 +632,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", () => {
+    if (!backgroundEnabled) return;
     const active = scheduler;
     if (!active) {
       schedulerBoot?.activity();
@@ -427,6 +650,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    backgroundEnabled = false;
+    feedbackGeneration++;
+    if (feedbackTimer) clearTimeout(feedbackTimer);
+    feedbackTimer = undefined;
+    try {
+      feedbackUI?.setStatus("memory-review", undefined);
+    } catch {}
+    feedbackUI = undefined;
     const active = scheduler;
     scheduler = undefined;
     const boot = schedulerBoot;
@@ -735,22 +966,91 @@ export default function (pi: ExtensionAPI) {
     name: "memory_consolidate",
     label: "Memory Consolidate",
     description:
-      "Review stored memories and suggest duplicate or merge candidates without mutating files.",
+      "Run an explicit evidence-based full memory review; supported changes may be applied automatically.",
     parameters: Type.Object({
       since: Type.Optional(
         Type.String({
           description:
-            "Only review memories created or updated after this ISO timestamp",
+            "Legacy option; date-limited reviews are not supported. Omit for a full review.",
         }),
       ),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const manager = await getReadyManager(ctx);
-      if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      if (params.since)
+        return textResult(
+          "Date-limited consolidation is no longer supported; omit since to run a full review.",
+          { failed: true },
+        );
+      return reviewOperation("full", ctx, signal);
+    },
+  });
 
-      const suggestions = await manager.consolidate(params.since);
-      return textResult(suggestions.map((entry) => `- ${entry}`).join("\n"), {
-        count: suggestions.length,
+  // The tool is also available in headless/RPC mode; the command is a direct
+  // user-facing entry point and never opens a focus-stealing screen.
+  pi.registerCommand?.("memory-review", {
+    description: "Show memory review status or request full, resume, or cancel",
+    handler: async (args, ctx) => {
+      const [actionText = "status", ...rest] = args
+        .trim()
+        .toLowerCase()
+        .split(/\s+/)
+        .filter(Boolean);
+      const action = actionText as "status" | "full" | "resume" | "cancel";
+      const restart =
+        action === "full" && rest.length === 1 && rest[0] === "--restart";
+      if (
+        !["status", "full", "resume", "cancel"].includes(action) ||
+        (rest.length > 0 && !restart)
+      ) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "Usage: /memory-review [status|full [--restart]|resume|cancel]",
+            "warning",
+          );
+        return;
+      }
+      if (action === "full") {
+        const target = ctx.ui;
+        const generation = feedbackGeneration;
+        void reviewOperation(action, ctx, undefined, { restart })
+          .then((result) => {
+            if (ctx.hasUI && generation === feedbackGeneration)
+              target.notify(result.content[0].text, "info");
+          })
+          .catch(() => {});
+        return;
+      }
+      const result = await reviewOperation(action, ctx);
+      if (ctx.hasUI) ctx.ui.notify(result.content[0].text, "info");
+    },
+  });
+
+  pi.registerTool({
+    name: "memory_review",
+    label: "Memory Review",
+    description:
+      "Inspect bounded memory review status and reports, run a full review, or explicitly resume/cancel pending work.",
+    parameters: Type.Object({
+      restart: Type.Optional(
+        Type.Boolean({
+          description:
+            "Explicitly discard saved full-review progress and start from the first page.",
+        }),
+      ),
+      action: Type.Union([
+        Type.Literal("status"),
+        Type.Literal("full"),
+        Type.Literal("resume"),
+        Type.Literal("cancel"),
+      ]),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      if (params.restart && params.action !== "full")
+        return textResult("restart is available only for a full review.", {
+          failed: true,
+        });
+      return reviewOperation(params.action, ctx, signal, {
+        restart: params.restart,
       });
     },
   });

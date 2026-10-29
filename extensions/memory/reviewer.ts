@@ -17,6 +17,10 @@ import { RepositoryEvidence } from "./reviewer-evidence.ts";
 import { PiReviewerModel, type ReviewerModel } from "./reviewer-model.ts";
 import type { ReviewBatch } from "./session-review.ts";
 import { validateSessionBatch } from "./reviewer-session.ts";
+import {
+  resolveManualResumePermit,
+  type ManualResumePermit,
+} from "./scheduler.ts";
 
 export type ReviewerStore = {
   captureAddPrecondition(): Promise<MemoryAddPrecondition>;
@@ -286,13 +290,19 @@ export class MemoryReviewer {
     string,
     { offset: number; snapshot: string }
   >();
+  private fullCursor?: { offset: number; snapshot: string };
   constructor(options: {
     project: string;
     store: ReviewerStore;
     model: ReviewerModel;
     validateSession?: SessionValidator;
+    /** Issued only after the scheduler claims a persisted cursor. */
+    fullContinuation?: ManualResumePermit;
   }) {
     this.options = options;
+    this.fullCursor = options.fullContinuation
+      ? resolveManualResumePermit(options.fullContinuation)
+      : undefined;
   }
   async review(
     options: {
@@ -339,6 +349,15 @@ export class MemoryReviewer {
         throw new Error(
           "review snapshot changed or is missing; restart at zero",
         );
+      if (
+        !batchKey &&
+        (!this.fullCursor ||
+          this.fullCursor.offset !== offset ||
+          this.fullCursor.snapshot !== snapshotHash)
+      )
+        throw new Error(
+          "full review pages must be reviewed in order; restart at zero",
+        );
       if (batchKey) {
         const cursor = this.incremental.get(batchKey);
         if (
@@ -351,6 +370,7 @@ export class MemoryReviewer {
           );
       }
     } else if (batchKey) this.incremental.delete(batchKey);
+    else this.fullCursor = undefined;
     const visible: StoredMemoryLine[] = [];
     let visibleBytes = 2;
     for (const memory of memories.slice(offset, offset + 50)) {
@@ -420,6 +440,8 @@ export class MemoryReviewer {
     if (d.action === "no_change") {
       await validateSnapshot();
       if (nextOffset !== undefined) {
+        if (!batchKey)
+          this.fullCursor = { offset: nextOffset, snapshot: snapshotHash };
         if (batchKey) {
           if (this.incremental.size >= 128 && !this.incremental.has(batchKey))
             throw new Error("too many pending review cursors");
@@ -439,6 +461,7 @@ export class MemoryReviewer {
       }
       batch?.acknowledge();
       if (batchKey) this.incremental.delete(batchKey);
+      else this.fullCursor = undefined;
       return {
         status: "unchanged",
         detail: "No supported changes proposed.",
@@ -563,6 +586,7 @@ export class MemoryReviewer {
     }
     await validateSnapshot();
     if (batchKey) this.incremental.delete(batchKey);
+    else this.fullCursor = undefined;
     // Once a store call starts, it may commit even if cancellation, source changes,
     // index reconciliation or the call itself fails. Never automatically retry it.
     try {
@@ -609,6 +633,7 @@ export class MemoryReviewer {
 export async function createConfiguredPiMemoryReviewer(
   ctx: Pick<ExtensionContext, "cwd" | "isProjectTrusted" | "modelRegistry">,
   store: ReviewerStore,
+  fullContinuation?: ManualResumePermit,
 ): Promise<MemoryReviewer> {
   if (!ctx.isProjectTrusted())
     throw new Error("project trust is required for memory review");
@@ -624,6 +649,7 @@ export async function createConfiguredPiMemoryReviewer(
     store,
     ctx,
     configuredModel,
+    fullContinuation,
   });
 }
 export function createPiMemoryReviewer(options: {
@@ -631,6 +657,7 @@ export function createPiMemoryReviewer(options: {
   store: ReviewerStore;
   ctx: Pick<ExtensionContext, "modelRegistry">;
   configuredModel: string;
+  fullContinuation?: ManualResumePermit;
 }): MemoryReviewer {
   return new MemoryReviewer({
     project: options.project,
@@ -639,5 +666,6 @@ export function createPiMemoryReviewer(options: {
       options.ctx.modelRegistry,
       options.configuredModel,
     ),
+    fullContinuation: options.fullContinuation,
   });
 }

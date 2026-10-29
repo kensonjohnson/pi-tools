@@ -1,0 +1,75 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { MemoryScheduler } from "./scheduler.ts";
+import Database from "better-sqlite3";
+
+test("reports persist bounded changes, unresolved outcomes and explicit resume", async () => {
+  const root = await mkdtemp(join(tmpdir(), "review-report-")),
+    runtimeDir = join(root, "runtime"),
+    sessionDir = join(root, "sessions");
+  await mkdir(sessionDir);
+  const opts = {
+    project: root,
+    runtimeDir,
+    sessionDir,
+    automatic: false,
+    work: async () => ({ status: "done" as const }),
+  };
+  let scheduler = new MemoryScheduler(opts);
+  try {
+    for (let i = 0; i < 23; i++) {
+      await scheduler.runManual(async () => ({
+        status: "done",
+        detail: `run ${i}`,
+        changes: [{ id: `id-${i}`, detail: "Changed record." }],
+      }));
+      await scheduler.waitForIdle();
+    }
+    const many = Array.from({ length: 20 }, (_, i) => ({
+      id: `change-${i}`,
+      detail: `Changed ${i}`,
+    }));
+    await scheduler.runManual(async () => ({
+      status: "done",
+      detail: "Many changes.",
+      changes: many,
+    }));
+    await scheduler.waitForIdle();
+    const event = scheduler.report().events[0];
+    assert.equal(event.changesTotal, 20);
+    assert.equal(event.changes.length, 12);
+    assert.equal(event.changesOmitted, 8);
+    const unresolved = await scheduler.runManual(async () => ({
+      status: "unresolved",
+      detail: "User instruction conflicts with code.",
+    }));
+    await scheduler.waitForIdle();
+    assert.equal(unresolved.status, "unresolved");
+    assert.equal(scheduler.status().paused, true);
+    assert.equal(scheduler.report().events.length, 20);
+    assert.match(scheduler.report().events[0].detail, /conflicts/);
+    await scheduler.shutdown();
+    scheduler = new MemoryScheduler(opts);
+    assert.equal(scheduler.status().paused, true);
+    assert.equal(scheduler.report().events[0].status, "unresolved");
+    await assert.rejects(
+      scheduler.runManual(async () => ({ status: "done" })),
+      /paused/,
+    );
+    scheduler.resume({ schedule: false });
+    assert.equal(scheduler.status().paused, false);
+    const state = new Database(join(runtimeDir, "scheduler.sqlite"));
+    state.exec("UPDATE meta SET inflight=1,status='manual-running' WHERE id=1");
+    state.close();
+    const interrupted = scheduler.report();
+    assert.equal(interrupted.status.status, "interrupted-uncertain");
+    assert.equal(interrupted.status.paused, true);
+    assert.equal(interrupted.events[0].status, "uncertain");
+  } finally {
+    await scheduler.shutdown();
+    await rm(root, { recursive: true, force: true });
+  }
+});
