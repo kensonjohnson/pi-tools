@@ -38,6 +38,13 @@ type State = {
 };
 export type ReviewIssue = { path?: string; reason: string };
 export type ReviewItem = { id: string; role: string; text: string };
+export type SessionBoundary = {
+  leaf: string | null;
+  dev: number;
+  ino: number;
+  size: number;
+  hash: string;
+};
 export type ReviewBatch = {
   path: string;
   sessionId: string;
@@ -46,6 +53,10 @@ export type ReviewBatch = {
   items: ReviewItem[];
   /** More entries remain on the snapshotted active branch. */
   more: boolean;
+  /** Exact source prefix captured when this batch was discovered. */
+  sourceBoundary?: SessionBoundary;
+  /** True when a saved source boundary was verified for this batch. */
+  resumedBoundary?: boolean;
   acknowledge: () => void;
 };
 export type ReviewOptions = {
@@ -340,7 +351,12 @@ export class SessionReview {
       db.close();
     }
   }
-  discover(options: { continue?: boolean } = {}): {
+  discover(
+    options: {
+      continue?: boolean;
+      boundaries?: ReadonlyMap<string, SessionBoundary>;
+    } = {},
+  ): {
     batches: ReviewBatch[];
     issues: ReviewIssue[];
     continuation: boolean;
@@ -515,11 +531,32 @@ export class SessionReview {
               });
           }
         }
+        const boundary = options.boundaries?.get(path);
+        let branchEnd = s.branch.length;
+        let resumedBoundary = false;
+        if (
+          boundary &&
+          boundary.dev === s.dev &&
+          boundary.ino === s.ino &&
+          Number.isSafeInteger(boundary.size) &&
+          boundary.size >= 0 &&
+          boundary.size <= s.bytes.length &&
+          hash(s.bytes.subarray(0, boundary.size)) === boundary.hash
+        ) {
+          const index =
+            boundary.leaf === null
+              ? -1
+              : s.branch.findIndex((entry) => entry.id === boundary.leaf);
+          if ((boundary.leaf === null || index >= 0) && index + 1 >= start) {
+            branchEnd = index + 1;
+            resumedBoundary = true;
+          }
+        }
         const items: ReviewItem[] = [];
         let end = start;
         let blocked = false;
         const budget = Math.min(this.maxText, this.maxScanText - textBytes);
-        for (let index = start; index < s.branch.length; index++) {
+        for (let index = start; index < branchEnd; index++) {
           const entry = s.branch[index];
           if (entry.type === "message") {
             const message = entry.message;
@@ -583,7 +620,7 @@ export class SessionReview {
             path,
             reason: "review text budget reached; more branch entries remain",
           });
-        if (end === start && more) {
+        if (end === start && end < branchEnd) {
           if (!blocked) {
             this.pending = name;
             break;
@@ -607,6 +644,14 @@ export class SessionReview {
           leaf: batchLeaf,
           items,
           more,
+          resumedBoundary,
+          sourceBoundary: {
+            leaf: batchLeaf,
+            dev: s.dev,
+            ino: s.ino,
+            size: s.bytes.length,
+            hash: hash(s.bytes),
+          },
           acknowledge: () => {
             if (acknowledged) throw new Error("batch already acknowledged");
             const current = snapshot(path, this.maxFile);

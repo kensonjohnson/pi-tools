@@ -19,7 +19,10 @@ import type { ReviewBatch } from "./session-review.ts";
 import { validateSessionBatch } from "./reviewer-session.ts";
 import {
   resolveManualResumePermit,
+  resolveIncrementalResumePermit,
+  incrementalBatchKey,
   type ManualResumePermit,
+  type IncrementalResumePermit,
 } from "./scheduler.ts";
 
 export type ReviewerStore = {
@@ -310,6 +313,7 @@ export class MemoryReviewer {
       signal?: AbortSignal;
       fullOffset?: number;
       fullSnapshot?: string;
+      incrementalContinuation?: IncrementalResumePermit;
     } = {},
   ): Promise<ReviewResult> {
     const { batch, signal } = options;
@@ -332,18 +336,23 @@ export class MemoryReviewer {
       new Set(session.map((x) => x.id)).size !== session.length
     )
       throw new Error("invalid or oversized session input");
-    const batchKey = batch
-      ? createHash("sha256")
-          .update(
-            JSON.stringify({
-              path: batch.path,
-              sessionId: batch.sessionId,
-              leaf: batch.leaf,
-              items: session,
-            }),
-          )
-          .digest("hex")
-      : undefined;
+    const batchKey = batch ? incrementalBatchKey(batch) : undefined;
+    if (options.incrementalContinuation) {
+      const permit = resolveIncrementalResumePermit(
+        options.incrementalContinuation,
+      );
+      if (
+        !batchKey ||
+        permit.key !== batchKey ||
+        permit.offset !== offset ||
+        permit.snapshot !== options.fullSnapshot
+      )
+        throw new Error("incremental review continuation does not match batch");
+      this.incremental.set(batchKey, {
+        offset: permit.offset,
+        snapshot: permit.snapshot,
+      });
+    }
     if (offset > 0) {
       if (options.fullSnapshot !== snapshotHash)
         throw new Error(

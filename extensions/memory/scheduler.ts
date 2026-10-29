@@ -5,8 +5,8 @@ import {
   openSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { dirname, join, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
   open,
@@ -18,6 +18,7 @@ import {
 import Database from "better-sqlite3";
 import { SessionReview } from "./session-review.ts";
 import type { MemoryReviewer } from "./reviewer.ts";
+import type { ReviewBatch, SessionBoundary } from "./session-review.ts";
 
 export type SchedulerStatus = {
   pending: number;
@@ -71,6 +72,34 @@ export function resolveManualResumePermit(permit: ManualResumePermit): {
   const cursor = resumePermits.get(permit);
   if (!cursor) throw new Error("invalid manual review continuation permit");
   return { ...cursor };
+}
+declare const incrementalResumeBrand: unique symbol;
+export type IncrementalResumePermit = {
+  readonly [incrementalResumeBrand]: true;
+};
+const incrementalPermits = new WeakMap<
+  object,
+  { key: string; offset: number; snapshot: string }
+>();
+export function resolveIncrementalResumePermit(
+  permit: IncrementalResumePermit,
+) {
+  const cursor = incrementalPermits.get(permit);
+  if (!cursor)
+    throw new Error("invalid incremental review continuation permit");
+  return { ...cursor };
+}
+export function incrementalBatchKey(batch: ReviewBatch): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        path: batch.path,
+        sessionId: batch.sessionId,
+        leaf: batch.leaf,
+        items: batch.items,
+      }),
+    )
+    .digest("hex");
 }
 export type ManualProgress = {
   current?: { offset: number; snapshot: string };
@@ -231,6 +260,9 @@ export class MemoryScheduler {
         this.db.exec(
           "ALTER TABLE review_events ADD COLUMN changes_total INTEGER NOT NULL DEFAULT 0",
         );
+      this.db.exec(
+        "CREATE TABLE IF NOT EXISTS directory_turn (path TEXT PRIMARY KEY, sequence INTEGER NOT NULL)",
+      );
       this.db
         .prepare("INSERT OR IGNORE INTO meta VALUES (1, ?, 0, 0, 0, 'idle')")
         .run(this.options.project);
@@ -824,13 +856,20 @@ export class MemoryScheduler {
       if (this.clock.now() < meta.cooldown) return;
       const item = this.db
         .prepare(
-          "SELECT path,pending FROM directories WHERE pending>completed ORDER BY path LIMIT 1",
+          "SELECT d.path,d.pending FROM directories d LEFT JOIN directory_turn t ON t.path=d.path WHERE d.pending>d.completed ORDER BY COALESCE(t.sequence,0),d.path LIMIT 1",
         )
         .get() as { path: string; pending: number } | undefined;
       if (!item) return;
-      this.db
-        .prepare("UPDATE meta SET inflight=1,status='running' WHERE id=1")
-        .run();
+      this.db.transaction(() => {
+        this.db
+          .prepare(
+            "INSERT INTO directory_turn(path,sequence) VALUES (?,(SELECT COALESCE(MAX(sequence),0)+1 FROM directory_turn)) ON CONFLICT(path) DO UPDATE SET sequence=excluded.sequence",
+          )
+          .run(item.path);
+        this.db
+          .prepare("UPDATE meta SET inflight=1,status='running' WHERE id=1")
+          .run();
+      })();
       this.controller = new AbortController();
       let outcome: SchedulerOutcome;
       try {
@@ -931,6 +970,21 @@ export async function reviewProjectSessions(options: {
     checkpointFile: options.checkpointFile,
   });
   const maxPasses = options.maxPasses ?? 24;
+  mkdirSync(dirname(options.checkpointFile), { recursive: true, mode: 0o700 });
+  const cursorPath = `${options.checkpointFile}.incremental.db`;
+  const cursorFd = openSync(cursorPath, "a", 0o600);
+  closeSync(cursorFd);
+  chmodSync(cursorPath, 0o600);
+  const cursors = new Database(cursorPath, { timeout: 0 });
+  cursors.pragma("synchronous = FULL");
+  cursors.exec(
+    "CREATE TABLE IF NOT EXISTS cursors (path TEXT PRIMARY KEY, batch_key TEXT NOT NULL, offset INTEGER NOT NULL, snapshot TEXT NOT NULL, boundary TEXT)",
+  );
+  const columns = cursors.pragma("table_info(cursors)") as Array<{
+    name: string;
+  }>;
+  if (!columns.some((column) => column.name === "boundary"))
+    cursors.exec("ALTER TABLE cursors ADD COLUMN boundary TEXT");
   let passes = 0;
   let continuation = false;
   let unavailable = false;
@@ -938,7 +992,17 @@ export async function reviewProjectSessions(options: {
   try {
     do {
       options.signal.throwIfAborted();
-      const scan = source.discover({ continue: continuation });
+      const boundaries = new Map<string, SessionBoundary>();
+      for (const row of cursors
+        .prepare("SELECT path,boundary FROM cursors WHERE boundary IS NOT NULL")
+        .all() as Array<{ path: string; boundary: string }>) {
+        try {
+          boundaries.set(row.path, JSON.parse(row.boundary));
+        } catch {
+          /* Invalid cursors cannot be resumed. */
+        }
+      }
+      const scan = source.discover({ continue: continuation, boundaries });
       continuation = scan.continuation;
       unavailable ||= scan.issues.some(
         (issue) =>
@@ -948,7 +1012,31 @@ export async function reviewProjectSessions(options: {
           ),
       );
       for (const batch of scan.batches) {
-        let offset: number | undefined, fullSnapshot: string | undefined;
+        const key = incrementalBatchKey(batch);
+        const saved = cursors
+          .prepare(
+            "SELECT batch_key,offset,snapshot,boundary FROM cursors WHERE path=?",
+          )
+          .get(batch.path) as
+          | {
+              batch_key: string;
+              offset: number;
+              snapshot: string;
+              boundary: string | null;
+            }
+          | undefined;
+        const canResume =
+          !!saved &&
+          saved.batch_key === key &&
+          !!saved.boundary &&
+          batch.resumedBoundary === true;
+        if (saved && !canResume)
+          cursors.prepare("DELETE FROM cursors WHERE path=?").run(batch.path);
+        let offset: number | undefined = canResume ? saved!.offset : undefined;
+        let fullSnapshot: string | undefined = canResume
+          ? saved!.snapshot
+          : undefined;
+        let needsPermit = offset !== undefined;
         while (true) {
           options.signal.throwIfAborted();
           if (++passes > maxPasses)
@@ -957,15 +1045,48 @@ export async function reviewProjectSessions(options: {
               detail: "Review pass limit reached; work remains pending.",
               changes,
             };
-          const result = await options.reviewer.review({
-            batch,
-            signal: options.signal,
-            fullOffset: offset,
-            fullSnapshot,
-          });
+          let permit: IncrementalResumePermit | undefined;
+          if (needsPermit) {
+            permit = {} as IncrementalResumePermit;
+            incrementalPermits.set(permit, {
+              key,
+              offset: offset!,
+              snapshot: fullSnapshot!,
+            });
+          }
+          let result;
+          try {
+            result = await options.reviewer.review({
+              batch,
+              signal: options.signal,
+              fullOffset: offset,
+              fullSnapshot,
+              incrementalContinuation: permit,
+            });
+          } catch (error) {
+            if (
+              needsPermit &&
+              error instanceof Error &&
+              error.message ===
+                "review snapshot changed or is missing; restart at zero"
+            ) {
+              cursors
+                .prepare("DELETE FROM cursors WHERE path=?")
+                .run(batch.path);
+              offset = undefined;
+              fullSnapshot = undefined;
+              needsPermit = false;
+              continue;
+            }
+            throw error;
+          } finally {
+            if (permit) incrementalPermits.delete(permit);
+          }
+          needsPermit = false;
           if (result.status === "uncertain" || result.status === "unresolved")
             return { status: result.status, detail: result.detail, changes };
           if (result.status === "applied") {
+            cursors.prepare("DELETE FROM cursors WHERE path=?").run(batch.path);
             if (result.memoryId)
               changes.push({ id: result.memoryId, detail: result.detail });
             offset = undefined;
@@ -973,12 +1094,33 @@ export async function reviewProjectSessions(options: {
             continue;
           }
           if (result.nextOffset !== undefined) {
+            if (
+              !result.fullSnapshot ||
+              result.fullSnapshot.length > 256 ||
+              !Number.isSafeInteger(result.nextOffset) ||
+              result.nextOffset < 1
+            )
+              throw new Error("invalid incremental review cursor");
+            cursors
+              .prepare(
+                "INSERT INTO cursors(path,batch_key,offset,snapshot,boundary) VALUES (?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET batch_key=excluded.batch_key,offset=excluded.offset,snapshot=excluded.snapshot,boundary=excluded.boundary",
+              )
+              .run(
+                batch.path,
+                key,
+                result.nextOffset,
+                result.fullSnapshot,
+                batch.sourceBoundary
+                  ? JSON.stringify(batch.sourceBoundary)
+                  : null,
+              );
             offset = result.nextOffset;
             fullSnapshot = result.fullSnapshot;
             continue;
           }
           if (!result.acknowledged)
             return { status: "unresolved", detail: result.detail, changes };
+          cursors.prepare("DELETE FROM cursors WHERE path=?").run(batch.path);
           if (batch.more)
             return {
               status: "pending",
@@ -1010,6 +1152,7 @@ export async function reviewProjectSessions(options: {
       };
     throw error;
   } finally {
+    cursors.close();
     source.close();
   }
 }
