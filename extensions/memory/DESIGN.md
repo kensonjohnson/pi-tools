@@ -88,20 +88,18 @@ function serializeMemory(obj: MemoryLine): string {
 
 ### Loading Strategy
 
-Pi starts a fresh session with **<1K tokens**.
-
 **Session start** (and after compaction):
 
 1. Inject full contents of `knowledge.ndjson`
-2. Inject a compact index of `practices.ndjson` + `decisions.ndjson`
+2. Direct the agent to use `memory_recall` for relevant practices and decisions
 
-**On-demand**: Agent calls `memory_recall` to retrieve full entries.
+**On-demand**: Agent calls `memory_recall` to retrieve relevant entries. The briefing is refreshed on a new session or the first agent turn after compaction, not on ordinary turns.
 
 |                | `knowledge.ndjson` | `practices.ndjson` + `decisions.ndjson` |
 | -------------- | ------------------ | --------------------------------------- |
-| **Loaded**     | Eager              | Lazy                                    |
+| **Loaded**     | Eager              | On demand                               |
 | **Volatility** | Low                | Medium                                  |
-| **Size**       | <50 lines typical  | Grows with project                      |
+| **Size**       | No fixed limit     | Grows with project                      |
 
 ## Tools
 

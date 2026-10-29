@@ -29,38 +29,14 @@ const MEMORY_TOOL_NAMES = [
   "memory_list",
 ] as const;
 
-const managers = new Map<string, Promise<MemoryManager>>();
-
 function isMemoryCategory(value: string | undefined): value is MemoryCategory {
   return (
     value !== undefined && MEMORY_CATEGORIES.includes(value as MemoryCategory)
   );
 }
 
-async function getManager(cwd: string): Promise<MemoryManager> {
-  const existing = managers.get(cwd);
-  if (existing) {
-    return existing;
-  }
-
-  const created = Promise.resolve(new MemoryManager(cwd));
-  managers.set(cwd, created);
-  return created;
-}
-
 const NOT_ENABLED_MESSAGE =
   "Memory tracking is not enabled for this project. Run `memory_init` to create the memory store and enable it.";
-
-async function getReadyManager(
-  ctx: ExtensionContext,
-): Promise<MemoryManager | undefined> {
-  if (!(await isExtensionEnabled(ctx, CONFIG_DIR_NAME, MEMORY_EXTENSION_ID))) {
-    return undefined;
-  }
-
-  const manager = await getManager(ctx.cwd);
-  return (await manager.isReady()) ? manager : undefined;
-}
 
 function formatRecall(
   result: Awaited<ReturnType<MemoryManager["recall"]>>,
@@ -112,27 +88,41 @@ function textResult(text: string, details?: unknown) {
   };
 }
 
-const injectedSessions = new Set<string>();
+export default function (pi: ExtensionAPI) {
+  const managers = new Map<string, Promise<MemoryManager>>();
+  const injectedSessions = new Set<string>();
 
-async function injectMemoryMessage(ctx: ExtensionContext) {
-  const manager = await getReadyManager(ctx);
-  if (!manager) return;
-
-  const promptContext = await manager.buildPromptContext();
-  if (!promptContext) {
-    return;
+  async function getReadyManager(
+    ctx: ExtensionContext,
+  ): Promise<MemoryManager | undefined> {
+    if (
+      !(await isExtensionEnabled(ctx, CONFIG_DIR_NAME, MEMORY_EXTENSION_ID))
+    ) {
+      return undefined;
+    }
+    let manager = managers.get(ctx.cwd);
+    if (!manager) {
+      manager = Promise.resolve(new MemoryManager(ctx.cwd));
+      managers.set(ctx.cwd, manager);
+    }
+    const ready = await manager;
+    return (await ready.isReady()) ? ready : undefined;
   }
 
-  return {
-    message: {
-      customType: "project_memory",
-      content: `Project memory:\n${promptContext}`,
-      display: false,
-    },
-  };
-}
+  async function injectMemoryMessage(ctx: ExtensionContext) {
+    const manager = await getReadyManager(ctx);
+    if (!manager) return;
+    const promptContext = await manager.buildPromptContext();
+    if (!promptContext) return null;
+    return {
+      message: {
+        customType: "project_memory",
+        content: `Project memory:\n${promptContext}`,
+        display: false,
+      },
+    };
+  }
 
-export default function (pi: ExtensionAPI) {
   publishExtensionSettings(pi.events, {
     id: MEMORY_EXTENSION_ID,
     label: "Project Memory",
@@ -171,16 +161,15 @@ export default function (pi: ExtensionAPI) {
     }
 
     const result = await injectMemoryMessage(ctx);
-    if (result) {
+    if (result !== undefined) {
       injectedSessions.add(sessionId);
     }
-    return result;
+    return result ?? undefined;
   });
 
-  pi.on("session_compact", async () => {
-    // After compaction, the injected message may have been summarized away.
-    // Clear tracking so the next before_agent_start re-injects.
-    injectedSessions.clear();
+  pi.on("session_compact", async (_event, ctx) => {
+    // The message may have been summarized away; reinject for this session.
+    injectedSessions.delete(ctx.sessionManager.getSessionId());
   });
 
   pi.registerTool({

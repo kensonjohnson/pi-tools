@@ -447,40 +447,12 @@ export class NdjsonMemoryStore {
 
   async buildPromptContext(): Promise<string> {
     const knowledge = await this.readCategory("knowledge");
-    const practices = await this.readCategory("practices");
-    const decisions = await this.readCategory("decisions");
+    if (knowledge.length === 0) return "";
 
-    if (
-      knowledge.length === 0 &&
-      practices.length === 0 &&
-      decisions.length === 0
-    ) {
-      return "";
-    }
-
-    const sections: string[] = [];
-
-    if (knowledge.length > 0) {
-      sections.push(
-        `Knowledge:\n${knowledge.map((entry) => `- ${entry.content}`).join("\n")}`,
-      );
-    }
-
-    const summarize = (title: string, items: StoredMemoryLine[]) => {
-      if (items.length === 0) {
-        return;
-      }
-
-      const lines = items
-        .slice(0, 20)
-        .map((entry) => `- ${truncate(entry.content, 120)}`);
-      sections.push(`${title} index:\n${lines.join("\n")}`);
-    };
-
-    summarize("Practices", practices);
-    summarize("Decisions", decisions);
-
-    return sections.join("\n\n");
+    return [
+      `Knowledge:\n${knowledge.map((entry) => `- ${entry.content}`).join("\n")}`,
+      "Use memory_recall to find relevant project practices and decisions when needed.",
+    ].join("\n\n");
   }
 
   private async readCategory(
