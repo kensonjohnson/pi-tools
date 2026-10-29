@@ -6,12 +6,33 @@ import {
 import { Type } from "@sinclair/typebox";
 import { Text } from "@earendil-works/pi-tui";
 import {
+  dirname,
+  extname,
+  isAbsolute,
+  join,
+  relative,
+  resolve,
+  sep,
+} from "node:path";
+import {
   MEMORY_CATEGORIES,
   type MemoryCategory,
   MemoryManager,
 } from "./core.ts";
-import { publishExtensionSettings } from "../../lib/pi-tools-config.ts";
 import {
+  getSettingValue,
+  publishExtensionSettings,
+} from "../../lib/pi-tools-config.ts";
+import {
+  MemoryScheduler,
+  UNSUPPORTED_FILE_SOURCE,
+  persistSchedulerActivity,
+  reviewProjectSessions,
+  type SchedulerOptions,
+} from "./scheduler.ts";
+import { createConfiguredPiMemoryReviewer } from "./reviewer.ts";
+import {
+  getRuntimeSettings,
   isExtensionEnabled,
   removeDisabledTools,
 } from "../../lib/pi-tools-runtime-settings.ts";
@@ -91,6 +112,8 @@ function textResult(text: string, details?: unknown) {
 export default function (pi: ExtensionAPI) {
   const managers = new Map<string, Promise<MemoryManager>>();
   const injectedSessions = new Set<string>();
+  let scheduler: MemoryScheduler | undefined;
+  let schedulerBoot: { activity(): void; stop(): Promise<void> } | undefined;
 
   async function getReadyManager(
     ctx: ExtensionContext,
@@ -134,6 +157,29 @@ export default function (pi: ExtensionAPI) {
         default: true,
         label: "Enabled",
       },
+      "historyReview.enabled": {
+        type: "boolean",
+        default: true,
+        label: "Review session history",
+        description:
+          "When enabled, background review sends project session text and selected repository excerpts to the explicitly configured reviewer model provider.",
+      },
+      "historyReview.debounceSeconds": {
+        type: "number",
+        default: 30,
+        minimum: 0,
+        maximum: 3600,
+        integer: true,
+        label: "Review debounce seconds",
+      },
+      "historyReview.cooldownSeconds": {
+        type: "number",
+        default: 300,
+        minimum: 0,
+        maximum: 86400,
+        integer: true,
+        label: "Review cooldown seconds",
+      },
       "models.reviewer": {
         type: "string",
         default: "",
@@ -159,14 +205,255 @@ export default function (pi: ExtensionAPI) {
       MEMORY_TOOL_NAMES,
       await isExtensionEnabled(ctx, CONFIG_DIR_NAME, MEMORY_EXTENSION_ID),
     );
+    if (!ctx.isProjectTrusted()) return;
+    const settings = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);
+    if (
+      getSettingValue<boolean>(settings, MEMORY_EXTENSION_ID, "enabled") ===
+        false ||
+      getSettingValue<boolean>(
+        settings,
+        MEMORY_EXTENSION_ID,
+        "historyReview.enabled",
+      ) !== true ||
+      !getSettingValue<string>(
+        settings,
+        MEMORY_EXTENSION_ID,
+        "models.reviewer",
+      )?.trim()
+    )
+      return;
+    const configuredDir = ctx.sessionManager?.getSessionDir?.();
+    const sessionFile = ctx.sessionManager?.getSessionFile?.();
+    if (!sessionFile) return; // Ephemeral sessions cannot be discovered or resumed.
+    const sessionDir = dirname(resolve(sessionFile));
+    // SessionReview discovers JSONL only. Persist an explicit unavailable source
+    // so an active custom filename cannot be silently marked complete.
+    const unsupportedFile =
+      extname(sessionFile) === ".jsonl"
+        ? undefined
+        : `${UNSUPPORTED_FILE_SOURCE}${resolve(sessionFile)}`;
+    const isWorkerDir = (dir: string) => {
+      const workerRelative = relative(
+        resolve(ctx.cwd, "tmp/subagents"),
+        resolve(dir),
+      );
+      return (
+        workerRelative === "" ||
+        (workerRelative !== ".." &&
+          !workerRelative.startsWith(`..${sep}`) &&
+          !isAbsolute(workerRelative))
+      );
+    };
+    if (
+      isWorkerDir(sessionDir) ||
+      (configuredDir && isWorkerDir(configuredDir))
+    )
+      return;
+    const manager = await getReadyManager(ctx);
+    if (!manager) return;
+    const runtimeDir = join(
+      ctx.cwd,
+      CONFIG_DIR_NAME,
+      "memory",
+      ".runtime",
+      "review-scheduler",
+    );
+    const schedulerOptions: SchedulerOptions = {
+      project: ctx.cwd,
+      runtimeDir,
+      sessionDir,
+      additionalSessionDirs: configuredDir ? [configuredDir] : [],
+      additionalSources: unsupportedFile ? [unsupportedFile] : [],
+      debounceMs:
+        (getSettingValue<number>(
+          settings,
+          MEMORY_EXTENSION_ID,
+          "historyReview.debounceSeconds",
+        ) ?? 30) * 1000,
+      cooldownMs:
+        (getSettingValue<number>(
+          settings,
+          MEMORY_EXTENSION_ID,
+          "historyReview.cooldownSeconds",
+        ) ?? 300) * 1000,
+      work: async (directory, signal) => {
+        const current = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);
+        if (
+          !ctx.isProjectTrusted() ||
+          getSettingValue<boolean>(current, MEMORY_EXTENSION_ID, "enabled") ===
+            false ||
+          getSettingValue<boolean>(
+            current,
+            MEMORY_EXTENSION_ID,
+            "historyReview.enabled",
+          ) !== true ||
+          !getSettingValue<string>(
+            current,
+            MEMORY_EXTENSION_ID,
+            "models.reviewer",
+          )?.trim()
+        )
+          return { status: "pending" };
+        signal.throwIfAborted();
+        if (directory.startsWith(UNSUPPORTED_FILE_SOURCE))
+          return {
+            status: "unsupported-session",
+            detail:
+              "The explicitly opened session filename is not JSONL; activity remains pending.",
+          };
+        const reviewer = await createConfiguredPiMemoryReviewer(ctx, manager);
+        return reviewProjectSessions({
+          project: ctx.cwd,
+          sessionDir: directory,
+          checkpointFile: join(runtimeDir, "session-progress.json"),
+          reviewer,
+          signal,
+        });
+      },
+      onStatus: (status: string) => {
+        if (
+          ctx.hasUI &&
+          [
+            "error",
+            "uncertain",
+            "unresolved",
+            "interrupted-uncertain",
+            "activity-persist-pending",
+            "unsupported-session",
+          ].includes(status)
+        )
+          ctx.ui.notify(
+            status === "unsupported-session"
+              ? "Memory review cannot inspect an explicitly opened non-JSONL session; its activity remains pending."
+              : `Memory review ${status}; pending work was retained.`,
+            "warning",
+          );
+      },
+    };
+    // SQLite initialization can encounter a project writer. Retry without blocking
+    // the lifecycle hook; activity is spooled independently while initialization waits.
+    let stopped = false,
+      pending = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    let writing: Promise<void> | undefined;
+    const scheduleRetry = () => {
+      if (stopped || retry) return;
+      retry = setTimeout(() => {
+        retry = undefined;
+        initialize();
+        if (pending) flush();
+      }, 1000);
+      retry.unref();
+    };
+    const flush = () => {
+      if (writing || !pending) return;
+      writing = (async () => {
+        while (pending) {
+          pending = false;
+          try {
+            await persistSchedulerActivity(runtimeDir, [
+              sessionDir,
+              ...(configuredDir ? [configuredDir] : []),
+              ...(unsupportedFile ? [unsupportedFile] : []),
+            ]);
+          } catch {
+            pending = true;
+            console.error(
+              "Memory review activity could not be persisted; retry is pending.",
+            );
+            scheduleRetry();
+            break;
+          }
+        }
+        scheduler?.start();
+      })().finally(() => {
+        writing = undefined;
+        if (pending) scheduleRetry();
+      });
+    };
+    const initialize = () => {
+      if (stopped || scheduler) return;
+      try {
+        scheduler = new MemoryScheduler(schedulerOptions);
+        scheduler.start();
+      } catch {
+        console.error("Memory review scheduler unavailable; retry is pending.");
+        scheduleRetry();
+      }
+    };
+    schedulerBoot = {
+      activity() {
+        pending = true;
+        flush();
+      },
+      async stop() {
+        stopped = true;
+        if (retry) clearTimeout(retry);
+        if (pending && !writing) flush();
+        if (writing) {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          await Promise.race([
+            writing,
+            new Promise<void>((resolve) => {
+              timer = setTimeout(resolve, 1000);
+            }),
+          ]);
+          if (timer) clearTimeout(timer);
+        }
+        if (pending)
+          console.error(
+            "Memory review shutdown could not persist pending activity.",
+          );
+      },
+    };
+    initialize();
+  });
+
+  pi.on("agent_settled", () => {
+    const active = scheduler;
+    if (!active) {
+      schedulerBoot?.activity();
+      return;
+    }
+    if (active)
+      void Promise.resolve()
+        .then(() => active.activity())
+        .catch(() => {
+          // The scheduler retains the signal and retries; expose failure rather than dropping it.
+          console.error(
+            "Memory review activity could not yet be persisted; retry is pending.",
+          );
+        });
   });
 
   pi.on("session_shutdown", async () => {
-    for (const entry of managers.values()) {
-      const manager = await entry;
-      await manager.close();
-    }
+    const active = scheduler;
+    scheduler = undefined;
+    const boot = schedulerBoot;
+    schedulerBoot = undefined;
+    await boot?.stop();
+    const result = await active?.shutdown();
+    const entries = [...managers.values()];
     managers.clear();
+    const closeManagers = async () => {
+      for (const entry of entries) {
+        const manager = await entry;
+        await manager.close();
+      }
+    };
+    if (result?.status === "quarantined" && active) {
+      // The claim and manager remain owned until an abort-ignoring operation settles.
+      void active
+        .waitForIdle()
+        .finally(closeManagers)
+        .catch(() => {});
+    } else {
+      if (result?.status === "activity-unpersisted")
+        console.error(
+          "Memory review shutdown could not persist pending activity.",
+        );
+      await closeManagers();
+    }
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
