@@ -1,7 +1,5 @@
 import Database from "better-sqlite3";
 import { v7 as uuidv7 } from "uuid";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import {
   access,
   lstat,
@@ -17,8 +15,6 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import * as sqliteVec from "sqlite-vec";
-
-const execFileAsync = promisify(execFile);
 
 export const MEMORY_CATEGORIES = [
   "knowledge",
@@ -97,6 +93,7 @@ interface MemoryManagerOptions {
   embeddingModel?: string;
   embeddingDimensions?: number;
   semanticEnabled?: boolean;
+  embeddingProvider?: EmbeddingProvider | null;
 }
 
 interface EmbeddingProvider {
@@ -110,6 +107,7 @@ const DEFAULT_OPTIONS: Required<MemoryManagerOptions> = {
   embeddingModel: "sentence-transformers/all-MiniLM-L6-v2",
   embeddingDimensions: 384,
   semanticEnabled: true,
+  embeddingProvider: null,
 };
 
 const MODEL_ALIASES: Record<string, string> = {
@@ -344,6 +342,45 @@ export class NdjsonMemoryStore {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }
     }
+  }
+
+  /** Hold the project lock while reconciling a canonical snapshot and reading its index. */
+  async withIndexSnapshot<T>(
+    operation: (
+      memories: StoredMemoryLine[],
+      validate: () => Promise<void>,
+    ) => Promise<T>,
+  ): Promise<T> {
+    return this.withCategoryLock("knowledge", async () => {
+      const snapshots = await this.rawSnapshots();
+      const memories: StoredMemoryLine[] = [];
+      const ids = new Set<string>();
+      for (const category of MEMORY_CATEGORIES) {
+        for (const line of snapshots.get(category)!.contents.split(/\n/)) {
+          const memory = parseMemoryLine(line, category);
+          if (!memory) continue;
+          if (ids.has(memory.id))
+            throw new Error(`Memory conflict: duplicate id ${memory.id}`);
+          ids.add(memory.id);
+          memories.push(memory);
+        }
+      }
+      const validate = async () => {
+        const current = await this.rawSnapshots();
+        if (
+          !MEMORY_CATEGORIES.every(
+            (category) =>
+              current.get(category)!.contents ===
+                snapshots.get(category)!.contents &&
+              current.get(category)!.mode === snapshots.get(category)!.mode,
+          )
+        )
+          throw new Error(
+            "Memory index conflict: canonical files changed during reconciliation",
+          );
+      };
+      return operation(memories, validate);
+    });
   }
 
   async list(category?: MemoryCategory): Promise<StoredMemoryLine[]> {
@@ -994,7 +1031,7 @@ class PiMemoryIndex {
         category UNINDEXED,
         content
       );
-
+      CREATE TABLE IF NOT EXISTS memory_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     `);
 
     if (this.options.semanticEnabled) {
@@ -1011,10 +1048,20 @@ class PiMemoryIndex {
           );
         `);
 
-        this.embeddingProvider = new TransformersEmbeddingProvider(
-          this.embeddingModel,
-          this.embeddingDimensions,
+        const schema = this.dbReady
+          .prepare(`SELECT sql FROM sqlite_master WHERE name = 'vector_index'`)
+          .get() as { sql: string } | undefined;
+        const dimensions = schema?.sql.match(
+          /embedding\s+float\s*\[\s*(\d+)\s*\]/i,
         );
+        if (!dimensions || Number(dimensions[1]) !== this.embeddingDimensions)
+          throw new Error("Incompatible vector dimensions");
+        this.embeddingProvider =
+          this.options.embeddingProvider ??
+          new TransformersEmbeddingProvider(
+            this.embeddingModel,
+            this.embeddingDimensions,
+          );
         this.semanticAvailable = true;
       } catch {
         this.semanticAvailable = false;
@@ -1035,92 +1082,143 @@ class PiMemoryIndex {
     return this.semanticAvailable;
   }
 
-  async syncMemories(memories: StoredMemoryLine[]): Promise<void> {
-    await this.initialize();
-
-    const wantedIds = new Set(memories.map((memory) => memory.id));
-    const existingRows = this.dbReady
-      .prepare(`SELECT id FROM indexed_memories`)
-      .all() as Array<{ id: string }>;
-
-    for (const row of existingRows) {
-      if (!wantedIds.has(row.id)) {
-        await this.removeMemory(row.id);
-      }
-    }
-
-    for (const memory of memories) {
-      await this.upsertMemory(memory);
-    }
+  needsSync(memories: StoredMemoryLine[], force = false): boolean {
+    const rows = this.dbReady
+      .prepare(
+        `SELECT id, category, content, created_at AS created, updated_at AS updated FROM indexed_memories ORDER BY id`,
+      )
+      .all() as Array<{
+      id: string;
+      category: string;
+      content: string;
+      created: string;
+      updated: string | null;
+    }>;
+    const wanted = [...memories]
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .map((m) => ({
+        id: m.id,
+        category: m.category,
+        content: m.content,
+        created: m.created,
+        updated: m.updated ?? null,
+      }));
+    const changed = JSON.stringify(rows) !== JSON.stringify(wanted);
+    const vectorModel = this.dbReady
+      .prepare(`SELECT value FROM memory_meta WHERE key = 'vectors'`)
+      .get() as { value: string } | undefined;
+    const vectorKey = `${this.embeddingProvider?.name() ?? ""}:${this.embeddingDimensions}`;
+    return (
+      force ||
+      changed ||
+      (this.semanticAvailable && vectorModel?.value !== vectorKey)
+    );
   }
 
-  async upsertMemory(memory: StoredMemoryLine): Promise<void> {
-    await this.initialize();
-
-    const now = new Date().toISOString();
-    this.dbReady
-      .prepare(
-        `
-        INSERT INTO indexed_memories (id, category, content, created_at, updated_at, indexed_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-          category = excluded.category,
-          content = excluded.content,
-          created_at = excluded.created_at,
-          updated_at = excluded.updated_at,
-          indexed_at = excluded.indexed_at
-      `,
-      )
-      .run(
-        memory.id,
-        memory.category,
-        memory.content,
-        memory.created,
-        memory.updated || null,
-        now,
-      );
-
-    this.dbReady.prepare(`DELETE FROM memory_fts WHERE id = ?`).run(memory.id);
-    this.dbReady
-      .prepare(
-        `INSERT INTO memory_fts (id, category, content) VALUES (?, ?, ?)`,
-      )
-      .run(memory.id, memory.category, memory.content);
-
+  async prepareVectors(
+    memories: StoredMemoryLine[],
+    needed: boolean,
+  ): Promise<number[][] | null | undefined> {
+    if (!needed) return undefined;
+    let vectors: number[][] | null = null;
     if (this.semanticAvailable && this.embeddingProvider) {
       try {
-        const vector = await this.embeddingProvider.embed(memory.content);
-        this.indexVector(`memory:${memory.id}`, vector);
+        vectors = await this.embeddingProvider.embedBatch(
+          memories.map((m) => m.content),
+        );
+        if (
+          vectors.length !== memories.length ||
+          vectors.some(
+            (v) =>
+              v.length !== this.embeddingDimensions ||
+              v.some((n) => !Number.isFinite(n)),
+          )
+        )
+          throw new Error("Invalid embeddings");
       } catch {
         this.semanticAvailable = false;
+        vectors = null;
       }
     }
+    return vectors;
   }
 
-  async removeMemory(id: string): Promise<void> {
-    await this.initialize();
-
-    this.dbReady.prepare(`DELETE FROM indexed_memories WHERE id = ?`).run(id);
-    this.dbReady.prepare(`DELETE FROM memory_fts WHERE id = ?`).run(id);
-    if (this.semanticAvailable) {
-      this.removeVector(`memory:${id}`);
+  async prepareQuery(query: string | undefined): Promise<number[] | null> {
+    if (
+      query === undefined ||
+      !this.semanticAvailable ||
+      !this.embeddingProvider
+    )
+      return null;
+    try {
+      const result = await this.embeddingProvider.embed(query);
+      if (
+        result.length !== this.embeddingDimensions ||
+        result.some((n) => !Number.isFinite(n))
+      )
+        throw new Error("Invalid query embedding");
+      return result;
+    } catch {
+      this.semanticAvailable = false;
+      return null;
     }
   }
 
-  async search(
+  syncMemories(
+    memories: StoredMemoryLine[],
+    vectors: number[][] | null | undefined,
+    force = false,
+  ): void {
+    if (!this.needsSync(memories, force)) return;
+    if (this.semanticAvailable && vectors === undefined)
+      throw new Error("Memory index conflict: vector preparation needed");
+    const vectorKey = `${this.embeddingProvider?.name() ?? ""}:${this.embeddingDimensions}`;
+    const db = this.dbReady;
+    db.transaction(() => {
+      db.prepare(`DELETE FROM indexed_memories`).run();
+      db.prepare(`DELETE FROM memory_fts`).run();
+      const insert = db.prepare(
+        `INSERT INTO indexed_memories (id, category, content, created_at, updated_at, indexed_at) VALUES (?, ?, ?, ?, ?, ?)`,
+      );
+      const fts = db.prepare(
+        `INSERT INTO memory_fts (id, category, content) VALUES (?, ?, ?)`,
+      );
+      const now = new Date().toISOString();
+      for (const memory of memories) {
+        insert.run(
+          memory.id,
+          memory.category,
+          memory.content,
+          memory.created,
+          memory.updated ?? null,
+          now,
+        );
+        fts.run(memory.id, memory.category, memory.content);
+      }
+      if (this.semanticAvailable && vectors) {
+        db.prepare(`DELETE FROM vector_index`).run();
+        db.prepare(`DELETE FROM vector_item_map`).run();
+        for (let i = 0; i < memories.length; i++)
+          this.indexVector(`memory:${memories[i].id}`, vectors![i]);
+      }
+      db.prepare(
+        `INSERT OR REPLACE INTO memory_meta(key, value) VALUES ('vectors', ?)`,
+      ).run(this.semanticAvailable && vectors ? vectorKey : "invalid");
+    })();
+  }
+
+  search(
     query: string,
     category: MemoryCategory | undefined,
     limit: number,
-  ): Promise<RecallResult> {
-    await this.initialize();
-
+    embedding: number[] | null,
+  ): RecallResult {
     const ranked = new Map<string, SearchRow>();
     let mode: "semantic" | "fts" | "grep" = "grep";
 
-    if (this.semanticAvailable && this.embeddingProvider) {
+    if (this.semanticAvailable && embedding) {
       try {
-        const embedding = await this.embeddingProvider.embed(query);
-        const rows = this.searchVectors(embedding, limit * 3);
+        const rows = this.searchVectors(embedding, category, limit * 3);
         for (const row of rows) {
           ranked.set(row.itemId, row);
         }
@@ -1146,7 +1244,7 @@ class PiMemoryIndex {
     }
 
     if (ranked.size < limit) {
-      const rows = await this.searchRg(query, category, limit * 3);
+      const rows = this.searchLiteral(query, category, limit * 3);
       for (const row of rows) {
         if (!ranked.has(row.itemId)) {
           ranked.set(row.itemId, row);
@@ -1192,7 +1290,17 @@ class PiMemoryIndex {
     return { memories, searchMode: mode };
   }
 
-  private searchVectors(query: number[], limit: number): SearchRow[] {
+  private searchVectors(
+    query: number[],
+    category: MemoryCategory | undefined,
+    limit: number,
+  ): SearchRow[] {
+    const count = (
+      this.dbReady
+        .prepare(`SELECT COUNT(*) AS count FROM vector_item_map`)
+        .get() as { count: number }
+    ).count;
+    if (!count) return [];
     const rows = this.dbReady
       .prepare(
         `
@@ -1204,16 +1312,29 @@ class PiMemoryIndex {
         ORDER BY v.distance
       `,
       )
-      .all(new Float32Array(query), limit) as Array<{
+      .all(new Float32Array(query), count) as Array<{
       item_id: string;
       distance: number;
     }>;
 
-    return rows.map((row) => ({
-      itemId: row.item_id,
-      score: 1 / (1 + row.distance),
-      source: "semantic",
-    }));
+    const categoryOf = this.dbReady.prepare(
+      `SELECT category FROM indexed_memories WHERE id = ?`,
+    );
+    return rows
+      .filter(
+        (row) =>
+          !category ||
+          (
+            categoryOf.get(row.item_id.slice("memory:".length)) as
+              { category: string } | undefined
+          )?.category === category,
+      )
+      .slice(0, limit)
+      .map((row) => ({
+        itemId: row.item_id,
+        score: 1 / (1 + row.distance),
+        source: "semantic" as const,
+      }));
   }
 
   private searchFts(
@@ -1283,84 +1404,27 @@ class PiMemoryIndex {
     return rows;
   }
 
-  private async searchRg(
+  private searchLiteral(
     query: string,
     category: MemoryCategory | undefined,
     limit: number,
-  ): Promise<SearchRow[]> {
-    const rows: SearchRow[] = [];
-
-    try {
-      if (category) {
-        const file = join(this.memoryDir, categoryFileName(category));
-        const { stdout } = await execFileAsync("rg", [
-          "--no-heading",
-          "--line-number",
-          "--max-count",
-          String(limit),
-          query,
-          file,
-        ]);
-
-        const ids = await this.parseRgMemoryHits(stdout, category);
-        return ids.map((id, index) => ({
-          itemId: `memory:${id}`,
-          score: 0.4 - index * 0.01,
-          source: "grep",
-        }));
-      }
-
-      const memoryHits = await Promise.all(
-        MEMORY_CATEGORIES.map(async (entry) => {
-          const file = join(this.memoryDir, categoryFileName(entry));
-          const { stdout } = await execFileAsync("rg", [
-            "--no-heading",
-            "--line-number",
-            "--max-count",
-            String(limit),
-            query,
-            file,
-          ]);
-          return this.parseRgMemoryHits(stdout, entry);
-        }),
-      );
-
-      for (const ids of memoryHits.flat()) {
-        rows.push({
-          itemId: `memory:${ids}`,
-          score: 0.4,
-          source: "grep",
-        });
-      }
-    } catch {
-      return rows;
-    }
-
-    return rows;
-  }
-
-  private async parseRgMemoryHits(
-    stdout: string,
-    category: MemoryCategory,
-  ): Promise<string[]> {
-    const file = join(this.memoryDir, categoryFileName(category));
-    const lines = (await readFile(file, "utf8")).split(/\r?\n/);
-    const ids: string[] = [];
-
-    for (const line of stdout.split(/\r?\n/)) {
-      if (!line.trim()) {
-        continue;
-      }
-      const [, lineNumberRaw] = line.split(":", 3);
-      const lineNumber = Number(lineNumberRaw);
-      const raw = lines[lineNumber - 1];
-      const parsed = raw ? parseMemoryLine(raw, category) : null;
-      if (parsed) {
-        ids.push(parsed.id);
-      }
-    }
-
-    return ids;
+  ): SearchRow[] {
+    const rows = category
+      ? this.dbReady
+          .prepare(
+            `SELECT id FROM indexed_memories WHERE category = ? AND instr(lower(content), lower(?)) > 0 LIMIT ?`,
+          )
+          .all(category, query, limit)
+      : this.dbReady
+          .prepare(
+            `SELECT id FROM indexed_memories WHERE instr(lower(content), lower(?)) > 0 LIMIT ?`,
+          )
+          .all(query, limit);
+    return (rows as Array<{ id: string }>).map((row) => ({
+      itemId: `memory:${row.id}`,
+      score: 0.4,
+      source: "grep",
+    }));
   }
 
   private indexVector(itemId: string, vector: number[]): void {
@@ -1370,22 +1434,6 @@ class PiMemoryIndex {
         `INSERT OR REPLACE INTO vector_index(rowid, embedding) VALUES (?, ?)`,
       )
       .run(rowid, new Float32Array(vector));
-  }
-
-  private removeVector(itemId: string): void {
-    const existing = this.dbReady
-      .prepare(`SELECT vector_rowid FROM vector_item_map WHERE item_id = ?`)
-      .get(itemId) as { vector_rowid: number | bigint } | undefined;
-    if (!existing) {
-      return;
-    }
-
-    this.dbReady
-      .prepare(`DELETE FROM vector_index WHERE rowid = ?`)
-      .run(this.toSqliteInteger(existing.vector_rowid));
-    this.dbReady
-      .prepare(`DELETE FROM vector_item_map WHERE item_id = ?`)
-      .run(itemId);
   }
 
   private getOrCreateRowId(itemId: string): bigint {
@@ -1428,6 +1476,55 @@ export class MemoryManager {
     return exists(this.store.memoryDir);
   }
 
+  private async reconcile(
+    query?: { query: string; category?: MemoryCategory; limit: number },
+    force = false,
+  ): Promise<RecallResult | undefined> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const captured = await this.store.withIndexSnapshot(
+          async (memories, validate) => {
+            await this.index.initialize();
+            return {
+              memories,
+              validate,
+              needed: this.index.needsSync(memories, force),
+            };
+          },
+        );
+        // Provider calls never run while holding the canonical project lock.
+        const vectors = query
+          ? await this.index.prepareVectors(captured.memories, captured.needed)
+          : null;
+        const queryVector = await this.index.prepareQuery(query?.query);
+        return await this.store.withIndexSnapshot(
+          async (_current, validate) => {
+            await captured.validate();
+            this.index.syncMemories(captured.memories, vectors, force);
+            const result = query
+              ? this.index.search(
+                  query.query,
+                  query.category,
+                  query.limit,
+                  queryVector,
+                )
+              : undefined;
+            await validate();
+            await captured.validate();
+            return result;
+          },
+        );
+      } catch (error) {
+        if (
+          attempt >= 2 ||
+          !(error instanceof Error) ||
+          !error.message.startsWith("Memory index conflict:")
+        )
+          throw error;
+      }
+    }
+  }
+
   async initialize(): Promise<void> {
     if (this.initialized) {
       return;
@@ -1439,8 +1536,7 @@ export class MemoryManager {
     const initializing = (async () => {
       await this.store.ensureReady();
       this.lastRecovery = emptyRecoveryResult();
-      await this.index.initialize();
-      await this.index.syncMemories(await this.store.list());
+      await this.reconcile();
       this.initialized = true;
     })();
     this.initializing = initializing;
@@ -1464,7 +1560,7 @@ export class MemoryManager {
   ): Promise<{ memory: StoredMemoryLine; created: boolean }> {
     await this.initialize();
     const result = await this.store.remember(category, content);
-    await this.index.upsertMemory(result.memory);
+    await this.reconcile();
     return result;
   }
 
@@ -1474,11 +1570,11 @@ export class MemoryManager {
     limit?: number;
   }): Promise<RecallResult> {
     await this.initialize();
-    return this.index.search(
-      options.query,
-      options.category,
-      Math.max(1, options.limit ?? 10),
-    );
+    return (await this.reconcile({
+      query: options.query,
+      category: options.category,
+      limit: Math.max(1, options.limit ?? 10),
+    }))!;
   }
 
   // The interactive update/forget tools omit this precondition; automatic reviewers
@@ -1503,14 +1599,14 @@ export class MemoryManager {
   ): Promise<StoredMemoryLine> {
     await this.initialize();
     const moved = await this.store.move(expected, destination);
-    await this.index.upsertMemory(moved);
+    await this.reconcile();
     return moved;
   }
 
   async recoverMove(): Promise<void> {
     await this.store.recoverMove();
     await this.initialize();
-    await this.index.syncMemories(await this.store.list());
+    await this.reconcile();
   }
 
   async update(
@@ -1523,7 +1619,7 @@ export class MemoryManager {
     if (!updated) {
       return null;
     }
-    await this.index.upsertMemory(updated);
+    await this.reconcile();
     return updated;
   }
 
@@ -1534,7 +1630,7 @@ export class MemoryManager {
     await this.initialize();
     const removed = await this.store.forget(id, expected);
     if (removed) {
-      await this.index.removeMemory(id);
+      await this.reconcile();
     }
     return removed;
   }
@@ -1560,25 +1656,15 @@ export class MemoryManager {
       await this.store.repair(),
     );
     if (recovery.totalRemovedLines > 0) {
-      await this.index.syncMemories(await this.store.list());
+      await this.reconcile();
     }
     this.lastRecovery = recovery;
     return recovery;
   }
 
   async init(force = false, seed = false): Promise<InitResult> {
-    if (force) {
-      await this.index.close();
-      const dbPath = join(this.store.memoryDir, "vector.db");
-      try {
-        await unlink(dbPath);
-      } catch {}
-      this.index = new PiMemoryIndex(this.store.memoryDir, this.options);
-      this.initialized = false;
-      this.lastRecovery = emptyRecoveryResult();
-    }
-
     await this.initialize();
+    if (force) await this.reconcile(undefined, true);
     const recovery = emptyRecoveryResult();
 
     let createdMemories = 0;
