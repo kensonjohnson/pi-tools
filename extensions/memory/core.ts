@@ -4,7 +4,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import {
   access,
-  appendFile,
+  chmod,
   mkdir,
   readFile,
   readdir,
@@ -36,6 +36,18 @@ export interface MemoryLine {
 
 export interface StoredMemoryLine extends MemoryLine {
   category: MemoryCategory;
+}
+
+/** Capture before generating an automatic proposal; parsed list records are not preconditions. */
+export interface MemoryWritePrecondition {
+  category: MemoryCategory;
+  id: string;
+  rawLine: string;
+}
+
+interface CategorySnapshot {
+  contents: string;
+  mode: number;
 }
 
 export interface MemoryHit extends StoredMemoryLine {
@@ -269,12 +281,17 @@ function combineRecoveryResults(
 
 export class NdjsonMemoryStore {
   private memoryDirName: string;
-  private categoryLocks = new Map<MemoryCategory, Promise<void>>();
+  private readonly beforeReplace?: () => Promise<void>;
   readonly memoryDir: string;
 
-  constructor(cwd: string, memoryDirName: string) {
+  constructor(
+    cwd: string,
+    memoryDirName: string,
+    beforeReplace?: () => Promise<void>,
+  ) {
     this.memoryDirName = memoryDirName;
     this.memoryDir = join(cwd, memoryDirName);
+    this.beforeReplace = beforeReplace;
   }
 
   async ensureReady(): Promise<void> {
@@ -301,9 +318,9 @@ export class NdjsonMemoryStore {
     for (const category of MEMORY_CATEGORIES) {
       const path = join(this.memoryDir, categoryFileName(category));
       try {
-        await access(path);
-      } catch {
-        await writeFile(path, "", "utf8");
+        await writeFile(path, "", { encoding: "utf8", flag: "wx" });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }
     }
   }
@@ -326,10 +343,13 @@ export class NdjsonMemoryStore {
     content: string,
   ): Promise<{ memory: StoredMemoryLine; created: boolean }> {
     return this.withCategoryLock(category, async () => {
+      const snapshots = await this.snapshots();
       const normalized = normalizeText(content);
-      const existing = (await this.readCategory(category)).find(
-        (memory) => normalizeText(memory.content) === normalized,
-      );
+      const existing = snapshots
+        .get(category)!
+        .memories.find(
+          (memory) => normalizeText(memory.content) === normalized,
+        );
       if (existing) {
         return { memory: existing, created: false };
       }
@@ -341,56 +361,101 @@ export class NdjsonMemoryStore {
         created: new Date().toISOString(),
       };
 
-      await this.append(category, serializeMemoryLine(memory));
+      const snapshot = snapshots.get(category)!;
+      const prefix =
+        snapshot.contents.length > 0 && !snapshot.contents.endsWith("\n")
+          ? "\n"
+          : "";
+      await this.replace(
+        category,
+        snapshots,
+        `${snapshot.contents}${prefix}${serializeMemoryLine(memory)}\n`,
+      );
       return { memory, created: true };
     });
   }
 
-  async update(id: string, content: string): Promise<StoredMemoryLine | null> {
-    for (const category of MEMORY_CATEGORIES) {
-      const updated = await this.withCategoryLock(category, async () => {
-        const memories = await this.readCategory(category);
-        const index = memories.findIndex((memory) => memory.id === id);
-        if (index === -1) {
-          return null;
-        }
-
-        const updated: StoredMemoryLine = {
-          ...memories[index],
-          content: normalizeText(content),
-          updated: new Date().toISOString(),
-        };
-        memories[index] = updated;
-        await this.writeCategory(category, memories);
-        return updated;
-      });
-      if (updated) {
-        return updated;
-      }
-    }
-
-    return null;
+  async update(
+    id: string,
+    content: string,
+    expected?: MemoryWritePrecondition,
+  ): Promise<StoredMemoryLine | null> {
+    return this.mutate(id, expected, (memory) => ({
+      ...memory,
+      content: normalizeText(content),
+      updated: new Date().toISOString(),
+    }));
   }
 
-  async forget(id: string): Promise<StoredMemoryLine | null> {
-    for (const category of MEMORY_CATEGORIES) {
-      const removed = await this.withCategoryLock(category, async () => {
-        const memories = await this.readCategory(category);
-        const index = memories.findIndex((memory) => memory.id === id);
-        if (index === -1) {
-          return null;
-        }
+  async forget(
+    id: string,
+    expected?: MemoryWritePrecondition,
+  ): Promise<StoredMemoryLine | null> {
+    return this.mutate(id, expected, () => null);
+  }
 
-        const [removed] = memories.splice(index, 1);
-        await this.writeCategory(category, memories);
-        return removed;
-      });
-      if (removed) {
-        return removed;
+  /** Automatic reviewers must retain this exact raw-line snapshot with each proposal. */
+  async captureWritePrecondition(
+    id: string,
+  ): Promise<MemoryWritePrecondition | null> {
+    return this.withCategoryLock("knowledge", async () => {
+      const snapshots = await this.snapshots();
+      for (const category of MEMORY_CATEGORIES) {
+        const lines =
+          snapshots.get(category)!.contents.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+        const rawLine = lines.find(
+          (line) => parseMemoryLine(line, category)?.id === id,
+        );
+        if (rawLine !== undefined) return { id, category, rawLine };
       }
-    }
+      return null;
+    });
+  }
 
-    return null;
+  private async mutate(
+    id: string,
+    expected: MemoryWritePrecondition | undefined,
+    change: (memory: StoredMemoryLine) => StoredMemoryLine | null,
+  ): Promise<StoredMemoryLine | null> {
+    return this.withCategoryLock("knowledge", async () => {
+      const snapshots = await this.snapshots();
+      for (const category of MEMORY_CATEGORIES) {
+        const snapshot = snapshots.get(category)!;
+        const memory = snapshot.memories.find((item) => item.id === id);
+        if (!memory) continue;
+        const lines = snapshot.contents.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+        const index = lines.findIndex(
+          (line) => parseMemoryLine(line, category)?.id === id,
+        );
+        if (
+          expected &&
+          (expected.category !== category ||
+            expected.id !== id ||
+            expected.rawLine !== lines[index])
+        )
+          throw new Error(`Memory conflict: ${id} changed`);
+        const updated = change(memory);
+        if (updated) {
+          const ending = lines[index].endsWith("\r\n")
+            ? "\r\n"
+            : lines[index].endsWith("\n")
+              ? "\n"
+              : "";
+          // Keep additional fields and existing key ordering on the changed record.
+          const raw = JSON.parse(lines[index]);
+          lines[index] =
+            JSON.stringify({
+              ...raw,
+              content: updated.content,
+              updated: updated.updated,
+            }) + ending;
+        } else lines.splice(index, 1);
+        await this.replace(category, snapshots, lines.join(""));
+        return updated ?? memory;
+      }
+      if (expected) throw new Error(`Memory conflict: ${id} was deleted`);
+      return null;
+    });
   }
 
   async repair(): Promise<RecoveryResult> {
@@ -399,23 +464,17 @@ export class NdjsonMemoryStore {
       MEMORY_CATEGORIES.map(async (category) => [
         category,
         await this.withCategoryLock(category, async () => {
-          const filePath = join(this.memoryDir, categoryFileName(category));
-          const contents = await readFile(filePath, "utf8");
-          const memories: StoredMemoryLine[] = [];
+          const snapshots = await this.rawSnapshots();
+          const contents = snapshots.get(category)!.contents;
           let removedLines = 0;
-
-          for (const line of contents.split(/\r?\n/)) {
-            const memory = parseMemoryLine(line, category);
-            if (memory) {
-              memories.push(memory);
-            } else if (line.trim()) {
-              removedLines++;
-            }
-          }
-
-          if (removedLines > 0) {
-            await this.writeCategory(category, memories);
-          }
+          const lines = contents.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+          const retained = lines.filter((line) => {
+            if (!line.trim() || parseMemoryLine(line, category)) return true;
+            removedLines++;
+            return false;
+          });
+          if (removedLines > 0)
+            await this.replace(category, snapshots, retained.join(""));
           return removedLines;
         }),
       ]),
@@ -466,53 +525,109 @@ export class NdjsonMemoryStore {
       .filter((entry): entry is StoredMemoryLine => entry !== null);
   }
 
-  private async append(category: MemoryCategory, line: string): Promise<void> {
-    const filePath = join(this.memoryDir, categoryFileName(category));
-    const contents = await readFile(filePath, "utf8");
-    const prefix = contents.length > 0 && !contents.endsWith("\n") ? "\n" : "";
-    await appendFile(filePath, `${prefix}${line}\n`, "utf8");
+  private async rawSnapshots(): Promise<Map<MemoryCategory, CategorySnapshot>> {
+    const result = new Map<MemoryCategory, CategorySnapshot>();
+    for (const category of MEMORY_CATEGORIES) {
+      const file = join(this.memoryDir, categoryFileName(category));
+      const contents = await readFile(file, "utf8");
+      const mode = (await stat(file)).mode & 0o7777;
+      result.set(category, { contents, mode });
+    }
+    return result;
   }
 
-  private async writeCategory(
+  private async snapshots(): Promise<
+    Map<MemoryCategory, CategorySnapshot & { memories: StoredMemoryLine[] }>
+  > {
+    const raw = await this.rawSnapshots();
+    const result = new Map<
+      MemoryCategory,
+      CategorySnapshot & { memories: StoredMemoryLine[] }
+    >();
+    const ids = new Set<string>();
+    for (const category of MEMORY_CATEGORIES) {
+      const { contents, mode } = raw.get(category)!;
+      const memories: StoredMemoryLine[] = [];
+      for (const line of contents.split(/\n/)) {
+        if (!line.trim()) continue;
+        const memory = parseMemoryLine(line, category);
+        if (!memory)
+          throw new Error(
+            `Memory conflict: malformed line in ${category}; use memory_repair explicitly`,
+          );
+        if (ids.has(memory.id))
+          throw new Error(`Memory conflict: duplicate id ${memory.id}`);
+        ids.add(memory.id);
+        memories.push(memory);
+      }
+      result.set(category, { contents, mode, memories });
+    }
+    return result;
+  }
+
+  private async replace(
     category: MemoryCategory,
-    memories: StoredMemoryLine[],
+    expected: Map<MemoryCategory, CategorySnapshot>,
+    body: string,
   ): Promise<void> {
     const filePath = join(this.memoryDir, categoryFileName(category));
-    const body = memories.map(serializeMemoryLine).join("\n");
     const temporaryPath = `${filePath}.${uuidv7()}.tmp`;
     try {
-      await writeFile(
-        temporaryPath,
-        body.length > 0 ? `${body}\n` : "",
-        "utf8",
-      );
+      await writeFile(temporaryPath, body, {
+        encoding: "utf8",
+        flag: "wx",
+        mode: 0o600,
+      });
+      await chmod(temporaryPath, expected.get(category)!.mode);
+      await this.beforeReplace?.();
+      for (const entry of MEMORY_CATEGORIES) {
+        const file = join(this.memoryDir, categoryFileName(entry));
+        const snapshot = expected.get(entry)!;
+        if (
+          (await readFile(file, "utf8")) !== snapshot.contents ||
+          ((await stat(file)).mode & 0o7777) !== snapshot.mode
+        )
+          throw new Error(`Memory conflict: ${entry} changed during write`);
+      }
+      // A non-cooperating editor can still write between these checks and rename.
       await rename(temporaryPath, filePath);
-    } catch (error) {
+    } finally {
       await unlink(temporaryPath).catch(() => {});
-      throw error;
     }
   }
 
   private async withCategoryLock<T>(
-    category: MemoryCategory,
+    _category: MemoryCategory,
     operation: () => Promise<T>,
   ): Promise<T> {
-    const previous = this.categoryLocks.get(category) ?? Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolve) => {
-      release = resolve;
+    await this.ensureReady();
+    // SQLite's OS-managed write lock survives process crashes without PID guessing.
+    // Never delete or replace this lock database while any process is using it.
+    const db = new Database(join(this.memoryDir, "write-lock.db"), {
+      timeout: 0,
     });
-    const tail = previous.then(() => current);
-    this.categoryLocks.set(category, tail);
-
-    await previous;
+    const deadline = Date.now() + 10000;
     try {
-      return await operation();
-    } finally {
-      release();
-      if (this.categoryLocks.get(category) === tail) {
-        this.categoryLocks.delete(category);
+      while (true) {
+        try {
+          db.exec("BEGIN IMMEDIATE");
+          break;
+        } catch (error) {
+          if (
+            (error as { code?: string }).code !== "SQLITE_BUSY" ||
+            Date.now() >= deadline
+          )
+            throw new Error(`Memory lock unavailable: ${String(error)}`);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
       }
+      try {
+        return await operation();
+      } finally {
+        db.exec("ROLLBACK");
+      }
+    } finally {
+      db.close();
     }
   }
 }
@@ -1008,7 +1123,7 @@ export class MemoryManager {
 
     const initializing = (async () => {
       await this.store.ensureReady();
-      this.lastRecovery = await this.store.repair();
+      this.lastRecovery = emptyRecoveryResult();
       await this.index.initialize();
       await this.index.syncMemories(await this.store.list());
       this.initialized = true;
@@ -1051,9 +1166,22 @@ export class MemoryManager {
     );
   }
 
-  async update(id: string, content: string): Promise<StoredMemoryLine | null> {
+  // The interactive update/forget tools omit this precondition; automatic reviewers
+  // must capture it before proposing a change and pass it back unchanged.
+  async captureWritePrecondition(
+    id: string,
+  ): Promise<MemoryWritePrecondition | null> {
     await this.initialize();
-    const updated = await this.store.update(id, content);
+    return this.store.captureWritePrecondition(id);
+  }
+
+  async update(
+    id: string,
+    content: string,
+    expected?: MemoryWritePrecondition,
+  ): Promise<StoredMemoryLine | null> {
+    await this.initialize();
+    const updated = await this.store.update(id, content, expected);
     if (!updated) {
       return null;
     }
@@ -1061,9 +1189,12 @@ export class MemoryManager {
     return updated;
   }
 
-  async forget(id: string): Promise<StoredMemoryLine | null> {
+  async forget(
+    id: string,
+    expected?: MemoryWritePrecondition,
+  ): Promise<StoredMemoryLine | null> {
     await this.initialize();
-    const removed = await this.store.forget(id);
+    const removed = await this.store.forget(id, expected);
     if (removed) {
       await this.index.removeMemory(id);
     }
@@ -1109,7 +1240,8 @@ export class MemoryManager {
       this.lastRecovery = emptyRecoveryResult();
     }
 
-    const recovery = await this.repair();
+    await this.initialize();
+    const recovery = emptyRecoveryResult();
 
     let createdMemories = 0;
     let skippedMemories = 0;

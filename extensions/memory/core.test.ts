@@ -49,7 +49,7 @@ test("repair retains valid NDJSON records and removes malformed lines", async ()
   });
 });
 
-test("manager repair reports malformed lines removed during initialization", async () => {
+test("manager repair explicitly removes malformed lines", async () => {
   await withStore(async (store, cwd) => {
     const file = join(cwd, ".pi/memory/practices.ndjson");
     await writeFile(
@@ -74,7 +74,7 @@ test("manager repair reports malformed lines removed during initialization", asy
   });
 });
 
-test("memory_init repairs corruption added after manager initialization", async () => {
+test("memory_init preserves corruption added after manager initialization", async () => {
   await withStore(async (store, cwd) => {
     const manager = new MemoryManager(cwd, { semanticEnabled: false });
     try {
@@ -84,8 +84,9 @@ test("memory_init repairs corruption added after manager initialization", async 
 
       const result = await manager.init();
 
-      assert.equal(result.recoveredLines, 1);
-      assert.equal(await readFile(file, "utf8"), "");
+      assert.equal(result.recoveredLines, 0);
+      assert.equal(await readFile(file, "utf8"), "malformed tail\n");
+      assert.equal((await manager.repair()).totalRemovedLines, 1);
     } finally {
       await manager.close();
     }
