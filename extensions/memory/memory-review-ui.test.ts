@@ -114,10 +114,10 @@ test("review controls work headlessly; UI feedback clears and reports persist", 
     const result = await tools
       .get("memory_consolidate")
       .execute("", {}, undefined, undefined, ctx);
-    assert.match(result.content[0].text, /review done/i);
+    assert.match(result.content[0].text, /review unresolved/i);
     assert.equal(calls, 2);
     assert.ok(statuses.some((x) => x?.includes("manual-running")));
-    assert.ok(statuses.some((x) => x?.includes("done")));
+    assert.ok(statuses.some((x) => x?.includes("unresolved")));
     assert.equal(timers.size, 1);
     [...timers.values()][0]();
     assert.equal(statuses.at(-1), undefined);
@@ -129,7 +129,7 @@ test("review controls work headlessly; UI feedback clears and reports persist", 
       ctx,
     );
     assert.equal(report.details.report.events[0].mode, "manual");
-    assert.equal(report.details.report.events[0].status, "done");
+    assert.equal(report.details.report.events[0].status, "unresolved");
     await commands.get("memory-review").handler("status", ctx);
     assert.match(notices.at(-1)!, /Memory review report/);
     await tool.execute("", { action: "cancel" }, undefined, undefined, ctx);
@@ -164,7 +164,7 @@ test("review controls work headlessly; UI feedback clears and reports persist", 
     const restored = await tools2
       .get("memory_review")
       .execute("", { action: "status" }, undefined, undefined, ctx);
-    assert.equal(restored.details.report.events[0].status, "done");
+    assert.equal(restored.details.report.events[0].status, "unresolved");
     await handlers2.get("session_shutdown")!({}, ctx);
   } finally {
     globalThis.setTimeout = originalSet;

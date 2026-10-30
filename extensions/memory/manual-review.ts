@@ -1,5 +1,7 @@
 import type { MemoryReviewer } from "./reviewer.ts";
+import { REVIEW_GAP_REASONS } from "./scheduler.ts";
 import type {
+  ReviewGapReason,
   IncrementalFragmentProgress,
   ManualCursor,
   SchedulerOutcome,
@@ -12,17 +14,26 @@ export async function reviewAllMemories(options: {
   maxPasses?: number;
   fullOffset?: number;
   fullSnapshot?: string;
+  priorEvidenceGaps?: boolean;
   onProgress?: (cursor: ManualCursor | undefined) => void;
 }): Promise<SchedulerOutcome> {
   const changes: Array<{ id: string; detail: string }> = [];
   let offset = options.fullOffset,
     snapshot = options.fullSnapshot;
   let pages = 0;
+  // Old cursors have no coverage state. Do not claim success for an unknown prefix.
+  let snapshotHasGaps =
+    options.fullOffset !== undefined && options.fullOffset > 0
+      ? options.priorEvidenceGaps !== false
+      : false;
   let evidenceGaps: number | undefined;
   let limitedPages = 0;
   let discoveryTruncatedPages = 0;
   let searchIncompletePages = 0;
   let candidatesTruncatedPages = 0;
+  let memoryEvaluations: number | undefined;
+  let snapshotMemories: number | undefined;
+  const gapReasons: Partial<Record<ReviewGapReason, number>> = {};
   const progress = () => ({
     pages,
     resumedAtOffset: options.fullOffset ?? 0,
@@ -34,6 +45,11 @@ export async function reviewAllMemories(options: {
           discoveryTruncatedPages,
           searchIncompletePages,
           candidatesTruncatedPages,
+          ...(memoryEvaluations === undefined ? {} : { memoryEvaluations }),
+          ...(snapshotMemories === undefined ? {} : { snapshotMemories }),
+          ...(Object.keys(gapReasons).length
+            ? { gapReasons: { ...gapReasons } }
+            : {}),
         }),
   });
   try {
@@ -50,7 +66,12 @@ export async function reviewAllMemories(options: {
                 onFragmentProgress: (progress: {
                   snapshot: string;
                   fragment: IncrementalFragmentProgress;
-                }) => options.onProgress!({ offset: offset ?? 0, ...progress }),
+                }) =>
+                  options.onProgress!({
+                    offset: offset ?? 0,
+                    ...progress,
+                    evidenceGaps: snapshotHasGaps,
+                  }),
               }
             : {}),
         });
@@ -65,6 +86,7 @@ export async function reviewAllMemories(options: {
           options.reviewer.restartFullReview();
           offset = undefined;
           snapshot = undefined;
+          snapshotHasGaps = false;
           continue;
         }
         throw error;
@@ -78,8 +100,26 @@ export async function reviewAllMemories(options: {
         (audit.coverage === "limited" || audit.coverage === "insufficient")
       ) {
         evidenceGaps ??= 0;
-        if (audit.coverage === "insufficient") evidenceGaps++;
-        else limitedPages++;
+        if (audit.coverage === "insufficient") {
+          evidenceGaps++;
+          snapshotHasGaps = true;
+        } else limitedPages++;
+        if (Number.isSafeInteger(audit.pageCount) && audit.pageCount! >= 0)
+          memoryEvaluations = (memoryEvaluations ?? 0) + audit.pageCount!;
+        if (
+          Number.isSafeInteger(audit.totalMemories) &&
+          audit.totalMemories! >= 0
+        )
+          snapshotMemories = audit.totalMemories;
+        const reasons = (audit as typeof audit & { gapReasons?: unknown })
+          .gapReasons;
+        if (Array.isArray(reasons)) {
+          for (const reason of new Set(reasons))
+            if (REVIEW_GAP_REASONS.includes(reason as ReviewGapReason)) {
+              const key = reason as ReviewGapReason;
+              gapReasons[key] = (gapReasons[key] ?? 0) + 1;
+            }
+        }
         if (audit.discoveryTruncated) discoveryTruncatedPages++;
         if (audit.searchIncomplete) searchIncompletePages++;
         if (audit.candidatesTruncated) candidatesTruncatedPages++;
@@ -104,6 +144,7 @@ export async function reviewAllMemories(options: {
         options.onProgress?.(undefined);
         offset = undefined;
         snapshot = undefined;
+        snapshotHasGaps = false;
         continue;
       }
       if (result.nextOffset !== undefined) {
@@ -112,6 +153,7 @@ export async function reviewAllMemories(options: {
         options.onProgress?.({
           offset: result.nextOffset,
           snapshot: result.fullSnapshot,
+          evidenceGaps: snapshotHasGaps,
         });
         offset = result.nextOffset;
         snapshot = result.fullSnapshot;
@@ -126,9 +168,10 @@ export async function reviewAllMemories(options: {
         };
       options.onProgress?.(undefined);
       return {
-        status: "done",
-        detail:
-          "Full model review pass finished. Evidence gaps may remain; no-change decisions do not verify that memories are current.",
+        status: snapshotHasGaps ? "unresolved" : "done",
+        detail: snapshotHasGaps
+          ? "Full review traversal finished with insufficient or unknown evidence; retry the full review."
+          : "Full model review pass finished. Evidence gaps may remain; no-change decisions do not verify that memories are current.",
         changes,
         review: progress(),
       };

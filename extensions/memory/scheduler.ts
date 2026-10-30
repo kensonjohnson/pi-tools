@@ -60,7 +60,20 @@ export type ReviewProgress = {
   discoveryTruncatedPages?: number;
   searchIncompletePages?: number;
   candidatesTruncatedPages?: number;
+  memoryEvaluations?: number;
+  snapshotMemories?: number;
+  gapReasons?: Partial<Record<ReviewGapReason, number>>;
 };
+export const REVIEW_GAP_REASONS = [
+  "model_insufficient",
+  "missing_reason",
+  "no_evidence",
+  "evidence_failures",
+  "requests_truncated",
+  "search_incomplete",
+  "fragment_insufficient",
+] as const;
+export type ReviewGapReason = (typeof REVIEW_GAP_REASONS)[number];
 export type SchedulerReportEvent = {
   at: number;
   mode: "background" | "manual";
@@ -77,6 +90,7 @@ export type ManualCursor = {
   offset: number;
   snapshot: string;
   fragment?: IncrementalFragmentProgress;
+  evidenceGaps?: boolean;
 };
 const resumePermits = new WeakMap<object, ManualCursor>();
 export function resolveManualResumePermit(
@@ -279,6 +293,10 @@ export class MemoryScheduler {
       const manualColumns = this.db.pragma(
         "table_info(manual_cursor)",
       ) as Array<{ name: string }>;
+      if (!manualColumns.some((column) => column.name === "evidence_gaps"))
+        this.db.exec(
+          "ALTER TABLE manual_cursor ADD COLUMN evidence_gaps INTEGER",
+        );
       if (!manualColumns.some((column) => column.name === "fragment"))
         this.db.exec("ALTER TABLE manual_cursor ADD COLUMN fragment TEXT");
       const columns = this.db.pragma("table_info(review_events)") as Array<{
@@ -451,7 +469,15 @@ export class MemoryScheduler {
       limitedPages = count(progress?.limitedPages),
       discoveryTruncatedPages = count(progress?.discoveryTruncatedPages),
       searchIncompletePages = count(progress?.searchIncompletePages),
-      candidatesTruncatedPages = count(progress?.candidatesTruncatedPages);
+      candidatesTruncatedPages = count(progress?.candidatesTruncatedPages),
+      memoryEvaluations = count(progress?.memoryEvaluations),
+      snapshotMemories = count(progress?.snapshotMemories);
+    const gapReasons = Object.fromEntries(
+      REVIEW_GAP_REASONS.flatMap((key) => {
+        const value = count(progress?.gapReasons?.[key]);
+        return value === undefined ? [] : [[key, value]];
+      }),
+    );
     const review =
       pages === undefined || resumedAtOffset === undefined
         ? null
@@ -469,6 +495,9 @@ export class MemoryScheduler {
             ...(candidatesTruncatedPages === undefined
               ? {}
               : { candidatesTruncatedPages }),
+            ...(memoryEvaluations === undefined ? {} : { memoryEvaluations }),
+            ...(snapshotMemories === undefined ? {} : { snapshotMemories }),
+            ...(Object.keys(gapReasons).length ? { gapReasons } : {}),
           });
     this.db
       .prepare(
@@ -672,10 +701,15 @@ export class MemoryScheduler {
       begin();
       const saved = this.db
         .prepare(
-          "SELECT offset,snapshot,fragment FROM manual_cursor WHERE id=1",
+          "SELECT offset,snapshot,fragment,evidence_gaps FROM manual_cursor WHERE id=1",
         )
         .get() as
-        | { offset: number; snapshot: string; fragment: string | null }
+        | {
+            offset: number;
+            snapshot: string;
+            fragment: string | null;
+            evidence_gaps: number | null;
+          }
         | undefined;
       if (saved) {
         let fragment: IncrementalFragmentProgress | undefined;
@@ -697,6 +731,9 @@ export class MemoryScheduler {
           offset: saved.offset,
           snapshot: saved.snapshot,
           ...(fragment ? { fragment } : {}),
+          ...(saved.evidence_gaps === 0 || saved.evidence_gaps === 1
+            ? { evidenceGaps: saved.evidence_gaps === 1 }
+            : {}),
         };
       }
     } catch (error) {
@@ -726,6 +763,8 @@ export class MemoryScheduler {
           cursor.offset < (progress.current?.offset ?? 0) ||
           (cursor.offset === (progress.current?.offset ?? 0) &&
             !cursor.fragment) ||
+          (cursor.evidenceGaps !== undefined &&
+            typeof cursor.evidenceGaps !== "boolean") ||
           (cursor.fragment &&
             (!/^[a-f0-9]{64}$/.test(cursor.fragment.plan) ||
               !Number.isSafeInteger(cursor.fragment.index) ||
@@ -737,12 +776,15 @@ export class MemoryScheduler {
           throw new Error("invalid manual review continuation");
         this.db
           .prepare(
-            "INSERT INTO manual_cursor(id,offset,snapshot,fragment) VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET offset=excluded.offset,snapshot=excluded.snapshot,fragment=excluded.fragment",
+            "INSERT INTO manual_cursor(id,offset,snapshot,fragment,evidence_gaps) VALUES (1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET offset=excluded.offset,snapshot=excluded.snapshot,fragment=excluded.fragment,evidence_gaps=excluded.evidence_gaps",
           )
           .run(
             cursor.offset,
             cursor.snapshot,
             cursor.fragment ? JSON.stringify(cursor.fragment) : null,
+            cursor.evidenceGaps === undefined
+              ? null
+              : Number(cursor.evidenceGaps),
           );
         progress.current = cursor;
       },

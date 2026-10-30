@@ -65,6 +65,7 @@ test("full review exposes bounded continuation without silently restarting", asy
     signal: new AbortController().signal,
     fullOffset: first.nextOffset,
     fullSnapshot: first.fullSnapshot,
+    priorEvidenceGaps: false,
   });
   assert.equal(next.status, "done");
   assert.deepEqual(first.review, { pages: 1, resumedAtOffset: 0 });
@@ -85,6 +86,9 @@ test("manual review aggregates bounded evidence gap counts without retaining evi
               discoveryTruncated: true,
               searchIncomplete: true,
               candidatesTruncated: true,
+              pageCount: 50,
+              totalMemories: 51,
+              gapReasons: ["no_evidence", "no_evidence", "private secret"],
             },
           }
         : {
@@ -102,7 +106,7 @@ test("manual review aggregates bounded evidence gap counts without retaining evi
     reviewer,
     signal: new AbortController().signal,
   });
-  assert.equal(result.status, "done");
+  assert.equal(result.status, "unresolved");
   assert.equal(calls, 2);
   assert.deepEqual(result.review, {
     pages: 2,
@@ -112,8 +116,57 @@ test("manual review aggregates bounded evidence gap counts without retaining evi
     discoveryTruncatedPages: 1,
     searchIncompletePages: 1,
     candidatesTruncatedPages: 1,
+    memoryEvaluations: 50,
+    snapshotMemories: 51,
+    gapReasons: { no_evidence: 1 },
   });
 });
+test("continuation retains insufficient prefix across scheduler instances", () =>
+  fixture(async (root, runtimeDir, sessionDir) => {
+    const options = {
+      project: root,
+      runtimeDir,
+      sessionDir,
+      automatic: false,
+      work: async () => ({ status: "done" as const }),
+    };
+    const snapshot = "a".repeat(64);
+    const reviewer: any = {
+      review: async ({ fullOffset }: any) =>
+        fullOffset === undefined
+          ? {
+              status: "unchanged",
+              nextOffset: 1,
+              fullSnapshot: snapshot,
+              audit: { coverage: "insufficient" },
+            }
+          : { status: "unchanged", audit: { coverage: "limited" } },
+    };
+    const run = (scheduler: MemoryScheduler) =>
+      scheduler.runManual((signal, cursor) =>
+        reviewAllMemories({
+          reviewer,
+          signal,
+          maxPasses: 1,
+          fullOffset: cursor.current?.offset,
+          fullSnapshot: cursor.current?.snapshot,
+          priorEvidenceGaps: cursor.current?.evidenceGaps,
+          onProgress: (next) => (next ? cursor.advance(next) : cursor.clear()),
+        }),
+      );
+    const first = new MemoryScheduler(options);
+    assert.equal((await run(first)).status, "pending");
+    await first.shutdown();
+    const second = new MemoryScheduler(options);
+    try {
+      assert.equal((await run(second)).status, "unresolved");
+      assert.equal(second.status().paused, false);
+      assert.equal(second.status().manualContinuation, undefined);
+    } finally {
+      await second.shutdown();
+    }
+  }));
+
 test("unresolved model reason is not included in the manual outcome", async () => {
   const reviewer: any = {
     review: async () => ({

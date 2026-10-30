@@ -162,10 +162,13 @@ test("bounded manual continuation survives reload and /memory-review full contin
       pages: 24,
       resumedAtOffset: 0,
       evidenceGaps: 1,
+      gapReasons: { model_insufficient: 1, no_evidence: 1 },
       limitedPages: 23,
       discoveryTruncatedPages: 0,
       searchIncompletePages: 0,
       candidatesTruncatedPages: 0,
+      memoryEvaluations: resumeOffset,
+      snapshotMemories: 1201,
     });
     assert.match(first.content[0].text, /Coverage is not verification/);
     assert.equal(decisions, 24);
@@ -182,12 +185,12 @@ test("bounded manual continuation survives reload and /memory-review full contin
     await b.commands.get("memory-review").handler("full", ctx);
     for (
       let i = 0;
-      i < 100 && !notices.some((x) => /review done/i.test(x));
+      i < 100 && !notices.some((x) => /review unresolved/i.test(x));
       i++
     )
       await new Promise((resolve) => setTimeout(resolve, 10));
     assert.ok(
-      notices.some((x) => /review done/i.test(x)),
+      notices.some((x) => /review unresolved/i.test(x)),
       JSON.stringify(notices),
     );
     assert.ok(calls > initialCalls);
@@ -210,19 +213,27 @@ test("bounded manual continuation survives reload and /memory-review full contin
           discoveryTruncatedPages: 0,
           searchIncompletePages: 0,
           candidatesTruncatedPages: 0,
+          memoryEvaluations: 1201 - resumeOffset,
+          snapshotMemories: 1201,
         },
         {
           pages: 24,
           resumedAtOffset: 0,
           evidenceGaps: 1,
+          gapReasons: { model_insufficient: 1, no_evidence: 1 },
           limitedPages: 23,
           discoveryTruncatedPages: 0,
           searchIncompletePages: 0,
           candidatesTruncatedPages: 0,
+          memoryEvaluations: resumeOffset,
+          snapshotMemories: 1201,
         },
       ],
     );
-    assert.match(after.details.report.events[0].detail, /do not verify/i);
+    assert.match(
+      after.details.report.events[0].detail,
+      /insufficient or unknown evidence/i,
+    );
     await b.handlers.get("session_shutdown")!({}, ctx);
   } finally {
     MemoryManager.prototype.captureAddPrecondition = original;

@@ -52,6 +52,11 @@ for (const mode of ["insufficient", "mutation"] as const)
       const result = await reviewer.review({ batch });
       assert.ok(decisions > 1);
       assert.equal(result.status, "unresolved");
+      if (mode === "insufficient")
+        assert.deepEqual(result.audit?.gapReasons, [
+          "model_insufficient",
+          "fragment_insufficient",
+        ]);
       assert.equal(ack, 0);
       assert.equal((await store.list()).memories[0].content, "Original fact.");
     } finally {

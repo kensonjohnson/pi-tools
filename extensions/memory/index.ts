@@ -27,6 +27,7 @@ import {
 } from "../../lib/pi-tools-config.ts";
 import {
   MemoryScheduler,
+  REVIEW_GAP_REASONS,
   UNSUPPORTED_FILE_SOURCE,
   persistSchedulerActivity,
   reviewProjectSessions,
@@ -296,6 +297,7 @@ function safeReviewDetail(detail: unknown): string {
 
 const SAFE_REVIEW_OUTCOME_DETAILS = new Set([
   "Insufficient evidence for this memory page; inspect evidence gaps.",
+  "Full review traversal finished with insufficient or unknown evidence; retry the full review.",
   "Review found an unresolved evidence or authority conflict; inspect before resuming.",
   "Incremental review has insufficient evidence; batch remains unacknowledged for retry.",
   "Unresolved evidence or authority conflict.",
@@ -346,6 +348,27 @@ function displayUnresolvedDetail(detail: string): string {
       "Review found an unresolved evidence or authority conflict; inspect the report before retrying."
     ? detail
     : "Unresolved review. Details are unavailable or hidden; inspect the report before retrying.";
+}
+
+function formatReviewDiagnostics(
+  review: NonNullable<SchedulerReport["events"][number]["review"]>,
+): string {
+  const parts: string[] = [];
+  const valid = (value: unknown): value is number =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+  if (valid(review.memoryEvaluations))
+    parts.push(
+      `Memory evaluations: ${review.memoryEvaluations}${valid(review.snapshotMemories) ? `; last snapshot records: ${review.snapshotMemories}` : ""} (evaluations may repeat after changes)`,
+    );
+  const reasons = REVIEW_GAP_REASONS.flatMap((key) => {
+    const value = review.gapReasons?.[key];
+    return valid(value) ? [`${key.replaceAll("_", " ")}: ${value}`] : [];
+  });
+  if (reasons.length)
+    parts.push(
+      `Evidence gap pages by reason (may overlap): ${reasons.join(", ")}`,
+    );
+  return parts.join(". ");
 }
 
 export function formatReviewStatus(
@@ -444,6 +467,8 @@ export function formatReviewStatus(
         lines.push(
           `  Evidence: ${count(r.evidenceGaps)} insufficient, ${count(r.limitedPages)} limited page(s). Discovery truncated: ${count(r.discoveryTruncatedPages)}; search incomplete: ${count(r.searchIncompletePages)}; candidates truncated: ${count(r.candidatesTruncatedPages)}. Coverage is not verification.`,
         );
+      const diagnostics = formatReviewDiagnostics(r);
+      if (diagnostics) lines.push(`  ${diagnostics}.`);
     } else if (event.changesTotal)
       lines.push(`  Changes: ${event.changesTotal}`);
     for (const change of event.changes)
@@ -734,6 +759,7 @@ export default function (pi: ExtensionAPI) {
                 signal: runSignal,
                 fullOffset: progress.current?.offset,
                 fullSnapshot: progress.current?.snapshot,
+                priorEvidenceGaps: progress.current?.evidenceGaps,
                 onProgress: (cursor) => {
                   if (cursor) progress.advance(cursor);
                   else progress.clear();
@@ -770,15 +796,16 @@ export default function (pi: ExtensionAPI) {
         const summary = review
           ? ` This run evaluated ${review.pages} page(s)${review.resumedAtOffset ? ` starting at offset ${review.resumedAtOffset}` : ""}; ${safeResult.changes?.length ?? 0} change(s) recorded in this run. ${review.evidenceGaps === undefined ? "Evidence coverage is unknown." : `${review.evidenceGaps} page(s) reported insufficient evidence; ${review.limitedPages ?? 0} had limited coverage. Discovery was truncated on ${review.discoveryTruncatedPages ?? 0} page(s), search incomplete on ${review.searchIncompletePages ?? 0}, and cross-page candidates truncated on ${review.candidatesTruncatedPages ?? 0}. ${review.pages - review.evidenceGaps - (review.limitedPages ?? 0)} page evaluation(s) had no coverage metadata. Coverage is not verification.`}${review.resumedAtOffset ? " Earlier runs are listed separately in review status." : ""}`
           : "";
+        const diagnostics = review ? formatReviewDiagnostics(review) : "";
         const detail =
           safeResult.status === "unresolved"
             ? displayUnresolvedDetail(safeResult.detail ?? "")
             : (safeResult.detail ?? "");
         const retry =
           safeResult.status === "unresolved"
-            ? " Run /memory-review full again to retry; the conflict may remain."
+            ? " Run /memory-review full again to retry; evidence gaps or conflicts may remain."
             : "";
-        const text = `Full memory review ${safeResult.status}: ${detail}${retry}${summary}${repair ? ` ${repair.detail}` : ""}${safeResult.nextOffset === undefined ? "" : ` Progress saved at offset ${safeResult.nextOffset}; run /memory-review full to continue.`}`;
+        const text = `Full memory review ${safeResult.status}: ${detail}${retry}${summary}${diagnostics ? ` ${diagnostics}.` : ""}${repair ? ` ${repair.detail}` : ""}${safeResult.nextOffset === undefined ? "" : ` Progress saved at offset ${safeResult.nextOffset}; run /memory-review full to continue.`}`;
         return textResult(text, { action, result: safeResult });
       }
       const settings = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);

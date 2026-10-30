@@ -317,6 +317,10 @@ test("incremental evidence gaps never acknowledge and empty inventory search is 
     const result = await reviewer.review({ batch });
     assert.equal(result.status, "unresolved");
     assert.equal(result.acknowledged, false);
+    assert.deepEqual(result.audit?.gapReasons, [
+      "model_insufficient",
+      "search_incomplete",
+    ]);
     assert.equal(ack, 0);
     assert.equal(
       (await new RepositoryEvidence(root).search([], "Go")).incomplete,

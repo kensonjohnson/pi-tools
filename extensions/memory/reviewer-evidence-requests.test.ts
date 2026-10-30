@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryReviewer } from "./reviewer.ts";
+import { reviewAllMemories } from "./manual-review.ts";
 
 async function fixture(fn: (root: string, store: any) => Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), "review-requests-"));
@@ -177,6 +178,52 @@ test("mixed unavailable requests reach the model safely and make no-change insuf
     assert.equal(result.status, "unchanged");
     assert.equal(result.acknowledged, false);
     assert.equal(result.audit?.coverage, "insufficient");
+    assert.deepEqual(result.audit?.gapReasons, ["evidence_failures"]);
+  }));
+
+test("no-change gap reasons distinguish empty evidence and model response fields", () =>
+  fixture(async (root, store) => {
+    await writeFile(
+      join(root, "extensions/browser-tools/index.ts"),
+      "Browser uses Playwright.\n",
+    );
+    for (const scenario of ["empty", "model", "reason", "complete"] as const) {
+      const reviewer = new MemoryReviewer({
+        project: root,
+        store,
+        model: {
+          generate: async ({ instruction }: any) => {
+            if (instruction.startsWith("Select"))
+              return {
+                paths:
+                  scenario === "empty"
+                    ? []
+                    : ["extensions/browser-tools/index.ts"],
+              };
+            return {
+              action: "no_change",
+              ...(scenario === "reason" ? {} : { reason: "Reviewed." }),
+              evidenceSufficient: scenario !== "model",
+            };
+          },
+        },
+      });
+      const result = await reviewer.review();
+      assert.deepEqual(
+        result.audit?.gapReasons,
+        scenario === "empty"
+          ? ["no_evidence"]
+          : scenario === "model"
+            ? ["model_insufficient"]
+            : scenario === "reason"
+              ? ["missing_reason"]
+              : undefined,
+      );
+      assert.equal(
+        result.audit?.coverage,
+        scenario === "complete" ? "limited" : "insufficient",
+      );
+    }
   }));
 
 test("a supported correction can use captured evidence despite unrelated gaps", () =>
@@ -233,8 +280,154 @@ test("a supported correction can use captured evidence despite unrelated gaps", 
     assert.equal(result.status, "applied");
     assert.equal(result.acknowledged, false);
     assert.equal(result.audit?.coverage, "insufficient");
+    assert.deepEqual(result.audit?.gapReasons, ["evidence_failures"]);
     assert.equal(writes, 1);
     assert.equal(assessments, 1);
+  }));
+
+test("full review applies a supported stale correction despite unrelated gaps and terminates", () =>
+  fixture(async (root, store) => {
+    await writeFile(
+      join(root, "extensions/browser-tools/index.ts"),
+      "Browser uses Chromium.\n",
+    );
+    let content = "Browser uses Playwright.";
+    let writes = 0;
+    let selectionCalls = 0;
+    let decisionCalls = 0;
+    store.captureAddPrecondition = async () => ({
+      snapshots: {
+        knowledge: {
+          contents:
+            JSON.stringify({ id: "one", content, created: "2025-01-01" }) +
+            "\n",
+          mode: 0o600,
+        },
+        practices: { contents: "", mode: 0o600 },
+        decisions: { contents: "", mode: 0o600 },
+      },
+    });
+    store.update = async (_id: string, next: string) => {
+      writes++;
+      content = next;
+      return {
+        id: "one",
+        content,
+        category: "knowledge",
+        created: "2025-01-01",
+      };
+    };
+    const reviewer = new MemoryReviewer({
+      project: root,
+      store,
+      model: {
+        generate: async ({ instruction, data }: any) => {
+          if (instruction.startsWith("Select")) {
+            selectionCalls++;
+            assert.match(
+              instruction,
+              /Prioritize evidence for specific memories likely to be stale/,
+            );
+            return {
+              paths: [
+                "extensions/browser-tools/index.ts",
+                "extensions/browser-tools/missing.ts",
+              ],
+            };
+          }
+          if (instruction.startsWith("Independently"))
+            return {
+              verdict: "supported",
+              reason: "Source supports the correction.",
+            };
+          decisionCalls++;
+          assert.match(
+            instruction,
+            /even when other records lack evidence or requests failed/,
+          );
+          assert.deepEqual(
+            data.evidenceFailures.map((failure: any) => failure.reason),
+            ["not_found"],
+          );
+          if (content === "Browser uses Chromium.")
+            return {
+              action: "no_change",
+              reason: "Other evidence is missing.",
+              evidenceSufficient: false,
+            };
+          return {
+            action: "update",
+            id: "one",
+            content: "Browser uses Chromium.",
+            reason: "Correct the stale fact.",
+            targetAuthority: "fact",
+            citation: {
+              kind: "file",
+              id: data.files[0].id,
+              quote: "Browser uses Chromium.",
+            },
+          };
+        },
+      },
+    });
+    const result = await reviewAllMemories({
+      reviewer,
+      signal: new AbortController().signal,
+    });
+    assert.equal(result.status, "unresolved");
+    assert.equal(result.changes?.length, 1);
+    assert.equal(result.review?.evidenceGaps, 2);
+    assert.deepEqual(result.review?.gapReasons, {
+      evidence_failures: 2,
+      model_insufficient: 1,
+    });
+    assert.equal(writes, 1);
+    assert.equal(selectionCalls, 2);
+    assert.equal(decisionCalls, 2);
+  }));
+
+test("an unchanged update stops without writing or restarting full review", () =>
+  fixture(async (root, store) => {
+    await writeFile(
+      join(root, "extensions/browser-tools/index.ts"),
+      "Browser uses Playwright.\n",
+    );
+    let writes = 0;
+    store.update = async () => {
+      writes++;
+      throw new Error("unexpected write");
+    };
+    const reviewer = new MemoryReviewer({
+      project: root,
+      store,
+      model: {
+        generate: async ({ instruction, data }: any) => {
+          if (instruction.startsWith("Select"))
+            return { paths: ["extensions/browser-tools/index.ts"] };
+          if (instruction.startsWith("Independently"))
+            throw new Error("unexpected assessment");
+          return {
+            action: "update",
+            id: "one",
+            content: "Browser uses Playwright.",
+            reason: "No change.",
+            targetAuthority: "fact",
+            citation: {
+              kind: "file",
+              id: data.files[0].id,
+              quote: "Browser uses Playwright.",
+            },
+          };
+        },
+      },
+    });
+    const result = await reviewAllMemories({
+      reviewer,
+      signal: new AbortController().signal,
+    });
+    assert.equal(result.status, "unresolved");
+    assert.equal(result.review?.pages, 1);
+    assert.equal(writes, 0);
   }));
 
 test("a fabricated citation for unavailable evidence is rejected before assessment or write", () =>

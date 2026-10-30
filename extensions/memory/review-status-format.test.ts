@@ -66,6 +66,9 @@ test("explains unresolved insufficient evidence and its page summary without req
       discoveryTruncatedPages: 1,
       searchIncompletePages: 0,
       candidatesTruncatedPages: 0,
+      memoryEvaluations: 42,
+      snapshotMemories: 100,
+      gapReasons: { no_evidence: 1, model_insufficient: 1 },
     },
   };
   const text = formatReviewStatus({
@@ -84,6 +87,8 @@ test("explains unresolved insufficient evidence and its page summary without req
     /Discovery truncated: 1; search incomplete: 0; candidates truncated: 0/,
   );
   assert.match(text, /Coverage is not verification/);
+  assert.match(text, /Memory evaluations: 42; last snapshot records: 100/);
+  assert.match(text, /model insufficient: 1, no evidence: 1/);
   assert.match(text, /Run \/memory-review full again to retry/);
   assert.doesNotMatch(text, /\/memory-review resume/);
 });
