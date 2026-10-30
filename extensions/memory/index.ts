@@ -177,11 +177,85 @@ export function createTrackedReviewStore(
   };
 }
 
+// These fixed messages contain no provider response, path, or project data.
+const REVIEW_DIAGNOSTICS: Record<string, string> = {
+  "malformed reviewer evidence requests":
+    "Reviewer returned invalid evidence requests. Retry or use a different reviewer model.",
+  "malformed reviewer response":
+    "Reviewer returned a response that does not match the required schema. Retry or use a different reviewer model.",
+  "unsupported reviewer action":
+    "Reviewer returned an unsupported action. Retry or use a different reviewer model.",
+  "malformed citation":
+    "Reviewer returned an invalid citation. Retry or use a different reviewer model.",
+  "malformed target id":
+    "Reviewer returned an invalid target ID. Retry or use a different reviewer model.",
+  "malformed category":
+    "Reviewer returned an invalid memory category. Retry or use a different reviewer model.",
+  "malformed memory content":
+    "Reviewer returned invalid memory content. Retry or use a different reviewer model.",
+  "malformed reason":
+    "Reviewer returned an invalid reason. Retry or use a different reviewer model.",
+  "malformed target authority":
+    "Reviewer returned an invalid target authority. Retry or use a different reviewer model.",
+  "malformed evidence sufficiency":
+    "Reviewer returned invalid evidence sufficiency. Retry or use a different reviewer model.",
+  "malformed evidence assessment":
+    "Reviewer returned an invalid evidence assessment. Retry or use a different reviewer model.",
+  "unknown memory target":
+    "Reviewer selected a memory outside the current page. Retry or use a different reviewer model.",
+  "invalid project-relative evidence path":
+    "Reviewer requested an invalid evidence path. Retry or use a different reviewer model.",
+  "private or hidden evidence path is excluded":
+    "Reviewer requested excluded private or hidden evidence. Retry or use a different reviewer model.",
+  "symlink evidence is unsupported":
+    "Reviewer requested symlink evidence, which is unsupported. Retry or use a different reviewer model.",
+  "evidence escapes project root":
+    "Reviewer requested evidence outside the project. Retry or use a different reviewer model.",
+  "requested missing path exists":
+    "Reviewer requested a missing-path check for a path that exists. Retry or use a different reviewer model.",
+  "evidence is not a bounded regular file":
+    "Reviewer requested evidence that is not a bounded regular file. Retry or use a different reviewer model.",
+  "binary evidence is unsupported":
+    "Reviewer requested binary evidence, which is unsupported. Retry or use a different reviewer model.",
+  "no matching paragraph":
+    "Reviewer requested an excerpt with no matching paragraph. Retry or use a different reviewer model.",
+  "matching paragraph exceeds excerpt limit":
+    "Requested evidence paragraph exceeds the excerpt limit. Retry or use a different reviewer model.",
+  "evidence call limit reached":
+    "Evidence request limit reached. Retry or use a different reviewer model.",
+  "evidence byte limit reached":
+    "Evidence byte limit reached. Retry or use a different reviewer model.",
+  "invalid evidence query":
+    "Reviewer returned an invalid evidence query. Retry or use a different reviewer model.",
+  "evidence changed during read":
+    "Evidence changed during review. Retry after project changes settle.",
+  "evidence truncated during read":
+    "Evidence changed during review. Retry after project changes settle.",
+  "evidence changed since review":
+    "Evidence changed during review. Retry after project changes settle.",
+  "memory review snapshot conflict":
+    "Memory changed during review. Retry after memory changes settle.",
+  "review snapshot changed or is missing; restart at zero":
+    "Memory changed since the saved review cursor. Restart the full review from zero.",
+  "memory snapshot exceeds review limit":
+    "Memory snapshot exceeds the review limit. Reduce the memory corpus before retrying.",
+  "single memory exceeds review page limit":
+    "A memory exceeds the review page limit. Reduce its size before retrying.",
+  "invalid memory snapshot":
+    "Memory snapshot is invalid. Inspect the memory files before retrying.",
+  "review model must be explicitly configured as provider/model":
+    "Configure the reviewer model as provider/model before retrying.",
+};
+
 // Provider and filesystem errors can contain credentials, paths, or user data.
 // Only display known diagnostic messages; never echo arbitrary exception text.
 function safeReviewDetail(detail: unknown): string {
   if (typeof detail !== "string")
     return "Review failed. Check the reviewer model configuration and .pi/memory files; inspect before retrying.";
+  if (Object.hasOwn(REVIEW_DIAGNOSTICS, detail))
+    return REVIEW_DIAGNOSTICS[detail];
+  // Status formatting applies this sanitizer again to the already-safe report.
+  if (Object.values(REVIEW_DIAGNOSTICS).includes(detail)) return detail;
   const known = [
     "review model must be explicitly configured",
     "review model unavailable or not a chat model",
