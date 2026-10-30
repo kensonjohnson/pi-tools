@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import Database from "better-sqlite3";
 import extension from "./index.ts";
 
-test("configured background review retains activity while duplicates exist", async () => {
+test("configured background review repairs duplicates and resumes activity", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "memory-scheduler-conflict-"));
   try {
     const memory = join(cwd, ".pi", "memory");
@@ -33,6 +34,25 @@ test("configured background review retains activity while duplicates exist", asy
       content: "fact",
     });
     await writeFile(join(memory, "knowledge.ndjson"), `${row}\n${row}\n`);
+    await mkdir(join(cwd, "sessions"));
+    await writeFile(
+      join(cwd, "sessions", "s.jsonl"),
+      [
+        { type: "session", version: 3, id: "s", cwd },
+        {
+          type: "message",
+          id: "1",
+          parentId: null,
+          message: {
+            role: "user",
+            content: "Remember a relevant project fact.",
+          },
+        },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+    );
+    let modelCalls = 0;
     const handlers = new Map<string, Function>();
     const tools = new Map<string, any>();
     const notices: string[] = [];
@@ -67,6 +87,30 @@ test("configured background review retains activity while duplicates exist", asy
           notices.push(message);
         },
       },
+      modelRegistry: {
+        find: () => ({ provider: "p", id: "m", input: ["text"] }),
+        getAvailable: () => [],
+        getApiKeyAndHeaders: async () => ({ ok: true }),
+        complete: async () => {
+          const rows = (
+            await readFile(join(memory, "knowledge.ndjson"), "utf8")
+          )
+            .trim()
+            .split("\n")
+            .map((line) => JSON.parse(line));
+          assert.notEqual(rows[0].id, rows[1].id);
+          return {
+            stopReason: "stop",
+            content: [
+              {
+                type: "text",
+                text:
+                  ++modelCalls % 2 ? '{"paths":[]}' : '{"action":"no_change"}',
+              },
+            ],
+          };
+        },
+      },
     };
     const locker = new Database(join(memory, "write-lock.db"));
     locker.exec("BEGIN IMMEDIATE");
@@ -80,6 +124,19 @@ test("configured background review retains activity while duplicates exist", asy
           ),
         ),
       ]);
+      const schedulerDb = join(
+        memory,
+        ".runtime",
+        "review-scheduler",
+        "scheduler.sqlite",
+      );
+      for (let i = 0; i < 100 && !existsSync(schedulerDb); i++)
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      const db = new Database(schedulerDb, { fileMustExist: true });
+      db.prepare(
+        "INSERT INTO manual_cursor(id,offset,snapshot) VALUES(1,?,?)",
+      ).run(1, "a".repeat(64));
+      db.close();
       await handlers.get("agent_settled")!({}, ctx);
       await new Promise((resolve) => setTimeout(resolve, 50));
     } finally {
@@ -95,16 +152,24 @@ test("configured background review retains activity while duplicates exist", asy
           .get("memory_review")
           .execute("", { action: "status" }, undefined, undefined, ctx)
       ).details.report.status;
-      if (status.pending > 0 && status.status === "pending") break;
+      if (modelCalls >= 2 && status.status === "done") break;
     }
-    assert.ok(status.pending > 0);
-    assert.equal(status.status, "pending");
     assert.equal(status.paused, false);
+    assert.equal(modelCalls, 2);
+    assert.equal(status.status, "done");
+    assert.equal(status.manualContinuation, undefined);
     assert.equal(notices.length, 1);
-    assert.match(notices[0], /duplicate/);
+    assert.match(notices[0], /Reassigned 1 duplicate/);
     assert.match(
       (await handlers.get("before_agent_start")!({}, ctx)).message.content,
       /fact/,
+    );
+    const report = await tools
+      .get("memory_review")
+      .execute("", { action: "status" }, undefined, undefined, ctx);
+    assert.match(
+      JSON.stringify(report.details.report.events),
+      /Reassigned 1 duplicate/,
     );
     assert.equal(notices.length, 1);
     await handlers.get("session_shutdown")!({}, ctx);

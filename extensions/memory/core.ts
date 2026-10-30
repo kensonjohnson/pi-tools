@@ -58,6 +58,24 @@ export interface MemoryAddPrecondition {
   snapshots: Record<MemoryCategory, CategorySnapshot>;
 }
 
+export interface DuplicateIdResolution {
+  /** Stable transaction ID, or null when no repair was needed. */
+  transactionId: string | null;
+  changes: Array<{
+    category: MemoryCategory;
+    line: number;
+    oldId: string;
+    newId: string;
+  }>;
+}
+
+interface DuplicateJournal {
+  version: 1;
+  transactionId: string;
+  snapshots: Record<MemoryCategory, CategorySnapshot>;
+  changes: DuplicateIdResolution["changes"];
+}
+
 interface MoveJournal {
   version: 1;
   expected: MemoryWritePrecondition;
@@ -258,6 +276,54 @@ function parseMemoryLine(
   }
 }
 
+// Locate the top-level id token without reserializing any other bytes.
+function replaceIdToken(line: string, oldId: string, newId: string): string {
+  let depth = 0;
+  let found: [number, number] | undefined;
+  for (let i = 0; i < line.length;) {
+    const c = line[i];
+    if (c === '"') {
+      const start = i++;
+      while (i < line.length) {
+        if (line[i] === "\\") {
+          i += 2;
+          continue;
+        }
+        if (line[i++] === '"') break;
+      }
+      const token = line.slice(start, i);
+      let j = i;
+      while (/\s/.test(line[j] ?? "") && j < line.length) j++;
+      if (depth === 1 && line[j] === ":" && JSON.parse(token) === "id") {
+        if (found)
+          throw new Error("Memory duplicate conflict: ambiguous id fields");
+        j++;
+        while (j < line.length && /\s/.test(line[j])) j++;
+        if (line[j] !== '"')
+          throw new Error("Memory duplicate conflict: invalid id");
+        const valueStart = j++;
+        while (j < line.length) {
+          if (line[j] === "\\") {
+            j += 2;
+            continue;
+          }
+          if (line[j++] === '"') break;
+        }
+        if (JSON.parse(line.slice(valueStart, j)) !== oldId)
+          throw new Error("Memory duplicate conflict: id changed");
+        found = [valueStart, j];
+        i = j;
+      }
+    } else {
+      if (c === "{" || c === "[") depth++;
+      if (c === "}" || c === "]") depth--;
+      i++;
+    }
+  }
+  if (!found) throw new Error("Memory duplicate conflict: missing id");
+  return line.slice(0, found[0]) + JSON.stringify(newId) + line.slice(found[1]);
+}
+
 function normalizeText(value: string): string {
   return value.trim().replace(/\s+/g, " ");
 }
@@ -308,8 +374,17 @@ function combineRecoveryResults(
 export class NdjsonMemoryStore {
   private memoryDirName: string;
   private readonly beforeReplace?: () => Promise<void>;
+  private readonly onDuplicateRecovery?: () => void;
   private readonly moveCheckpoint?: (
-    phase: "journal" | "destination" | "source",
+    phase:
+      | "journal"
+      | "destination"
+      | "source"
+      | "duplicate-prepublish"
+      | "duplicate-written"
+      | "duplicate-synced"
+      | "duplicate-renamed"
+      | "duplicate-directory-synced",
   ) => Promise<void>;
   readonly memoryDir: string;
 
@@ -318,9 +393,19 @@ export class NdjsonMemoryStore {
     memoryDirName: string,
     beforeReplace?: () => Promise<void>,
     moveCheckpoint?: (
-      phase: "journal" | "destination" | "source",
+      phase:
+        | "journal"
+        | "destination"
+        | "source"
+        | "duplicate-prepublish"
+        | "duplicate-written"
+        | "duplicate-synced"
+        | "duplicate-renamed"
+        | "duplicate-directory-synced",
     ) => Promise<void>,
+    onDuplicateRecovery?: () => void,
   ) {
+    this.onDuplicateRecovery = onDuplicateRecovery;
     this.memoryDirName = memoryDirName;
     this.memoryDir = join(cwd, memoryDirName);
     this.beforeReplace = beforeReplace;
@@ -620,6 +705,112 @@ export class NdjsonMemoryStore {
     });
   }
 
+  /** Explicitly assign fresh IDs to every later occurrence in category and line order. */
+  async resolveDuplicateIds(
+    signal?: AbortSignal,
+  ): Promise<DuplicateIdResolution> {
+    return this.withCategoryLock(
+      "knowledge",
+      async () => {
+        const snapshots = await this.rawSnapshots();
+        const seen = new Set<string>();
+        const records: Array<{
+          category: MemoryCategory;
+          line: number;
+          id: string;
+        }> = [];
+        for (const category of MEMORY_CATEGORIES) {
+          const lines = snapshots.get(category)!.contents.split("\n");
+          for (let i = 0; i < lines.length; i++) {
+            if (!lines[i].trim()) continue;
+            const record = parseMemoryLine(lines[i], category);
+            if (!record)
+              throw new Error(
+                `Memory duplicate conflict: malformed line in ${category}`,
+              );
+            records.push({ category, line: i + 1, id: record.id });
+          }
+        }
+        const reserved = new Set(records.map((record) => record.id));
+        const changes: DuplicateIdResolution["changes"] = [];
+        for (const record of records) {
+          if (seen.has(record.id)) {
+            let newId: string;
+            do {
+              newId = uuidv7();
+            } while (reserved.has(newId));
+            reserved.add(newId);
+            changes.push({
+              category: record.category,
+              line: record.line,
+              oldId: record.id,
+              newId,
+            });
+          }
+          seen.add(record.id);
+        }
+        if (!changes.length) return { transactionId: null, changes };
+        const journal: DuplicateJournal = {
+          version: 1,
+          transactionId: uuidv7(),
+          snapshots: Object.fromEntries(
+            snapshots,
+          ) as DuplicateJournal["snapshots"],
+          changes,
+        };
+        // Validate all rewrites before making the journal durable.
+        this.duplicateStates(journal);
+        await this.moveCheckpoint?.("duplicate-prepublish");
+        // After publication starts, completion or recovery may still be required.
+        signal?.throwIfAborted();
+        await this.publishDuplicateFile(
+          this.duplicateJournalPath(),
+          JSON.stringify(journal),
+        );
+        await this.moveCheckpoint?.("journal");
+        await this.recoverDuplicatesLocked();
+        return { transactionId: journal.transactionId, changes };
+      },
+      signal,
+    );
+  }
+
+  /** Durable repair receipts, including repairs completed by another read or process. */
+  async listDuplicateIdResolutions(): Promise<DuplicateIdResolution[]> {
+    return this.withCategoryLock("knowledge", async () => {
+      const results: DuplicateIdResolution[] = [];
+      for (const name of (await readdir(this.runtimeDir())).sort()) {
+        if (!/^duplicate-receipt-[0-9a-f-]{36}\.json$/.test(name)) continue;
+        const raw = await readFile(join(this.runtimeDir(), name), "utf8");
+        let receipt: DuplicateIdResolution;
+        try {
+          receipt = JSON.parse(raw);
+          if (
+            typeof receipt.transactionId !== "string" ||
+            name !== `duplicate-receipt-${receipt.transactionId}.json` ||
+            !Array.isArray(receipt.changes) ||
+            !receipt.changes.length ||
+            receipt.changes.some(
+              (c) =>
+                !MEMORY_CATEGORIES.includes(c.category) ||
+                !Number.isInteger(c.line) ||
+                c.line < 1 ||
+                typeof c.oldId !== "string" ||
+                typeof c.newId !== "string",
+            )
+          )
+            throw new Error("invalid receipt");
+        } catch {
+          throw new Error(
+            "Memory duplicate conflict: malformed repair receipt",
+          );
+        }
+        results.push(receipt);
+      }
+      return results;
+    });
+  }
+
   /** Replays a valid interrupted move or throws an explicit conflict without overwriting edits. */
   async recoverMove(): Promise<void> {
     await this.withCategoryLock("knowledge", async () => {});
@@ -743,7 +934,16 @@ export class NdjsonMemoryStore {
     const result = new Map<MemoryCategory, CategorySnapshot>();
     for (const category of MEMORY_CATEGORIES) {
       const file = join(this.memoryDir, categoryFileName(category));
-      const contents = await readFile(file, "utf8");
+      const bytes = await readFile(file);
+      let contents: string;
+      try {
+        contents = new TextDecoder("utf-8", {
+          fatal: true,
+          ignoreBOM: true,
+        }).decode(bytes);
+      } catch {
+        throw new Error(`Memory conflict: invalid UTF-8 in ${category}`);
+      }
       const mode = (await stat(file)).mode & 0o7777;
       result.set(category, { contents, mode });
     }
@@ -782,6 +982,10 @@ export class NdjsonMemoryStore {
   private runtimeDir(): string {
     return join(this.memoryDir, ".runtime");
   }
+  private duplicateJournalPath(): string {
+    return join(this.runtimeDir(), "duplicate-transaction.json");
+  }
+
   private moveJournalPath(): string {
     return join(this.runtimeDir(), "move-transaction.json");
   }
@@ -823,7 +1027,7 @@ export class NdjsonMemoryStore {
     let removed = false;
     for (const name of await readdir(this.runtimeDir())) {
       if (
-        !/^replace-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/.test(
+        !/^(?:replace|duplicate-publish)-[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.tmp$/.test(
           name,
         )
       )
@@ -844,6 +1048,194 @@ export class NdjsonMemoryStore {
     } finally {
       await dir.close();
     }
+  }
+
+  private async publishDuplicateFile(path: string, raw: string): Promise<void> {
+    const temp = join(this.runtimeDir(), `duplicate-publish-${uuidv7()}.tmp`);
+    try {
+      const file = await open(temp, "wx", 0o600);
+      try {
+        await file.writeFile(raw, "utf8");
+        if (path === this.duplicateJournalPath())
+          await this.moveCheckpoint?.("duplicate-written");
+        await file.sync();
+        if (path === this.duplicateJournalPath())
+          await this.moveCheckpoint?.("duplicate-synced");
+      } finally {
+        await file.close();
+      }
+      await rename(temp, path);
+      if (path === this.duplicateJournalPath())
+        await this.moveCheckpoint?.("duplicate-renamed");
+      await this.syncDirectory(this.runtimeDir());
+      if (path === this.duplicateJournalPath())
+        await this.moveCheckpoint?.("duplicate-directory-synced");
+    } finally {
+      await unlink(temp).catch(() => {});
+    }
+  }
+
+  private duplicateStates(
+    journal: DuplicateJournal,
+  ): Map<MemoryCategory, CategorySnapshot>[] {
+    if (
+      journal.version !== 1 ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+        journal.transactionId,
+      ) ||
+      !journal.snapshots ||
+      !Array.isArray(journal.changes) ||
+      !journal.changes.length
+    )
+      throw new Error("invalid journal");
+    const before = new Map<MemoryCategory, CategorySnapshot>();
+    const records: Array<{
+      category: MemoryCategory;
+      line: number;
+      id: string;
+    }> = [];
+    for (const category of MEMORY_CATEGORIES) {
+      const snapshot = journal.snapshots[category];
+      if (
+        !snapshot ||
+        typeof snapshot.contents !== "string" ||
+        !Number.isInteger(snapshot.mode) ||
+        snapshot.mode < 0 ||
+        snapshot.mode > 0o7777
+      )
+        throw new Error("invalid snapshot");
+      before.set(category, snapshot);
+      const lines = snapshot.contents.split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        if (!lines[i].trim()) continue;
+        const record = parseMemoryLine(lines[i], category);
+        if (!record) throw new Error("invalid record");
+        records.push({ category, line: i + 1, id: record.id });
+      }
+    }
+    const reserved = new Set(records.map((record) => record.id));
+    const seen = new Set<string>();
+    let index = 0;
+    const output = new Map(
+      MEMORY_CATEGORIES.map((category) => [
+        category,
+        before.get(category)!.contents.split("\n"),
+      ]),
+    );
+    for (const record of records) {
+      if (seen.has(record.id)) {
+        const change = journal.changes[index++];
+        if (
+          !change ||
+          change.category !== record.category ||
+          change.line !== record.line ||
+          change.oldId !== record.id ||
+          typeof change.newId !== "string" ||
+          !change.newId ||
+          reserved.has(change.newId)
+        )
+          throw new Error("invalid change");
+        reserved.add(change.newId);
+        const lines = output.get(record.category)!;
+        lines[record.line - 1] = replaceIdToken(
+          lines[record.line - 1],
+          record.id,
+          change.newId,
+        );
+      }
+      seen.add(record.id);
+    }
+    if (index !== journal.changes.length) throw new Error("extra changes");
+    const states = [before];
+    for (const category of MEMORY_CATEGORIES) {
+      const contents = output.get(category)!.join("\n");
+      if (contents === before.get(category)!.contents) continue;
+      const next = new Map(states[states.length - 1]);
+      next.set(category, { ...before.get(category)!, contents });
+      states.push(next);
+    }
+    return states;
+  }
+
+  private async recoverDuplicatesLocked(): Promise<void> {
+    const path = this.duplicateJournalPath();
+    let raw: string;
+    try {
+      raw = await readFile(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    let states: Map<MemoryCategory, CategorySnapshot>[];
+    let journal: DuplicateJournal;
+    try {
+      journal = JSON.parse(raw);
+      states = this.duplicateStates(journal);
+    } catch {
+      throw new Error(
+        "Memory duplicate conflict: malformed transaction journal",
+      );
+    }
+    const matches = (
+      actual: Map<MemoryCategory, CategorySnapshot>,
+      expected: Map<MemoryCategory, CategorySnapshot>,
+    ) =>
+      MEMORY_CATEGORIES.every(
+        (category) =>
+          actual.get(category)!.contents === expected.get(category)!.contents &&
+          actual.get(category)!.mode === expected.get(category)!.mode,
+      );
+    const checkJournal = async () => {
+      if ((await readFile(path, "utf8")) !== raw)
+        throw new Error(
+          "Memory duplicate conflict: transaction journal changed",
+        );
+    };
+    const actual = await this.rawSnapshots();
+    let position = states.findIndex((state) => matches(actual, state));
+    if (position < 0)
+      throw new Error(
+        "Memory duplicate conflict: files changed during interrupted transaction; preserve journal",
+      );
+    for (; position < states.length - 1; position++) {
+      await checkJournal();
+      const current = states[position],
+        next = states[position + 1];
+      const category = MEMORY_CATEGORIES.find(
+        (entry) => current.get(entry)!.contents !== next.get(entry)!.contents,
+      )!;
+      await this.replace(category, current, next.get(category)!.contents);
+      await this.moveCheckpoint?.("destination");
+    }
+    await checkJournal();
+    if (!matches(await this.rawSnapshots(), states[states.length - 1]))
+      throw new Error(
+        "Memory duplicate conflict: files changed before transaction cleanup",
+      );
+    const receiptPath = join(
+      this.runtimeDir(),
+      `duplicate-receipt-${journal.transactionId}.json`,
+    );
+    const receipt = JSON.stringify({
+      transactionId: journal.transactionId,
+      changes: journal.changes,
+    });
+    try {
+      const existing = await readFile(receiptPath, "utf8");
+      if (existing !== receipt)
+        throw new Error("Memory duplicate conflict: repair receipt changed");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      await this.publishDuplicateFile(receiptPath, receipt);
+    }
+    await checkJournal();
+    if (!matches(await this.rawSnapshots(), states[states.length - 1]))
+      throw new Error(
+        "Memory duplicate conflict: files changed before transaction cleanup",
+      );
+    await unlink(path);
+    await this.syncDirectory(this.runtimeDir());
+    this.onDuplicateRecovery?.();
   }
 
   private async recoverMoveLocked(): Promise<void> {
@@ -1009,8 +1401,11 @@ export class NdjsonMemoryStore {
   private async withCategoryLock<T>(
     _category: MemoryCategory,
     operation: () => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<T> {
+    signal?.throwIfAborted();
     await this.ensureReady();
+    signal?.throwIfAborted();
     // SQLite's OS-managed write lock survives process crashes without PID guessing.
     // Never delete or replace this lock database while any process is using it.
     const db = new Database(join(this.memoryDir, "write-lock.db"), {
@@ -1019,6 +1414,7 @@ export class NdjsonMemoryStore {
     const deadline = Date.now() + 10000;
     try {
       while (true) {
+        signal?.throwIfAborted();
         try {
           db.exec("BEGIN IMMEDIATE");
           break;
@@ -1032,9 +1428,14 @@ export class NdjsonMemoryStore {
         }
       }
       try {
+        signal?.throwIfAborted();
         await this.ensurePrivateRuntime();
         await this.cleanRuntimeTemps();
+        signal?.throwIfAborted();
         await this.recoverMoveLocked();
+        signal?.throwIfAborted();
+        await this.recoverDuplicatesLocked();
+        signal?.throwIfAborted();
         return await operation();
       } finally {
         db.exec("ROLLBACK");
@@ -1538,7 +1939,15 @@ export class MemoryManager {
   constructor(cwd: string, options: MemoryManagerOptions = {}) {
     this.cwd = cwd;
     this.options = { ...DEFAULT_OPTIONS, ...options };
-    this.store = new NdjsonMemoryStore(cwd, this.options.memoryDirName);
+    this.store = new NdjsonMemoryStore(
+      cwd,
+      this.options.memoryDirName,
+      undefined,
+      undefined,
+      () => {
+        this.warnings = [];
+      },
+    );
     this.index = new PiMemoryIndex(this.store.memoryDir, this.options);
   }
 
@@ -1654,7 +2063,25 @@ export class MemoryManager {
 
   async captureAddPrecondition(): Promise<MemoryAddPrecondition> {
     await this.initialize();
-    return this.store.captureAddPrecondition();
+    const result = await this.store.captureAddPrecondition();
+    await this.reconcile();
+    return result;
+  }
+
+  async resolveDuplicateIds(
+    signal?: AbortSignal,
+  ): Promise<DuplicateIdResolution> {
+    const result = await this.store.resolveDuplicateIds(signal);
+    await this.initialize();
+    await this.reconcile();
+    return result;
+  }
+
+  async listDuplicateIdResolutions(): Promise<DuplicateIdResolution[]> {
+    const results = await this.store.listDuplicateIdResolutions();
+    await this.initialize();
+    await this.reconcile();
+    return results;
   }
 
   async remember(
@@ -1687,14 +2114,18 @@ export class MemoryManager {
     id: string,
   ): Promise<MemoryWritePrecondition | null> {
     await this.initialize();
-    return this.store.captureWritePrecondition(id);
+    const result = await this.store.captureWritePrecondition(id);
+    await this.reconcile();
+    return result;
   }
 
   async captureMovePrecondition(
     id: string,
   ): Promise<MemoryMovePrecondition | null> {
     await this.initialize();
-    return this.store.captureMovePrecondition(id);
+    const result = await this.store.captureMovePrecondition(id);
+    await this.reconcile();
+    return result;
   }
 
   async move(
@@ -1746,6 +2177,7 @@ export class MemoryManager {
     await this.initialize();
     const memories = await this.store.list();
     const counts = await this.store.categoryCounts();
+    await this.reconcile();
     return { memories, counts };
   }
 

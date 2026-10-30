@@ -5,6 +5,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { Text } from "@earendil-works/pi-tui";
+import Database from "better-sqlite3";
 import {
   dirname,
   extname,
@@ -19,7 +20,6 @@ import {
   type MemoryCategory,
   type DuplicateIdWarning,
   MemoryManager,
-  NdjsonMemoryStore,
 } from "./core.ts";
 import {
   getSettingValue,
@@ -66,12 +66,17 @@ function isMemoryCategory(value: string | undefined): value is MemoryCategory {
 const NOT_ENABLED_MESSAGE =
   "Memory tracking is not enabled for this project. Run `memory_init` to create the memory store and enable it.";
 
+const DUPLICATE_REVIEW_GUIDANCE =
+  "Run /memory-review full to repair duplicate IDs. Configured background review also repairs them when it runs.";
+
+function formatDuplicateWarning(warning: DuplicateIdWarning): string {
+  return `Duplicate memory id ${warning.id}. ${DUPLICATE_REVIEW_GUIDANCE}`;
+}
+
 function formatRecall(
   result: Awaited<ReturnType<MemoryManager["recall"]>>,
 ): string {
-  const warnings = result.warnings
-    ?.map((warning) => warning.message)
-    .join("\n");
+  const warnings = result.warnings?.map(formatDuplicateWarning).join("\n");
   const fallback =
     result.searchMode === "grep" && result.warnings?.length
       ? "Duplicate IDs prevent indexing. Search uses case-insensitive literal substring matching and may miss relevant memories."
@@ -176,8 +181,6 @@ export function createTrackedReviewStore(
 function safeReviewDetail(detail: unknown): string {
   if (typeof detail !== "string")
     return "Review failed. Check the reviewer model configuration and .pi/memory files; inspect before retrying.";
-  if (/duplicate (?:memory )?ids?/i.test(detail))
-    return "Duplicate memory IDs prevent review. Inspect .pi/memory NDJSON files and assign unique IDs manually.";
   const known = [
     "review model must be explicitly configured",
     "review model unavailable or not a chat model",
@@ -190,6 +193,7 @@ function safeReviewDetail(detail: unknown): string {
     "project review is paused or interrupted; inspect and explicitly resume first",
     "review scheduler is starting; try again shortly",
     "invalid durable manual review cursor",
+    "Duplicate ID repair may be incomplete; inspect memory files before resuming.",
     "Review stopped after applying changes; inspect before retrying.",
     "Full review stopped after applying changes; inspect before retrying.",
     "Cancelled; a partial apply may have occurred. Inspect before retrying.",
@@ -197,6 +201,8 @@ function safeReviewDetail(detail: unknown): string {
     "Cancellation was requested from another process; work may have completed. Inspect before retrying.",
   ];
   if (known.includes(detail)) return detail;
+  if (/duplicate (?:memory )?ids?/i.test(detail))
+    return `Duplicate memory IDs were detected. ${DUPLICATE_REVIEW_GUIDANCE}`;
   if (
     /^review model returned malformed JSON \((?:empty text|invalid fenced JSON|invalid JSON or unsupported wrapper); [0-9]{1,5} text bytes\)$(?![\s\S])/.test(
       detail,
@@ -245,7 +251,7 @@ export default function (pi: ExtensionAPI) {
             `${warning.id} (${warning.locations.map(({ category, line }) => `.pi/memory/${category}.ndjson:${line}`).join(", ")})`,
         )
         .join("; ");
-      const message = `Duplicate memory IDs: ${details}. Review these files and resolve the IDs manually. Memory was not changed.`;
+      const message = `Duplicate memory IDs: ${details}. ${DUPLICATE_REVIEW_GUIDANCE} Memory was not changed by this warning.`;
       try {
         if (ctx.hasUI && typeof ctx.ui.notify === "function")
           ctx.ui.notify(message, "warning");
@@ -256,16 +262,6 @@ export default function (pi: ExtensionAPI) {
     }
     return true;
   }
-  async function checkDiagnostics(ctx: ExtensionContext): Promise<boolean> {
-    const store = new NdjsonMemoryStore(
-      ctx.cwd,
-      join(CONFIG_DIR_NAME, "memory"),
-    );
-    const warnings = await store.withIndexSnapshot(
-      async (_memories, _validate, warnings) => warnings,
-    );
-    return warnDiagnostics(ctx, warnings);
-  }
   function warnConflict(ctx: ExtensionContext, error: unknown): boolean {
     if (
       !(error instanceof Error) ||
@@ -274,7 +270,7 @@ export default function (pi: ExtensionAPI) {
       return false;
     if (warnedConflicts.get(ctx.cwd) !== error.message) {
       warnedConflicts.set(ctx.cwd, error.message);
-      const message = `${error.message}. Review the files in .pi/memory and resolve the duplicate ID manually. Memory was not changed.`;
+      const message = `${error.message}. ${DUPLICATE_REVIEW_GUIDANCE} Memory was not changed by this operation.`;
       try {
         if (ctx.hasUI && typeof ctx.ui.notify === "function")
           ctx.ui.notify(message, "warning");
@@ -361,6 +357,62 @@ export default function (pi: ExtensionAPI) {
     return scheduler;
   }
 
+  // Called only under the scheduler's shared project claim. Persist observation,
+  // continuation invalidation and a visible event atomically, including recovery
+  // receipts created by another process or an interrupted repair.
+  async function observeDuplicateRepairs(
+    manager: MemoryManager,
+    cwd: string,
+    mode: "manual" | "background",
+    signal: AbortSignal,
+  ) {
+    await manager.resolveDuplicateIds(signal);
+    const receipts = await manager.listDuplicateIdResolutions();
+    const db = new Database(
+      join(
+        cwd,
+        CONFIG_DIR_NAME,
+        "memory",
+        ".runtime",
+        "review-scheduler",
+        "scheduler.sqlite",
+      ),
+      { timeout: 0 },
+    );
+    try {
+      db.exec(
+        "CREATE TABLE IF NOT EXISTS duplicate_repair_observed (id TEXT PRIMARY KEY)",
+      );
+      return db.transaction(() => {
+        const add = db.prepare(
+          "INSERT OR IGNORE INTO duplicate_repair_observed(id) VALUES (?)",
+        );
+        const fresh = receipts.filter(
+          (receipt) =>
+            receipt.transactionId && add.run(receipt.transactionId).changes,
+        );
+        if (!fresh.length) return undefined;
+        const changes = fresh.flatMap((receipt) => receipt.changes);
+        const ids = changes
+          .map((change) => change.newId)
+          .filter((id) =>
+            /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+              id,
+            ),
+          );
+        const shown = ids.slice(0, 5);
+        const detail = `Reassigned ${changes.length} duplicate memory ID(s).${shown.length ? ` New IDs: ${shown.join(", ")}${changes.length > shown.length ? " (additional IDs omitted)" : ""}.` : ""}`;
+        db.prepare("DELETE FROM manual_cursor WHERE id=1").run();
+        db.prepare(
+          "INSERT INTO review_events(at,mode,status,detail,changes,changes_total) VALUES (?,?,?,?,?,?)",
+        ).run(Date.now(), mode, "repair", detail, "[]", 0);
+        return detail;
+      })();
+    } finally {
+      db.close();
+    }
+  }
+
   async function reviewOperation(
     action: "status" | "full" | "resume" | "cancel",
     ctx: ExtensionContext,
@@ -402,16 +454,34 @@ export default function (pi: ExtensionAPI) {
         const result = await control.runManual(
           async (runSignal, progress) => {
             try {
-              const { memories } = await manager.list();
-              if (
-                new Set(memories.map((memory) => memory.id)).size !==
-                memories.length
-              )
-                throw new Error("Duplicate memory IDs prevent review");
+              runSignal.throwIfAborted();
+              let repairDetail: string | undefined;
+              try {
+                repairDetail = await observeDuplicateRepairs(
+                  manager,
+                  ctx.cwd,
+                  "manual",
+                  runSignal,
+                );
+              } catch {
+                return {
+                  status: "uncertain",
+                  detail:
+                    "Duplicate ID repair may be incomplete; inspect memory files before resuming.",
+                };
+              }
+              if (repairDetail) {
+                changes.push({
+                  id: "duplicate-id-repair",
+                  detail: repairDetail,
+                });
+                progress.clear();
+              }
+              runSignal.throwIfAborted();
               const reviewer = await createConfiguredPiMemoryReviewer(
                 ctx,
                 createTrackedReviewStore(manager, changes),
-                progress.resumePermit,
+                repairDetail ? undefined : progress.resumePermit,
               );
               const outcome = await reviewAllMemories({
                 reviewer,
@@ -442,7 +512,10 @@ export default function (pi: ExtensionAPI) {
           result.status === "error" || result.status === "uncertain"
             ? { ...result, detail: safeReviewDetail(result.detail) }
             : result;
-        const text = `Full memory review ${safeResult.status}: ${safeResult.detail ?? ""}${safeResult.nextOffset === undefined ? "" : ` Progress saved at offset ${safeResult.nextOffset}; run /memory-review full to continue.`}`;
+        const repair = safeResult.changes?.find(
+          (change) => change.id === "duplicate-id-repair",
+        );
+        const text = `Full memory review ${safeResult.status}: ${safeResult.detail ?? ""}${repair ? ` ${repair.detail}` : ""}${safeResult.nextOffset === undefined ? "" : ` Progress saved at offset ${safeResult.nextOffset}; run /memory-review full to continue.`}`;
         return textResult(text, { action, result: safeResult });
       }
       const settings = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);
@@ -662,24 +735,43 @@ export default function (pi: ExtensionAPI) {
         )
           return { status: "pending" };
         signal.throwIfAborted();
-        if (await checkDiagnostics(ctx))
-          return {
-            status: "pending",
-            detail:
-              "Duplicate memory IDs require manual resolution; review activity remains pending.",
-          };
-        if (directory.startsWith(UNSUPPORTED_FILE_SOURCE))
-          return {
-            status: "unsupported-session",
-            detail:
-              "The explicitly opened session filename is not JSONL; activity remains pending.",
-          };
         const changes: Array<{ id: string; detail: string }> = [];
-        const reviewer = await createConfiguredPiMemoryReviewer(
-          ctx,
-          createTrackedReviewStore(manager, changes),
-        );
+        let repairDetail: string | undefined;
         try {
+          repairDetail = await observeDuplicateRepairs(
+            manager,
+            ctx.cwd,
+            "background",
+            signal,
+          );
+        } catch {
+          return {
+            status: "uncertain",
+            detail:
+              "Duplicate ID repair may be incomplete; inspect memory files before resuming.",
+          };
+        }
+        if (repairDetail) {
+          changes.push({ id: "duplicate-id-repair", detail: repairDetail });
+          if (ctx.hasUI) {
+            try {
+              ctx.ui.notify(repairDetail, "info");
+            } catch {}
+          }
+        }
+        try {
+          signal.throwIfAborted();
+          if (directory.startsWith(UNSUPPORTED_FILE_SOURCE))
+            return {
+              status: "unsupported-session",
+              detail:
+                "The explicitly opened session filename is not JSONL; activity remains pending.",
+              ...(changes.length ? { changes } : {}),
+            };
+          const reviewer = await createConfiguredPiMemoryReviewer(
+            ctx,
+            createTrackedReviewStore(manager, changes),
+          );
           const outcome = await reviewProjectSessions({
             project: ctx.cwd,
             sessionDir: directory,
@@ -961,7 +1053,10 @@ export default function (pi: ExtensionAPI) {
       return textResult(formatRecall(result), {
         searchMode: result.searchMode,
         memoryCount: result.memories.length,
-        warnings: result.warnings ?? [],
+        warnings: (result.warnings ?? []).map((warning) => ({
+          ...warning,
+          message: formatDuplicateWarning(warning),
+        })),
       });
     },
   });

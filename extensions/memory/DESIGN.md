@@ -18,7 +18,7 @@ The source of truth is three NDJSON files under `.pi/memory/`. Each non-empty va
 
 The files can be inspected and edited directly. IDs remain stable through updates and category moves. NDJSON is not a provenance graph: a record does not necessarily identify its original instruction or evidence. The reviewer must therefore treat uncertain authority conservatively.
 
-`memory_init` creates the store and index and can optionally seed basic project facts. Initialization does not silently remove malformed lines. Mutations reject malformed records or duplicate IDs; `memory_repair` is the explicit recovery path for removing malformed non-empty lines. Review the source files before running a destructive repair.
+`memory_init` creates the store and index and can optionally seed basic project facts. Initialization does not silently remove malformed lines. Ordinary mutations reject malformed records or duplicate IDs. Full and background reviews resolve duplicate IDs by retaining the first ID and assigning fresh IDs to later records, preserving their content. `memory_repair` is the explicit recovery path for removing malformed non-empty lines. Review the source files before running a destructive repair.
 
 Cooperating processes serialize canonical operations with a project-wide SQLite lock. Changes use checked snapshots and atomic file replacement. Category moves use a private transaction journal so interrupted moves can be recovered when their snapshots still match; ambiguous changes fail closed. Uncooperative editors do not take the lock, and an edit between the final check and rename can still race a replacement. Private runtime files and the derived databases are Git-ignored.
 
