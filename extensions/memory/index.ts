@@ -17,7 +17,9 @@ import {
 import {
   MEMORY_CATEGORIES,
   type MemoryCategory,
+  type DuplicateIdWarning,
   MemoryManager,
+  NdjsonMemoryStore,
 } from "./core.ts";
 import {
   getSettingValue,
@@ -67,11 +69,27 @@ const NOT_ENABLED_MESSAGE =
 function formatRecall(
   result: Awaited<ReturnType<MemoryManager["recall"]>>,
 ): string {
+  const warnings = result.warnings
+    ?.map((warning) => warning.message)
+    .join("\n");
+  const fallback =
+    result.searchMode === "grep" && result.warnings?.length
+      ? "Duplicate IDs prevent indexing. Search uses case-insensitive literal substring matching and may miss relevant memories."
+      : undefined;
   if (result.memories.length === 0) {
-    return `No memory matches found.`;
+    return [
+      `Search mode: ${result.searchMode}`,
+      fallback,
+      "No memory matches found.",
+      warnings,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
   }
 
   const sections: string[] = [`Search mode: ${result.searchMode}`];
+  if (fallback) sections.push(fallback);
+  if (warnings) sections.push(`Memory warnings:\n${warnings}`);
 
   sections.push(
     `Memories:\n${result.memories
@@ -163,6 +181,73 @@ function textResult(text: string, details?: unknown) {
 export default function (pi: ExtensionAPI) {
   const managers = new Map<string, Promise<MemoryManager>>();
   const injectedSessions = new Set<string>();
+  const warnedConflicts = new Map<string, string>();
+  function warnDiagnostics(
+    ctx: ExtensionContext,
+    warnings: DuplicateIdWarning[],
+  ): boolean {
+    if (!warnings.length) {
+      warnedConflicts.delete(ctx.cwd);
+      return false;
+    }
+    const signature = JSON.stringify(
+      warnings
+        .map((warning) => [
+          warning.id,
+          warning.locations
+            .map(({ category, line }) => `${category}:${line}`)
+            .sort(),
+        ])
+        .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+    );
+    if (warnedConflicts.get(ctx.cwd) !== signature) {
+      warnedConflicts.set(ctx.cwd, signature);
+      const details = warnings
+        .map(
+          (warning) =>
+            `${warning.id} (${warning.locations.map(({ category, line }) => `.pi/memory/${category}.ndjson:${line}`).join(", ")})`,
+        )
+        .join("; ");
+      const message = `Duplicate memory IDs: ${details}. Review these files and resolve the IDs manually. Memory was not changed.`;
+      try {
+        if (ctx.hasUI && typeof ctx.ui.notify === "function")
+          ctx.ui.notify(message, "warning");
+        else console.error(message);
+      } catch {
+        console.error(message);
+      }
+    }
+    return true;
+  }
+  async function checkDiagnostics(ctx: ExtensionContext): Promise<boolean> {
+    const store = new NdjsonMemoryStore(
+      ctx.cwd,
+      join(CONFIG_DIR_NAME, "memory"),
+    );
+    const warnings = await store.withIndexSnapshot(
+      async (_memories, _validate, warnings) => warnings,
+    );
+    return warnDiagnostics(ctx, warnings);
+  }
+  function warnConflict(ctx: ExtensionContext, error: unknown): boolean {
+    if (
+      !(error instanceof Error) ||
+      !error.message.startsWith("Memory conflict: duplicate id ")
+    )
+      return false;
+    if (warnedConflicts.get(ctx.cwd) !== error.message) {
+      warnedConflicts.set(ctx.cwd, error.message);
+      const message = `${error.message}. Review the files in .pi/memory and resolve the duplicate ID manually. Memory was not changed.`;
+      try {
+        if (ctx.hasUI && typeof ctx.ui.notify === "function")
+          ctx.ui.notify(message, "warning");
+        else console.error(message);
+      } catch {
+        console.error(message);
+      }
+    }
+    return true;
+  }
   let scheduler: MemoryScheduler | undefined;
   let schedulerBoot: { activity(): void; stop(): Promise<void> } | undefined;
   let backgroundEnabled = false;
@@ -189,6 +274,15 @@ export default function (pi: ExtensionAPI) {
     feedbackTimer.unref();
   }
 
+  function getManager(cwd: string): Promise<MemoryManager> {
+    let manager = managers.get(cwd);
+    if (!manager) {
+      manager = Promise.resolve(new MemoryManager(cwd));
+      managers.set(cwd, manager);
+    }
+    return manager;
+  }
+
   async function getReadyManager(
     ctx: ExtensionContext,
   ): Promise<MemoryManager | undefined> {
@@ -197,12 +291,7 @@ export default function (pi: ExtensionAPI) {
     ) {
       return undefined;
     }
-    let manager = managers.get(ctx.cwd);
-    if (!manager) {
-      manager = Promise.resolve(new MemoryManager(ctx.cwd));
-      managers.set(ctx.cwd, manager);
-    }
-    const ready = await manager;
+    const ready = await getManager(ctx.cwd);
     return (await ready.isReady()) ? ready : undefined;
   }
 
@@ -359,6 +448,7 @@ export default function (pi: ExtensionAPI) {
     const manager = await getReadyManager(ctx);
     if (!manager) return;
     const promptContext = await manager.buildPromptContext();
+    warnDiagnostics(ctx, manager.getWarnings());
     if (!promptContext) return null;
     return {
       message: {
@@ -519,6 +609,12 @@ export default function (pi: ExtensionAPI) {
         )
           return { status: "pending" };
         signal.throwIfAborted();
+        if (await checkDiagnostics(ctx))
+          return {
+            status: "pending",
+            detail:
+              "Duplicate memory IDs require manual resolution; review activity remains pending.",
+          };
         if (directory.startsWith(UNSUPPORTED_FILE_SOURCE))
           return {
             status: "unsupported-session",
@@ -693,7 +789,13 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const result = await injectMemoryMessage(ctx);
+    let result: Awaited<ReturnType<typeof injectMemoryMessage>>;
+    try {
+      result = await injectMemoryMessage(ctx);
+    } catch (error) {
+      if (!warnConflict(ctx, error)) throw error;
+      return;
+    }
     if (result !== undefined) {
       injectedSessions.add(sessionId);
     }
@@ -802,9 +904,11 @@ export default function (pi: ExtensionAPI) {
         category: params.category,
         limit: params.limit,
       });
+      warnDiagnostics(ctx, result.warnings ?? []);
       return textResult(formatRecall(result), {
         searchMode: result.searchMode,
         memoryCount: result.memories.length,
+        warnings: result.warnings ?? [],
       });
     },
   });

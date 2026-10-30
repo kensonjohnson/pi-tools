@@ -70,9 +70,17 @@ export interface MemoryHit extends StoredMemoryLine {
   source: "semantic" | "fts" | "grep";
 }
 
+export interface DuplicateIdWarning {
+  code: "duplicate_memory_id";
+  id: string;
+  locations: Array<{ category: MemoryCategory; line: number }>;
+  message: string;
+}
+
 export interface RecallResult {
   memories: MemoryHit[];
   searchMode: "semantic" | "fts" | "grep";
+  warnings?: DuplicateIdWarning[];
 }
 
 export interface RecoveryResult {
@@ -85,6 +93,7 @@ export interface InitResult {
   skippedMemories: number;
   recoveredLines: number;
   semanticEnabled: boolean;
+  warnings?: DuplicateIdWarning[];
 }
 
 interface SearchRow {
@@ -354,22 +363,36 @@ export class NdjsonMemoryStore {
     operation: (
       memories: StoredMemoryLine[],
       validate: () => Promise<void>,
+      warnings: DuplicateIdWarning[],
     ) => Promise<T>,
   ): Promise<T> {
     return this.withCategoryLock("knowledge", async () => {
       const snapshots = await this.rawSnapshots();
       const memories: StoredMemoryLine[] = [];
-      const ids = new Set<string>();
+      const locations = new Map<
+        string,
+        Array<{ category: MemoryCategory; line: number }>
+      >();
       for (const category of MEMORY_CATEGORIES) {
-        for (const line of snapshots.get(category)!.contents.split(/\n/)) {
-          const memory = parseMemoryLine(line, category);
+        const lines = snapshots.get(category)!.contents.split(/\n/);
+        for (let index = 0; index < lines.length; index++) {
+          const memory = parseMemoryLine(lines[index], category);
           if (!memory) continue;
-          if (ids.has(memory.id))
-            throw new Error(`Memory conflict: duplicate id ${memory.id}`);
-          ids.add(memory.id);
+          const entries = locations.get(memory.id) ?? [];
+          entries.push({ category, line: index + 1 });
+          locations.set(memory.id, entries);
           memories.push(memory);
         }
       }
+      const warnings: DuplicateIdWarning[] = Array.from(
+        locations,
+        ([id, entries]) => ({
+          code: "duplicate_memory_id" as const,
+          id,
+          locations: entries,
+          message: `Duplicate memory id ${id}; inspect the listed NDJSON lines and assign unique IDs before writing or indexing.`,
+        }),
+      ).filter((warning) => warning.locations.length > 1);
       const validate = async () => {
         const current = await this.rawSnapshots();
         if (
@@ -384,7 +407,7 @@ export class NdjsonMemoryStore {
             "Memory index conflict: canonical files changed during reconciliation",
           );
       };
-      return operation(memories, validate);
+      return operation(memories, validate, warnings);
     });
   }
 
@@ -1501,7 +1524,16 @@ export class MemoryManager {
   private initialized = false;
   private initializing: Promise<void> | null = null;
   private lastRecovery = emptyRecoveryResult();
+  private warnings: DuplicateIdWarning[] = [];
   private options: Required<MemoryManagerOptions>;
+
+  /** Warnings from the most recent initialization or reconciliation snapshot. */
+  getWarnings(): DuplicateIdWarning[] {
+    return this.warnings.map((warning) => ({
+      ...warning,
+      locations: warning.locations.map((location) => ({ ...location })),
+    }));
+  }
 
   constructor(cwd: string, options: MemoryManagerOptions = {}) {
     this.cwd = cwd;
@@ -1521,23 +1553,51 @@ export class MemoryManager {
     for (let attempt = 0; ; attempt++) {
       try {
         const captured = await this.store.withIndexSnapshot(
-          async (memories, validate) => {
+          async (memories, validate, warnings) => {
+            this.warnings = warnings;
+            if (warnings.length > 0)
+              return { memories, validate, warnings, needed: false };
             await this.index.initialize();
             return {
               memories,
               validate,
+              warnings,
               needed: this.index.needsSync(memories, force),
             };
           },
         );
+        if (captured.warnings.length > 0) {
+          if (!query) return undefined;
+          const needle = query.query.toLowerCase();
+          return {
+            memories: captured.memories
+              .filter(
+                (memory) =>
+                  (!query.category || memory.category === query.category) &&
+                  memory.content.toLowerCase().includes(needle),
+              )
+              .slice(0, query.limit)
+              .map((memory) => ({
+                ...memory,
+                score: 0.4,
+                source: "grep" as const,
+              })),
+            searchMode: "grep",
+            warnings: this.getWarnings(),
+          };
+        }
         // Provider calls never run while holding the canonical project lock.
         const vectors = query
           ? await this.index.prepareVectors(captured.memories, captured.needed)
           : null;
         const queryVector = await this.index.prepareQuery(query?.query);
         return await this.store.withIndexSnapshot(
-          async (_current, validate) => {
+          async (_current, validate, warnings) => {
             await captured.validate();
+            if (warnings.length > 0)
+              throw new Error(
+                "Memory index conflict: duplicate IDs appeared during reconciliation",
+              );
             this.index.syncMemories(captured.memories, vectors, force);
             const result = query
               ? this.index.search(
@@ -1730,12 +1790,16 @@ export class MemoryManager {
       createdMemories,
       skippedMemories,
       recoveredLines: recovery.totalRemovedLines,
-      semanticEnabled: this.index.isSemanticAvailable(),
+      semanticEnabled:
+        this.warnings.length === 0 && this.index.isSemanticAvailable(),
+      warnings: this.getWarnings(),
     };
   }
 
   async buildPromptContext(): Promise<string> {
     await this.initialize();
+    // Prompt injection can run again after external edits, including compaction.
+    await this.reconcile();
     return this.store.buildPromptContext();
   }
 
