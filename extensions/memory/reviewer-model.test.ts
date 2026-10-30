@@ -78,3 +78,86 @@ test("review model requires explicit available authenticated text chat model and
     /malformed JSON/,
   );
 });
+
+test("review model accepts exactly one bare or fenced JSON value", async () => {
+  let text = "";
+  const registry: any = {
+    find: () => ({ input: ["text"] }),
+    getApiKeyAndHeaders: async () => ({ ok: true }),
+    complete: async () => ({
+      stopReason: "stop",
+      content: [
+        { type: "thinking", thinking: "ignored" },
+        { type: "text", text },
+      ],
+    }),
+  };
+  const generate = () =>
+    new PiReviewerModel(registry, "p/m").generate({
+      instruction: "test",
+      data: {},
+    });
+  for (text of [
+    ' {"ok":true} ',
+    '```json\n{"ok":true}\n```',
+    '```JSON\r\n{"ok":true}\r\n```',
+    '```\n{"ok":true}\n```',
+  ]) {
+    assert.deepEqual(await generate(), { ok: true });
+  }
+  const secret = "secret-provider-content";
+  for (text of [
+    `Here is JSON: {"secret":"${secret}"}`,
+    '```json\n{"ok":true}\n```\nExtra prose',
+    '```json\n{"ok":true}\n```\n```json\n{"ok":false}\n```',
+    '```json\n{"ok":true} {"ok":false}\n```',
+    '```json\n{"ok":\n```',
+    '```json\n{"ok":true}',
+    '{"ok":',
+    '```javascript\n{"ok":true}\n```',
+    `not JSON ${secret}`,
+    "",
+  ]) {
+    await assert.rejects(generate(), (error: Error) => {
+      assert.match(error.message, /malformed JSON/);
+      assert.doesNotMatch(error.message, new RegExp(secret));
+      assert.ok(error.message.length < 150);
+      return true;
+    });
+  }
+});
+
+test("review model rejects incomplete and failed responses without provider details", async () => {
+  let stopReason = "length";
+  const registry: any = {
+    find: () => ({ input: ["text"] }),
+    getApiKeyAndHeaders: async () => ({ ok: true }),
+    complete: async () => ({
+      stopReason,
+      errorMessage: "secret provider detail",
+      rawStopReason: "secret raw reason",
+      content: [{ type: "text", text: '{"ok":true}' }],
+    }),
+  };
+  for (stopReason of [
+    "length",
+    "error",
+    "aborted",
+    "toolUse",
+    "pending",
+    "deferred",
+    "secret unknown reason",
+  ]) {
+    await assert.rejects(
+      new PiReviewerModel(registry, "p/m").generate({
+        instruction: "test",
+        data: {},
+      }),
+      (error: Error) => {
+        assert.match(error.message, /did not complete/);
+        assert.doesNotMatch(error.message, /secret/);
+        return true;
+      },
+    );
+  }
+});

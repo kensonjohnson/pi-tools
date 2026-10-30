@@ -171,6 +171,43 @@ export function createTrackedReviewStore(
   };
 }
 
+// Provider and filesystem errors can contain credentials, paths, or user data.
+// Only display known diagnostic messages; never echo arbitrary exception text.
+function safeReviewDetail(detail: unknown): string {
+  if (typeof detail !== "string")
+    return "Review failed. Check the reviewer model configuration and .pi/memory files; inspect before retrying.";
+  if (/duplicate (?:memory )?ids?/i.test(detail))
+    return "Duplicate memory IDs prevent review. Inspect .pi/memory NDJSON files and assign unique IDs manually.";
+  const known = [
+    "review model must be explicitly configured",
+    "review model unavailable or not a chat model",
+    "review model lacks text input capability",
+    "review model authentication unavailable",
+    "review model input exceeds byte limit or is invalid",
+    "review model response exceeds byte limit",
+    "review model returned malformed JSON",
+    "project review is active",
+    "project review is paused or interrupted; inspect and explicitly resume first",
+    "review scheduler is starting; try again shortly",
+    "invalid durable manual review cursor",
+    "Review stopped after applying changes; inspect before retrying.",
+    "Full review stopped after applying changes; inspect before retrying.",
+    "Cancelled; a partial apply may have occurred. Inspect before retrying.",
+    "Cancellation or shutdown may have interrupted an apply; inspect before retrying.",
+    "Cancellation was requested from another process; work may have completed. Inspect before retrying.",
+  ];
+  if (known.includes(detail)) return detail;
+  if (
+    /^review model returned malformed JSON \((?:empty text|invalid fenced JSON|invalid JSON or unsupported wrapper); [0-9]{1,5} text bytes\)$(?![\s\S])/.test(
+      detail,
+    )
+  )
+    return detail;
+  if (detail.startsWith("review model did not complete:"))
+    return "Review model did not complete. Check the model provider and configuration.";
+  return "Review failed. Check the reviewer model configuration and .pi/memory files; inspect before retrying.";
+}
+
 function textResult(text: string, details?: unknown) {
   return {
     content: [{ type: "text" as const, text }],
@@ -334,10 +371,11 @@ export default function (pi: ExtensionAPI) {
       return textResult("Memory review requires a trusted project.", {
         available: false,
       });
-    const manager = await getReadyManager(ctx);
-    if (!manager) return textResult(NOT_ENABLED_MESSAGE, { available: false });
     let control: MemoryScheduler | undefined;
     try {
+      const manager = await getReadyManager(ctx);
+      if (!manager)
+        return textResult(NOT_ENABLED_MESSAGE, { available: false });
       control = await getReviewControl(ctx);
       if (!control)
         return textResult("Memory review is unavailable.", {
@@ -364,6 +402,12 @@ export default function (pi: ExtensionAPI) {
         const result = await control.runManual(
           async (runSignal, progress) => {
             try {
+              const { memories } = await manager.list();
+              if (
+                new Set(memories.map((memory) => memory.id)).size !==
+                memories.length
+              )
+                throw new Error("Duplicate memory IDs prevent review");
               const reviewer = await createConfiguredPiMemoryReviewer(
                 ctx,
                 createTrackedReviewStore(manager, changes),
@@ -394,8 +438,12 @@ export default function (pi: ExtensionAPI) {
           signal,
           { restart: options?.restart },
         );
-        const text = `Full memory review ${result.status}: ${result.detail ?? ""}${result.nextOffset === undefined ? "" : ` Progress saved at offset ${result.nextOffset}; run /memory-review full to continue.`}`;
-        return textResult(text, { action, result });
+        const safeResult =
+          result.status === "error" || result.status === "uncertain"
+            ? { ...result, detail: safeReviewDetail(result.detail) }
+            : result;
+        const text = `Full memory review ${safeResult.status}: ${safeResult.detail ?? ""}${safeResult.nextOffset === undefined ? "" : ` Progress saved at offset ${safeResult.nextOffset}; run /memory-review full to continue.`}`;
+        return textResult(text, { action, result: safeResult });
       }
       const settings = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);
       const raw = control.report();
@@ -415,7 +463,10 @@ export default function (pi: ExtensionAPI) {
           ) === true,
         events: raw.events.slice(0, 8).map((event) => ({
           ...event,
-          detail: event.detail.slice(0, 400),
+          detail:
+            event.status === "error" || event.status === "uncertain"
+              ? safeReviewDetail(event.detail)
+              : event.detail.slice(0, 400),
           changes: event.changes.slice(0, 5).map((change) => ({
             ...change,
             detail: change.detail.slice(0, 150),
@@ -431,7 +482,9 @@ export default function (pi: ExtensionAPI) {
         { action, report },
       );
     } catch (error) {
-      const detail = error instanceof Error ? error.message : "unknown error";
+      const detail = safeReviewDetail(
+        error instanceof Error ? error.message : undefined,
+      );
       if (action === "full" && control) {
         try {
           control.noteManualFailure(detail);
@@ -1121,7 +1174,13 @@ export default function (pi: ExtensionAPI) {
             if (ctx.hasUI && generation === feedbackGeneration)
               target.notify(result.content[0].text, "info");
           })
-          .catch(() => {});
+          .catch(() => {
+            if (ctx.hasUI && generation === feedbackGeneration)
+              target.notify(
+                `Full memory review failed: ${safeReviewDetail(undefined)}`,
+                "error",
+              );
+          });
         return;
       }
       const result = await reviewOperation(action, ctx);
