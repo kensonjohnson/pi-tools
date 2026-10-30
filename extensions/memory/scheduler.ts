@@ -73,14 +73,15 @@ export type SchedulerReportEvent = {
 };
 declare const manualResumeBrand: unique symbol;
 export type ManualResumePermit = { readonly [manualResumeBrand]: true };
-const resumePermits = new WeakMap<
-  object,
-  { offset: number; snapshot: string }
->();
-export function resolveManualResumePermit(permit: ManualResumePermit): {
+export type ManualCursor = {
   offset: number;
   snapshot: string;
-} {
+  fragment?: IncrementalFragmentProgress;
+};
+const resumePermits = new WeakMap<object, ManualCursor>();
+export function resolveManualResumePermit(
+  permit: ManualResumePermit,
+): ManualCursor {
   const cursor = resumePermits.get(permit);
   if (!cursor) throw new Error("invalid manual review continuation permit");
   return { ...cursor };
@@ -89,9 +90,19 @@ declare const incrementalResumeBrand: unique symbol;
 export type IncrementalResumePermit = {
   readonly [incrementalResumeBrand]: true;
 };
+export type IncrementalFragmentProgress = {
+  plan: string;
+  index: number;
+  sufficient: boolean;
+};
 const incrementalPermits = new WeakMap<
   object,
-  { key: string; offset: number; snapshot: string }
+  {
+    key: string;
+    offset: number;
+    snapshot: string;
+    fragment?: IncrementalFragmentProgress;
+  }
 >();
 export function resolveIncrementalResumePermit(
   permit: IncrementalResumePermit,
@@ -114,9 +125,9 @@ export function incrementalBatchKey(batch: ReviewBatch): string {
     .digest("hex");
 }
 export type ManualProgress = {
-  current?: { offset: number; snapshot: string };
+  current?: ManualCursor;
   resumePermit?: ManualResumePermit;
-  advance(cursor: { offset: number; snapshot: string }): void;
+  advance(cursor: ManualCursor): void;
   clear(): void;
 };
 export type SchedulerReport = {
@@ -265,6 +276,11 @@ export class MemoryScheduler {
       this.db.exec(
         "CREATE TABLE IF NOT EXISTS meta (id INTEGER PRIMARY KEY CHECK(id=1), project TEXT NOT NULL, cooldown INTEGER NOT NULL, inflight INTEGER NOT NULL, paused INTEGER NOT NULL, status TEXT NOT NULL); CREATE TABLE IF NOT EXISTS directories (path TEXT PRIMARY KEY, pending INTEGER NOT NULL, completed INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS processed_signals (id TEXT PRIMARY KEY); CREATE TABLE IF NOT EXISTS review_events (id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL, changes TEXT NOT NULL, changes_total INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS manual_cursor (id INTEGER PRIMARY KEY CHECK(id=1), offset INTEGER NOT NULL, snapshot TEXT NOT NULL)",
       );
+      const manualColumns = this.db.pragma(
+        "table_info(manual_cursor)",
+      ) as Array<{ name: string }>;
+      if (!manualColumns.some((column) => column.name === "fragment"))
+        this.db.exec("ALTER TABLE manual_cursor ADD COLUMN fragment TEXT");
       const columns = this.db.pragma("table_info(review_events)") as Array<{
         name: string;
       }>;
@@ -606,7 +622,7 @@ export class MemoryScheduler {
     if (this.running) throw new Error("project review is active");
     const claim = this.acquire();
     if (!claim) throw new Error("project review is active");
-    let currentCursor: { offset: number; snapshot: string } | undefined;
+    let currentCursor: ManualCursor | undefined;
     try {
       const meta = this.db
         .prepare("SELECT paused,inflight FROM meta WHERE id=1")
@@ -637,9 +653,35 @@ export class MemoryScheduler {
           .run();
       });
       begin();
-      currentCursor = this.db
-        .prepare("SELECT offset,snapshot FROM manual_cursor WHERE id=1")
-        .get() as typeof currentCursor;
+      const saved = this.db
+        .prepare(
+          "SELECT offset,snapshot,fragment FROM manual_cursor WHERE id=1",
+        )
+        .get() as
+        | { offset: number; snapshot: string; fragment: string | null }
+        | undefined;
+      if (saved) {
+        let fragment: IncrementalFragmentProgress | undefined;
+        if (saved.fragment) {
+          try {
+            const value = JSON.parse(saved.fragment);
+            if (
+              /^[a-f0-9]{64}$/.test(value.plan) &&
+              Number.isSafeInteger(value.index) &&
+              value.index > 0 &&
+              typeof value.sufficient === "boolean"
+            )
+              fragment = value;
+          } catch {
+            /* Invalid fragment state is not resumed. */
+          }
+        }
+        currentCursor = {
+          offset: saved.offset,
+          snapshot: saved.snapshot,
+          ...(fragment ? { fragment } : {}),
+        };
+      }
     } catch (error) {
       this.release(claim);
       throw error;
@@ -648,7 +690,8 @@ export class MemoryScheduler {
     if (currentCursor) {
       if (
         !Number.isSafeInteger(currentCursor.offset) ||
-        currentCursor.offset < 1 ||
+        currentCursor.offset < 0 ||
+        (currentCursor.offset === 0 && !currentCursor.fragment) ||
         !/^[a-f0-9]{64}$/.test(currentCursor.snapshot)
       ) {
         this.release(claim);
@@ -663,16 +706,27 @@ export class MemoryScheduler {
       advance: (cursor) => {
         if (
           !Number.isSafeInteger(cursor.offset) ||
-          cursor.offset <= (progress.current?.offset ?? 0) ||
+          cursor.offset < (progress.current?.offset ?? 0) ||
+          (cursor.offset === (progress.current?.offset ?? 0) &&
+            !cursor.fragment) ||
+          (cursor.fragment &&
+            (!/^[a-f0-9]{64}$/.test(cursor.fragment.plan) ||
+              !Number.isSafeInteger(cursor.fragment.index) ||
+              cursor.fragment.index < 1 ||
+              typeof cursor.fragment.sufficient !== "boolean")) ||
           !/^[a-f0-9]{64}$/.test(cursor.snapshot) ||
           (progress.current && progress.current.snapshot !== cursor.snapshot)
         )
           throw new Error("invalid manual review continuation");
         this.db
           .prepare(
-            "INSERT INTO manual_cursor(id,offset,snapshot) VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET offset=excluded.offset,snapshot=excluded.snapshot",
+            "INSERT INTO manual_cursor(id,offset,snapshot,fragment) VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET offset=excluded.offset,snapshot=excluded.snapshot,fragment=excluded.fragment",
           )
-          .run(cursor.offset, cursor.snapshot);
+          .run(
+            cursor.offset,
+            cursor.snapshot,
+            cursor.fragment ? JSON.stringify(cursor.fragment) : null,
+          );
         progress.current = cursor;
       },
       clear: () => {
@@ -1033,13 +1087,15 @@ export async function reviewProjectSessions(options: {
   const cursors = new Database(cursorPath, { timeout: 0 });
   cursors.pragma("synchronous = FULL");
   cursors.exec(
-    "CREATE TABLE IF NOT EXISTS cursors (path TEXT PRIMARY KEY, batch_key TEXT NOT NULL, offset INTEGER NOT NULL, snapshot TEXT NOT NULL, boundary TEXT)",
+    "CREATE TABLE IF NOT EXISTS cursors (path TEXT PRIMARY KEY, batch_key TEXT NOT NULL, offset INTEGER NOT NULL, snapshot TEXT NOT NULL, boundary TEXT, fragment TEXT)",
   );
   const columns = cursors.pragma("table_info(cursors)") as Array<{
     name: string;
   }>;
   if (!columns.some((column) => column.name === "boundary"))
     cursors.exec("ALTER TABLE cursors ADD COLUMN boundary TEXT");
+  if (!columns.some((column) => column.name === "fragment"))
+    cursors.exec("ALTER TABLE cursors ADD COLUMN fragment TEXT");
   let passes = 0;
   let continuation = false;
   let unavailable = false;
@@ -1070,7 +1126,7 @@ export async function reviewProjectSessions(options: {
         const key = incrementalBatchKey(batch);
         const saved = cursors
           .prepare(
-            "SELECT batch_key,offset,snapshot,boundary FROM cursors WHERE path=?",
+            "SELECT batch_key,offset,snapshot,boundary,fragment FROM cursors WHERE path=?",
           )
           .get(batch.path) as
           | {
@@ -1078,6 +1134,7 @@ export async function reviewProjectSessions(options: {
               offset: number;
               snapshot: string;
               boundary: string | null;
+              fragment: string | null;
             }
           | undefined;
         const canResume =
@@ -1091,6 +1148,21 @@ export async function reviewProjectSessions(options: {
         let fullSnapshot: string | undefined = canResume
           ? saved!.snapshot
           : undefined;
+        let fragment: IncrementalFragmentProgress | undefined;
+        if (canResume && saved!.fragment) {
+          try {
+            const value = JSON.parse(saved!.fragment);
+            if (
+              /^[a-f0-9]{64}$/.test(value.plan) &&
+              Number.isSafeInteger(value.index) &&
+              value.index > 0 &&
+              typeof value.sufficient === "boolean"
+            )
+              fragment = value;
+          } catch {
+            /* Invalid saved fragment progress is restarted. */
+          }
+        }
         let needsPermit = offset !== undefined;
         while (true) {
           options.signal.throwIfAborted();
@@ -1107,6 +1179,7 @@ export async function reviewProjectSessions(options: {
               key,
               offset: offset!,
               snapshot: fullSnapshot!,
+              ...(fragment ? { fragment } : {}),
             });
           }
           let result;
@@ -1117,6 +1190,22 @@ export async function reviewProjectSessions(options: {
               fullOffset: offset,
               fullSnapshot,
               incrementalContinuation: permit,
+              onFragmentProgress: (progress) => {
+                cursors
+                  .prepare(
+                    "INSERT INTO cursors(path,batch_key,offset,snapshot,boundary,fragment) VALUES (?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET batch_key=excluded.batch_key,offset=excluded.offset,snapshot=excluded.snapshot,boundary=excluded.boundary,fragment=excluded.fragment",
+                  )
+                  .run(
+                    batch.path,
+                    key,
+                    offset ?? 0,
+                    progress.snapshot,
+                    batch.sourceBoundary
+                      ? JSON.stringify(batch.sourceBoundary)
+                      : null,
+                    JSON.stringify(progress.fragment),
+                  );
+              },
             });
           } catch (error) {
             if (
@@ -1130,6 +1219,7 @@ export async function reviewProjectSessions(options: {
                 .run(batch.path);
               offset = undefined;
               fullSnapshot = undefined;
+              fragment = undefined;
               needsPermit = false;
               continue;
             }
@@ -1138,6 +1228,7 @@ export async function reviewProjectSessions(options: {
             if (permit) incrementalPermits.delete(permit);
           }
           needsPermit = false;
+          fragment = undefined;
           if (result.status === "uncertain" || result.status === "unresolved")
             return { status: result.status, detail: result.detail, changes };
           if (result.status === "applied") {
@@ -1158,7 +1249,7 @@ export async function reviewProjectSessions(options: {
               throw new Error("invalid incremental review cursor");
             cursors
               .prepare(
-                "INSERT INTO cursors(path,batch_key,offset,snapshot,boundary) VALUES (?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET batch_key=excluded.batch_key,offset=excluded.offset,snapshot=excluded.snapshot,boundary=excluded.boundary",
+                "INSERT INTO cursors(path,batch_key,offset,snapshot,boundary,fragment) VALUES (?,?,?,?,?,NULL) ON CONFLICT(path) DO UPDATE SET batch_key=excluded.batch_key,offset=excluded.offset,snapshot=excluded.snapshot,boundary=excluded.boundary,fragment=NULL",
               )
               .run(
                 batch.path,

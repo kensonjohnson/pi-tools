@@ -14,8 +14,9 @@ async function readSession(path: string) {
   const fd = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     const before = await fd.stat();
-    if (!before.isFile() || before.size > 8 * 1024 * 1024 || before.size === 0)
-      throw new Error("session source unavailable or oversized");
+    // Validation currently reads the whole source, including large sessions.
+    if (!before.isFile() || before.size === 0)
+      throw new Error("session source unavailable or empty");
     const bytes = Buffer.alloc(before.size);
     let offset = 0;
     while (offset < bytes.length) {
@@ -112,8 +113,8 @@ export async function validateSessionBatch(
   let child = true;
   let childEntries: Entry[] | undefined;
   while (path !== undefined) {
-    if (!isAbsolute(path) || seen.has(path) || seen.size >= 9)
-      throw new Error("invalid or excessive fork provenance");
+    if (!isAbsolute(path) || seen.has(path))
+      throw new Error("invalid or cyclic fork provenance");
     seen.add(path);
     const source = await readSession(path);
     if (resolve(source.header.cwd) !== cwd)
@@ -141,9 +142,27 @@ export async function validateSessionBatch(
         if (
           entry.type !== "message" ||
           entry.message?.role !== item.role ||
-          !["user", "assistant"].includes(item.role) ||
-          messageText(entry.message.content, item.role) !== item.text
+          !["user", "assistant"].includes(item.role)
         )
+          throw new Error("session item changed or is unsupported");
+        const fullText = messageText(entry.message.content, item.role);
+        if (item.chunk) {
+          const { start, end, total } = item.chunk;
+          const bytes = Buffer.from(fullText, "utf8");
+          if (
+            !Number.isSafeInteger(start) ||
+            !Number.isSafeInteger(end) ||
+            !Number.isSafeInteger(total) ||
+            start < 0 ||
+            end <= start ||
+            end > bytes.length ||
+            total !== bytes.length ||
+            (start < bytes.length && (bytes[start] & 0xc0) === 0x80) ||
+            (end < bytes.length && (bytes[end] & 0xc0) === 0x80) ||
+            bytes.subarray(start, end).toString("utf8") !== item.text
+          )
+            throw new Error("session item changed or is unsupported");
+        } else if (fullText !== item.text)
           throw new Error("session item changed or is unsupported");
         previous = index;
       }

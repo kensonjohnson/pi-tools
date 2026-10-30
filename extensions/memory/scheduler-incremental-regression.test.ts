@@ -59,14 +59,17 @@ test("incremental pages survive reviewer and process-style restarts, and stale s
     const offsets: number[] = [];
     const run = async () => {
       const store = new MemoryManager(root, { semanticEnabled: false });
-      let turn = 0;
+      let previous: number | undefined;
       const reviewer = new MemoryReviewer({
         project: root,
         store,
+        contextWindow: 1500,
         model: {
-          generate: async ({ data }: any) => {
-            if (turn++ % 2 === 0) {
-              offsets.push(Number(data.memories[0]?.id.slice(3) ?? 1201));
+          generate: async ({ instruction, data }: any) => {
+            if (instruction.startsWith("Select")) {
+              const first = Number(data.memories[0]?.id.slice(3) ?? 1201);
+              if (previous !== first) offsets.push(first);
+              previous = first;
               return { paths: [] };
             }
             return {
@@ -98,7 +101,7 @@ test("incremental pages survive reviewer and process-style restarts, and stale s
     assert.equal(offsets[24], 0);
     assert.equal((await run()).status, "done");
     await access(checkpointFile);
-    assert.equal(offsets.at(-1), 1200);
+    assert.ok(offsets.at(-1)! > offsets.at(-2)! && offsets.at(-1)! < 1201);
     assert.equal((await run()).status, "done");
   });
 });
@@ -136,14 +139,17 @@ test("appends during paged review retain the original session boundary", async (
     const observed: string[][] = [];
     const run = async () => {
       const store = new MemoryManager(root, { semanticEnabled: false });
-      let turn = 0;
+      let previous: string | undefined;
       const reviewer = new MemoryReviewer({
         project: root,
         store,
+        contextWindow: 1500,
         model: {
-          generate: async ({ data }: any) => {
-            if (turn++ % 2 === 0) {
-              observed.push(data.session.map((item: any) => item.id));
+          generate: async ({ instruction, data }: any) => {
+            if (instruction.startsWith("Select")) {
+              if (previous !== data.memories[0]?.id)
+                observed.push(data.session.map((item: any) => item.id));
+              previous = data.memories[0]?.id;
               return { paths: [] };
             }
             return {
@@ -201,12 +207,17 @@ test("appends during paged review retain the original session boundary", async (
         message: { role: "user", content: "fourth" },
       }) + "\n",
     );
-    assert.equal((await run()).status, "pending");
-    assert.deepEqual(observed.at(-1), ["b", "c"]);
-    assert.equal(
-      JSON.parse(await readFile(checkpointFile, "utf8")).sessions[session].leaf,
-      "c",
-    );
+    let leaf = JSON.parse(await readFile(checkpointFile, "utf8")).sessions[
+      session
+    ].leaf;
+    for (let i = 0; i < 10 && leaf !== "c"; i++) {
+      assert.equal((await run()).status, "pending");
+      assert.deepEqual(observed.at(-1), ["b", "c"]);
+      leaf = JSON.parse(await readFile(checkpointFile, "utf8")).sessions[
+        session
+      ].leaf;
+    }
+    assert.equal(leaf, "c");
   });
 });
 
@@ -247,17 +258,20 @@ test("branch replacement or truncation discards prior page progress", async () =
       const observed: Array<{ first: string; session: string[] }> = [];
       const run = async () => {
         const store = new MemoryManager(root, { semanticEnabled: false });
-        let turn = 0;
+        let previous: string | undefined;
         const reviewer = new MemoryReviewer({
           project: root,
           store,
+          contextWindow: 1500,
           model: {
-            generate: async ({ data }: any) => {
-              if (turn++ % 2 === 0) {
-                observed.push({
-                  first: data.memories[0].id,
-                  session: data.session.map((item: any) => item.id),
-                });
+            generate: async ({ instruction, data }: any) => {
+              if (instruction.startsWith("Select")) {
+                if (previous !== data.memories[0]?.id)
+                  observed.push({
+                    first: data.memories[0].id,
+                    session: data.session.map((item: any) => item.id),
+                  });
+                previous = data.memories[0]?.id;
                 return { paths: [] };
               }
               return {
@@ -334,7 +348,7 @@ test("incremental cursor resumes across independent processes", async () => {
     const core = new URL("./core.ts", import.meta.url).href;
     const reviewer = new URL("./reviewer.ts", import.meta.url).href;
     const scheduler = new URL("./scheduler.ts", import.meta.url).href;
-    const script = `import { MemoryManager } from ${JSON.stringify(core)}; import { MemoryReviewer } from ${JSON.stringify(reviewer)}; import { reviewProjectSessions } from ${JSON.stringify(scheduler)}; const [root,dir,checkpoint]=process.argv.slice(1); const store=new MemoryManager(root,{semanticEnabled:false}); let n=0; const r=new MemoryReviewer({project:root,store,model:{generate:async()=>++n%2?{paths:[]}:{action:'no_change',evidenceSufficient:true,reason:'Session reviewed.'}}}); const out=await reviewProjectSessions({project:root,sessionDir:dir,checkpointFile:checkpoint,reviewer:r,signal:new AbortController().signal}); console.log(out.status); await store.close();`;
+    const script = `import { MemoryManager } from ${JSON.stringify(core)}; import { MemoryReviewer } from ${JSON.stringify(reviewer)}; import { reviewProjectSessions } from ${JSON.stringify(scheduler)}; const [root,dir,checkpoint]=process.argv.slice(1); const store=new MemoryManager(root,{semanticEnabled:false}); const r=new MemoryReviewer({project:root,store,contextWindow:1500,model:{generate:async({instruction})=>instruction.startsWith('Select')?{paths:[]}:{action:'no_change',evidenceSufficient:true,reason:'Session reviewed.'}}}); const out=await reviewProjectSessions({project:root,sessionDir:dir,checkpointFile:checkpoint,reviewer:r,signal:new AbortController().signal}); console.log(out.status); await store.close();`;
     const run = () =>
       spawnSync(
         process.execPath,

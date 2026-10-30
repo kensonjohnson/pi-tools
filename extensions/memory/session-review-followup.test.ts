@@ -81,11 +81,10 @@ test("partial batches checkpoint only reviewed entries across restarts", () =>
     r.close();
   }));
 
-test("oversized records and unsupported content stop progress without acknowledging them", () =>
+test("unsupported content stops progress without acknowledging it", () =>
   fixture(({ project, dir, checkpoint }) => {
     const path = join(dir, "one.jsonl");
     for (const [content, issue] of [
-      ["x".repeat(500), /record .* exceeds/],
       [[{ type: "image", data: "x" }], /image/],
       [{ bad: true }, /malformed/],
       [[{ type: "text", text: 42 }], /malformed/],

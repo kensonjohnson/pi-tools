@@ -43,7 +43,7 @@ async function fixture(fn: (root: string, store: any) => Promise<void>) {
   }
 }
 
-test("failed captures and byte exhaustion do not acknowledge incremental review", () =>
+test("multiple large captures can acknowledge incremental review", () =>
   fixture(async (root, store) => {
     await writeFile(
       join(root, "extensions/browser-tools/first.ts"),
@@ -82,11 +82,11 @@ test("failed captures and byte exhaustion do not acknowledge incremental review"
       },
     });
     const result = await reviewer.review({ batch });
-    assert.equal(input.files.length, 1);
-    assert.equal(input.evidenceFailures[0].reason, "limit_reached");
-    assert.equal(result.status, "unresolved");
-    assert.equal(result.audit?.coverage, "insufficient");
-    assert.equal(ack, 0);
+    assert.equal(input.files.length, 2);
+    assert.equal(input.evidenceFailures.length, 0);
+    assert.equal(result.status, "unchanged");
+    assert.equal(result.audit?.coverage, "limited");
+    assert.equal(ack, 1);
   }));
 
 const noChange = {
@@ -95,7 +95,7 @@ const noChange = {
   evidenceSufficient: true,
 };
 
-test("eight paths plus eight excerpts are bounded and reported as insufficient", () =>
+test("eight paths plus eight excerpts are all captured", () =>
   fixture(async (root, store) => {
     const paths = Array.from(
       { length: 8 },
@@ -120,9 +120,9 @@ test("eight paths plus eight excerpts are bounded and reported as insufficient",
       },
     });
     const result = await reviewer.review();
-    assert.equal(decisionInput.files.length, 8);
-    assert.equal(decisionInput.requestsTruncated, true);
-    assert.equal(result.audit?.coverage, "insufficient");
+    assert.equal(decisionInput.files.length, 16);
+    assert.equal(decisionInput.requestsTruncated, false);
+    assert.equal(result.audit?.coverage, "limited");
     assert.equal(result.acknowledged, false);
   }));
 
@@ -162,12 +162,11 @@ test("mixed unavailable requests reach the model safely and make no-change insuf
       },
     });
     const result = await reviewer.review();
-    assert.equal(input.files.length, 1);
+    assert.equal(input.files.length, 2);
     assert.deepEqual(
       input.evidenceFailures.map((f: any) => f.reason),
       [
         "not_found",
-        "not_regular_or_too_large",
         "not_regular_or_too_large",
         "invalid_path",
         "no_match",
@@ -208,7 +207,7 @@ test("a supported correction can use captured evidence despite unrelated gaps", 
             };
           if (instruction.startsWith("Independently")) {
             assessments++;
-            assert.equal(data.requestsTruncated, true);
+            assert.equal(data.requestsTruncated, false);
             assert.equal(data.evidenceFailures[0].reason, "not_found");
             return {
               verdict: "supported",
@@ -271,7 +270,7 @@ test("a fabricated citation for unavailable evidence is rejected before assessme
     assert.equal(assessed, false);
   }));
 
-test("duplicate requests and excess searches are disclosed", () =>
+test("duplicate requests are deduplicated and all searches are processed", () =>
   fixture(async (root, store) => {
     await writeFile(
       join(root, "extensions/browser-tools/index.ts"),
@@ -297,7 +296,7 @@ test("duplicate requests and excess searches are disclosed", () =>
       },
     });
     const result = await reviewer.review();
-    assert.equal(input.searches.length, 3);
-    assert.equal(input.requestsTruncated, true);
-    assert.equal(result.audit?.coverage, "insufficient");
+    assert.equal(input.searches.length, 4);
+    assert.equal(input.requestsTruncated, false);
+    assert.equal(result.audit?.coverage, "limited");
   }));

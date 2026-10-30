@@ -30,6 +30,7 @@ type Progress = {
   size: number;
   hash: string;
   leaf: string | null;
+  partial?: { id: string; offset: number };
 };
 type State = {
   version: 1;
@@ -37,9 +38,16 @@ type State = {
   sessions: Record<string, Progress>;
 };
 export type ReviewIssue = { path?: string; reason: string };
-export type ReviewItem = { id: string; role: string; text: string };
+export type ReviewItem = {
+  id: string;
+  role: string;
+  text: string;
+  /** UTF-8 byte range in the complete normalized message text. */
+  chunk?: { start: number; end: number; total: number };
+};
 export type SessionBoundary = {
   leaf: string | null;
+  chunkEnd?: number;
   dev: number;
   ino: number;
   size: number;
@@ -232,7 +240,9 @@ export class SessionReview {
     this.project = resolve(options.project);
     this.dir = resolve(options.sessionDir);
     this.checkpoint = resolve(options.checkpointFile);
-    this.maxFile = options.maxFileBytes ?? 8 * 1024 * 1024;
+    // A caller may opt into a per-file cap. By default large persisted sessions
+    // remain reviewable, although reading one currently allocates its full size.
+    this.maxFile = options.maxFileBytes ?? Number.MAX_SAFE_INTEGER;
     this.maxText = options.maxTextBytes ?? 64 * 1024;
     this.maxSessions = options.maxSessionsPerScan ?? 32;
     this.maxScan = options.maxScanBytes ?? 32 * 1024 * 1024;
@@ -407,18 +417,20 @@ export class SessionReview {
       const workBeforeSession = scanned - 1;
       try {
         const size = statSync(path).size;
-        if (size > this.maxFile || size > this.maxScan) {
+        if (size > this.maxFile) {
           issues.push({
             path,
             reason: "session exceeds file or scan byte limit; unavailable",
           });
           continue;
         }
-        if (size > this.maxScan - bytes) {
+        if (size > this.maxScan - bytes && bytesBeforeSession > 0) {
           this.pending = name;
           break;
         }
-        const s = snapshot(path, Math.min(this.maxFile, this.maxScan - bytes));
+        // Let the first session exceed the aggregate scan budget so it cannot
+        // be deferred forever. The next session is deferred to the next scan.
+        const s = snapshot(path, this.maxFile);
         bytes += s.bytes.length;
         if (resolve(s.header.cwd) !== this.project) {
           issues.push({ path, reason: "excluded: different project" });
@@ -436,26 +448,15 @@ export class SessionReview {
         let childEntries = s.entries;
         let parent = s.header.parentSession;
         while (parent !== undefined) {
-          if (
-            typeof parent !== "string" ||
-            !isAbsolute(parent) ||
-            parents.length >= 8
-          )
-            throw new Error(
-              "fork provenance unsupported or too deep; excluded",
-            );
+          if (typeof parent !== "string" || !isAbsolute(parent))
+            throw new Error("fork provenance unsupported; excluded");
           const parentPath = resolve(parent);
           if (visited.has(parentPath))
             throw new Error("fork provenance cycle; excluded");
           visited.add(parentPath);
-          if (++scanned > this.maxSessions) {
-            if (workBeforeSession > 0) {
-              this.pending = name;
-              break;
-            }
-            throw new Error(
-              "fork provenance exceeds scan work budget; excluded",
-            );
+          if (++scanned > this.maxSessions && workBeforeSession > 0) {
+            this.pending = name;
+            break;
           }
           let parentSize: number;
           try {
@@ -467,19 +468,11 @@ export class SessionReview {
             throw new Error(
               "fork provenance exceeds file byte limit; excluded",
             );
-          if (parentSize > this.maxScan - bytes) {
-            if (bytesBeforeSession > 0) {
-              this.pending = name;
-              break;
-            }
-            throw new Error(
-              "fork provenance exceeds scan byte budget; excluded",
-            );
+          if (parentSize > this.maxScan - bytes && bytesBeforeSession > 0) {
+            this.pending = name;
+            break;
           }
-          const ancestor = snapshot(
-            parentPath,
-            Math.min(this.maxFile, this.maxScan - bytes),
-          );
+          const ancestor = snapshot(parentPath, this.maxFile);
           bytes += ancestor.bytes.length;
           if (resolve(ancestor.header.cwd) !== this.project)
             throw new Error("cross-project fork provenance; excluded");
@@ -505,6 +498,7 @@ export class SessionReview {
           });
         const previous = state.sessions[path];
         let start = 0;
+        let partialOffset = 0;
         if (previous) {
           const same =
             previous.id === s.header.id &&
@@ -523,8 +517,16 @@ export class SessionReview {
             const index = s.branch.findIndex(
               (entry) => entry.id === previous.leaf,
             );
-            if (index >= 0) start = index + 1;
-            else
+            if (index >= 0) {
+              if (
+                previous.partial?.id === previous.leaf &&
+                Number.isSafeInteger(previous.partial.offset) &&
+                previous.partial.offset > 0
+              ) {
+                start = index;
+                partialOffset = previous.partial.offset;
+              } else start = index + 1;
+            } else
               issues.push({
                 path,
                 reason: "active branch changed; replaying active branch",
@@ -534,6 +536,7 @@ export class SessionReview {
         const boundary = options.boundaries?.get(path);
         let branchEnd = s.branch.length;
         let resumedBoundary = false;
+        let boundaryChunkEnd: number | undefined;
         if (
           boundary &&
           boundary.dev === s.dev &&
@@ -547,14 +550,27 @@ export class SessionReview {
             boundary.leaf === null
               ? -1
               : s.branch.findIndex((entry) => entry.id === boundary.leaf);
-          if ((boundary.leaf === null || index >= 0) && index + 1 >= start) {
+          // A scheduler cursor can outlive acknowledgement of its batch. Do
+          // not resume an already-consumed entry or chunk; the scheduler will
+          // discard its stale cursor when the next batch has a different key.
+          const ahead =
+            (index >= 0 && index + 1 > start) ||
+            (boundary.leaf === null && start === 0);
+          const consumedChunk =
+            index === start &&
+            partialOffset > 0 &&
+            boundary.chunkEnd !== undefined &&
+            boundary.chunkEnd <= partialOffset;
+          if (ahead && !consumedChunk) {
             branchEnd = index + 1;
             resumedBoundary = true;
+            boundaryChunkEnd = boundary.chunkEnd;
           }
         }
         const items: ReviewItem[] = [];
         let end = start;
         let blocked = false;
+        let partial: { id: string; offset: number } | undefined;
         const budget = Math.min(this.maxText, this.maxScanText - textBytes);
         for (let index = start; index < branchEnd; index++) {
           const entry = s.branch[index];
@@ -581,23 +597,101 @@ export class SessionReview {
                 break;
               }
               if (text) {
-                const item = { id: entry.id, role: message.role, text };
+                const full = Buffer.from(text, "utf8");
+                const from = index === start ? partialOffset : 0;
                 if (
-                  Buffer.byteLength(JSON.stringify([item])) > this.maxText ||
-                  Buffer.byteLength(JSON.stringify([item])) > this.maxScanText
-                ) {
-                  issues.push({
-                    path,
-                    reason: `record ${entry.id} exceeds review byte limit; progress stops before it`,
-                  });
-                  blocked = true;
-                  break;
-                }
-                if (
-                  Buffer.byteLength(JSON.stringify([...items, item])) > budget
+                  from > full.length ||
+                  (from > 0 && (full[from] & 0xc0) === 0x80)
                 )
-                  break;
-                items.push(item);
+                  throw new Error("invalid saved message chunk offset");
+                const whole: ReviewItem = {
+                  id: entry.id,
+                  role: message.role,
+                  text,
+                };
+                if (
+                  !from &&
+                  !(
+                    resumedBoundary &&
+                    index === branchEnd - 1 &&
+                    boundaryChunkEnd !== undefined
+                  ) &&
+                  Buffer.byteLength(JSON.stringify([...items, whole])) <= budget
+                ) {
+                  items.push(whole);
+                } else {
+                  // Select the largest codepoint-aligned range fitting the serialized batch.
+                  let lo = from,
+                    hi = Math.min(
+                      full.length,
+                      resumedBoundary &&
+                        index === branchEnd - 1 &&
+                        boundaryChunkEnd !== undefined
+                        ? boundaryChunkEnd
+                        : full.length,
+                    );
+                  if (
+                    hi < from ||
+                    hi > full.length ||
+                    (hi < full.length && (full[hi] & 0xc0) === 0x80)
+                  )
+                    throw new Error("invalid saved message chunk boundary");
+                  const target = hi;
+                  const make = (end: number): ReviewItem => ({
+                    id: entry.id,
+                    role: message.role,
+                    text: full.subarray(from, end).toString("utf8"),
+                    chunk: { start: from, end, total: full.length },
+                  });
+                  while (lo < hi) {
+                    let mid = Math.ceil((lo + hi) / 2);
+                    while (
+                      mid > from &&
+                      mid < full.length &&
+                      (full[mid] & 0xc0) === 0x80
+                    )
+                      mid--;
+                    if (mid === lo) {
+                      mid = lo + 1;
+                      while (mid < full.length && (full[mid] & 0xc0) === 0x80)
+                        mid++;
+                      if (mid > hi) break;
+                    }
+                    if (
+                      Buffer.byteLength(
+                        JSON.stringify([...items, make(mid)]),
+                      ) <= budget
+                    )
+                      lo = mid;
+                    else hi = mid - 1;
+                  }
+                  if (lo === from) {
+                    if (items.length) break;
+                    if (textBytes > 0) {
+                      this.pending = name;
+                      break;
+                    }
+                    issues.push({
+                      path,
+                      reason: `review byte limit too small for message ${entry.id}; progress stops before it`,
+                    });
+                    blocked = true;
+                    break;
+                  }
+                  if (
+                    resumedBoundary &&
+                    index === branchEnd - 1 &&
+                    boundaryChunkEnd !== undefined &&
+                    lo !== target
+                  )
+                    resumedBoundary = false;
+                  items.push(make(lo));
+                  if (lo < full.length) {
+                    partial = { id: entry.id, offset: lo };
+                    end = index + 1;
+                    break;
+                  }
+                }
               }
             } else if (
               !["system", "toolResult", "custom", "bashExecution"].includes(
@@ -614,7 +708,8 @@ export class SessionReview {
           }
           end = index + 1;
         }
-        const more = end < s.branch.length;
+        if (this.pending === name) break;
+        const more = !!partial || end < s.branch.length;
         if (more && !blocked)
           issues.push({
             path,
@@ -647,6 +742,7 @@ export class SessionReview {
           resumedBoundary,
           sourceBoundary: {
             leaf: batchLeaf,
+            ...(partial ? { chunkEnd: partial.offset } : {}),
             dev: s.dev,
             ino: s.ino,
             size: s.bytes.length,
@@ -692,6 +788,7 @@ export class SessionReview {
                 size: s.bytes.length,
                 hash: hash(s.bytes),
                 leaf: batchLeaf,
+                ...(partial ? { partial } : {}),
               };
               this.save(fresh);
               acknowledged = true;

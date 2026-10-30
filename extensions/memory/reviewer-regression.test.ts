@@ -16,7 +16,9 @@ const batch = (ack: () => void): ReviewBatch => ({
   acknowledge: ack,
 });
 const fakeValidate = async () => {};
-test("incremental review of 201 memories requires each snapshot-bound page before acknowledgement", async () => {
+test("incremental review of 201 memories requires each snapshot-bound page before acknowledgement", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "review-pages-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
   const lines = Array.from(
     { length: 201 },
     (_, i) =>
@@ -31,21 +33,23 @@ test("incremental review of 201 memories requires each snapshot-bound page befor
     },
   };
   const store: any = { captureAddPrecondition: async () => state };
+  let reviewed = 0;
   const model: any = {
-    generate: async ({ instruction, data }: any) =>
-      instruction.startsWith("Select")
-        ? { paths: [] }
-        : (assert.ok(data.memories.length <= 50),
-          {
-            action: "no_change",
-            evidenceSufficient: true,
-            reason: "Session reviewed.",
-          }),
+    generate: async ({ instruction, data }: any) => {
+      if (instruction.startsWith("Select")) return { paths: [] };
+      reviewed += data.memories.length;
+      return {
+        action: "no_change",
+        evidenceSufficient: true,
+        reason: "Session reviewed.",
+      };
+    },
   };
   const reviewer = new MemoryReviewer({
-    project: "/project",
+    project: root,
     store,
     model,
+    contextWindow: 2500,
     validateSession: fakeValidate,
   });
   let ack = 0;
@@ -64,7 +68,8 @@ test("incremental review of 201 memories requires each snapshot-bound page befor
     offset = result.nextOffset;
     snapshot = result.fullSnapshot;
   } while (offset !== undefined);
-  assert.equal(calls, 5);
+  assert.ok(calls > 1);
+  assert.equal(reviewed, 201);
   assert.equal(ack, 1);
   await assert.rejects(
     reviewer.review({ batch: b, fullOffset: 50, fullSnapshot: snapshot }),

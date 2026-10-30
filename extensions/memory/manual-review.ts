@@ -1,5 +1,9 @@
 import type { MemoryReviewer } from "./reviewer.ts";
-import type { SchedulerOutcome } from "./scheduler.ts";
+import type {
+  IncrementalFragmentProgress,
+  ManualCursor,
+  SchedulerOutcome,
+} from "./scheduler.ts";
 
 /** Bounded full review; after each mutation the complete snapshot is reviewed again. */
 export async function reviewAllMemories(options: {
@@ -8,9 +12,7 @@ export async function reviewAllMemories(options: {
   maxPasses?: number;
   fullOffset?: number;
   fullSnapshot?: string;
-  onProgress?: (
-    cursor: { offset: number; snapshot: string } | undefined,
-  ) => void;
+  onProgress?: (cursor: ManualCursor | undefined) => void;
 }): Promise<SchedulerOutcome> {
   const changes: Array<{ id: string; detail: string }> = [];
   let offset = options.fullOffset,
@@ -37,11 +39,36 @@ export async function reviewAllMemories(options: {
   try {
     for (let pass = 0; pass < (options.maxPasses ?? 24); pass++) {
       options.signal.throwIfAborted();
-      const result = await options.reviewer.review({
-        signal: options.signal,
-        fullOffset: offset,
-        fullSnapshot: snapshot,
-      });
+      let result: Awaited<ReturnType<MemoryReviewer["review"]>>;
+      try {
+        result = await options.reviewer.review({
+          signal: options.signal,
+          fullOffset: offset,
+          fullSnapshot: snapshot,
+          ...(options.onProgress
+            ? {
+                onFragmentProgress: (progress: {
+                  snapshot: string;
+                  fragment: IncrementalFragmentProgress;
+                }) => options.onProgress!({ offset: offset ?? 0, ...progress }),
+              }
+            : {}),
+        });
+      } catch (error) {
+        if (
+          offset !== undefined &&
+          error instanceof Error &&
+          error.message ===
+            "review snapshot changed or is missing; restart at zero"
+        ) {
+          options.onProgress?.(undefined);
+          options.reviewer.restartFullReview();
+          offset = undefined;
+          snapshot = undefined;
+          continue;
+        }
+        throw error;
+      }
       pages++;
       // Optional aggregate metadata is supplied by reviewers that can identify
       // evidence gaps. Never persist paths, excerpts, or model-generated text.

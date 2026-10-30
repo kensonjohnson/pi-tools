@@ -25,10 +25,16 @@ async function fixture(
     await rm(cwd, { recursive: true, force: true });
   }
 }
-function noChange(store: MemoryManager, cwd: string, paths: string[] = []) {
+function noChange(
+  store: MemoryManager,
+  cwd: string,
+  paths: string[] = [],
+  contextWindow?: number,
+) {
   return new MemoryReviewer({
     project: cwd,
     store,
+    contextWindow,
     model: {
       generate: async ({ instruction }) =>
         instruction.startsWith("Select")
@@ -45,15 +51,15 @@ test("full review pages bind to an unchanged snapshot", () =>
   fixture(async (cwd, store) => {
     for (let i = 0; i < 51; i++)
       await store.remember("knowledge", `Fact number ${i}.`);
-    const reviewer = noChange(store, cwd);
+    const reviewer = noChange(store, cwd, [], 1500);
     const first = await reviewer.review();
-    assert.equal(first.nextOffset, 50);
+    assert.ok(first.nextOffset && first.nextOffset < 51);
     assert.ok(first.fullSnapshot);
     const second = await reviewer.review({
       fullOffset: first.nextOffset,
       fullSnapshot: first.fullSnapshot,
     });
-    assert.equal(second.nextOffset, undefined);
+    assert.ok(second.audit!.pageOffset! > 0);
     await store.remember("knowledge", "A new fact.");
     await assert.rejects(
       reviewer.review({

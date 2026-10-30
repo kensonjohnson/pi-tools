@@ -80,7 +80,8 @@ test("bounded manual continuation survives reload and /memory-review full contin
     await writeFile(join(cwd, "evidence.txt"), "Fixture evidence.\n");
     const saved = snapshot(1201);
     MemoryManager.prototype.captureAddPrecondition = async () => saved;
-    let calls = 0;
+    let calls = 0,
+      decisions = 0;
     const notices: string[] = [];
     const ctx: any = {
       cwd,
@@ -95,24 +96,27 @@ test("bounded manual continuation survives reload and /memory-review full contin
       },
       modelRegistry: {
         getAvailable: () => [],
-        find: () => ({ provider: "p", id: "model", input: ["text"] }),
-        getApiKeyAndHeaders: async () => ({ ok: true }),
-        complete: async () => ({
-          stopReason: "stop",
-          content: [
-            {
-              type: "text",
-              text:
-                ++calls % 2
-                  ? calls === 1
-                    ? '{"paths":[]}'
-                    : '{"paths":["evidence.txt"]}'
-                  : calls === 2
-                    ? '{"action":"no_change","reason":"Evidence missing","evidenceSufficient":false}'
-                    : '{"action":"no_change","reason":"Fixture review","evidenceSufficient":true}',
-            },
-          ],
+        find: () => ({
+          provider: "p",
+          id: "model",
+          input: ["text"],
+          contextWindow: 1600,
         }),
+        getApiKeyAndHeaders: async () => ({ ok: true }),
+        complete: async (_model: unknown, request: any) => {
+          calls++;
+          const selecting = request.systemPrompt.includes(
+            "Select evidence requests",
+          );
+          const text = selecting
+            ? decisions === 0
+              ? '{"paths":[]}'
+              : '{"paths":["evidence.txt"]}'
+            : ++decisions === 1
+              ? '{"action":"no_change","reason":"Evidence missing","evidenceSufficient":false}'
+              : '{"action":"no_change","reason":"Fixture review","evidenceSufficient":true}';
+          return { stopReason: "stop", content: [{ type: "text", text }] };
+        },
       },
     };
     const harness = () => {
@@ -147,8 +151,13 @@ test("bounded manual continuation survives reload and /memory-review full contin
     const first = await a.tools
       .get("memory_review")
       .execute("", { action: "full" }, undefined, undefined, ctx);
-    assert.equal(first.details.result.status, "pending");
-    assert.equal(first.details.result.nextOffset, 1200);
+    assert.equal(
+      first.details.result.status,
+      "pending",
+      JSON.stringify(first.details.result),
+    );
+    const resumeOffset = first.details.result.nextOffset;
+    assert.ok(resumeOffset > 0 && resumeOffset < 1201);
     assert.deepEqual(first.details.result.review, {
       pages: 24,
       resumedAtOffset: 0,
@@ -159,13 +168,17 @@ test("bounded manual continuation survives reload and /memory-review full contin
       candidatesTruncatedPages: 0,
     });
     assert.match(first.content[0].text, /Coverage is not verification/);
-    assert.equal(calls, 48);
+    assert.equal(decisions, 24);
+    const initialCalls = calls;
     await a.handlers.get("session_shutdown")!({}, ctx);
     const b = harness();
     const before = await b.tools
       .get("memory_review")
       .execute("", { action: "status" }, undefined, undefined, ctx);
-    assert.equal(before.details.report.status.manualContinuation.offset, 1200);
+    assert.equal(
+      before.details.report.status.manualContinuation.offset,
+      resumeOffset,
+    );
     await b.commands.get("memory-review").handler("full", ctx);
     for (
       let i = 0;
@@ -173,8 +186,11 @@ test("bounded manual continuation survives reload and /memory-review full contin
       i++
     )
       await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.ok(notices.some((x) => /review done/i.test(x)));
-    assert.equal(calls, 50);
+    assert.ok(
+      notices.some((x) => /review done/i.test(x)),
+      JSON.stringify(notices),
+    );
+    assert.ok(calls > initialCalls);
     const after = await b.tools
       .get("memory_review")
       .execute("", { action: "status" }, undefined, undefined, ctx);
@@ -187,10 +203,10 @@ test("bounded manual continuation survives reload and /memory-review full contin
       after.details.report.events.slice(0, 2).map((event: any) => event.review),
       [
         {
-          pages: 1,
-          resumedAtOffset: 1200,
+          pages: decisions - 24,
+          resumedAtOffset: resumeOffset,
           evidenceGaps: 0,
-          limitedPages: 1,
+          limitedPages: decisions - 24,
           discoveryTruncatedPages: 0,
           searchIncompletePages: 0,
           candidatesTruncatedPages: 0,
