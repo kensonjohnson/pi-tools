@@ -595,6 +595,17 @@ export class NdjsonMemoryStore {
     return this.mutate(id, expected, () => null);
   }
 
+  /** Remove only when both the target and all proposal-time category snapshots match. */
+  async forgetWithSnapshot(
+    id: string,
+    targetPrecondition: MemoryWritePrecondition,
+    snapshot: MemoryAddPrecondition,
+  ): Promise<StoredMemoryLine | null> {
+    if (!targetPrecondition || !snapshot)
+      throw new Error("Memory removal conflict: preconditions are missing");
+    return this.mutate(id, targetPrecondition, () => null, snapshot);
+  }
+
   /** Automatic reviewers must retain this exact raw-line snapshot with each proposal. */
   async captureWritePrecondition(
     id: string,
@@ -820,9 +831,26 @@ export class NdjsonMemoryStore {
     id: string,
     expected: MemoryWritePrecondition | undefined,
     change: (memory: StoredMemoryLine) => StoredMemoryLine | null,
+    expectedSnapshot?: MemoryAddPrecondition,
   ): Promise<StoredMemoryLine | null> {
     return this.withCategoryLock("knowledge", async () => {
       const snapshots = await this.snapshots();
+      if (
+        expectedSnapshot !== undefined &&
+        (!expectedSnapshot.snapshots ||
+          !MEMORY_CATEGORIES.every((category) => {
+            const prior = expectedSnapshot.snapshots[category];
+            const current = snapshots.get(category)!;
+            return (
+              prior &&
+              prior.contents === current.contents &&
+              prior.mode === current.mode
+            );
+          }))
+      )
+        throw new Error(
+          "Memory removal conflict: proposal snapshots changed or are missing",
+        );
       for (const category of MEMORY_CATEGORIES) {
         const snapshot = snapshots.get(category)!;
         const memory = snapshot.memories.find((item) => item.id === id);
@@ -2167,6 +2195,21 @@ export class MemoryManager {
     if (removed) {
       await this.reconcile();
     }
+    return removed;
+  }
+
+  async forgetWithSnapshot(
+    id: string,
+    targetPrecondition: MemoryWritePrecondition,
+    snapshot: MemoryAddPrecondition,
+  ): Promise<StoredMemoryLine | null> {
+    await this.initialize();
+    const removed = await this.store.forgetWithSnapshot(
+      id,
+      targetPrecondition,
+      snapshot,
+    );
+    if (removed) await this.reconcile();
     return removed;
   }
 
