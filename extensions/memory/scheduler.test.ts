@@ -49,6 +49,109 @@ async function fixture(
   }
 }
 
+test("unresolved generations remain pending without retries, and manual review remains available", () =>
+  fixture(async (root, runtime, sessions) => {
+    const clock = new Clock();
+    let runs = 0;
+    const options = {
+      project: root,
+      runtimeDir: runtime,
+      sessionDir: sessions,
+      debounceMs: 0,
+      cooldownMs: 100,
+      retryMs: 1,
+      clock,
+      work: async () => {
+        runs++;
+        return { status: "unresolved" as const };
+      },
+    };
+    let s = new MemoryScheduler(options);
+    await s.activity();
+    clock.advance(0);
+    await s.waitForIdle();
+    assert.equal(s.status().status, "unresolved");
+    assert.equal(s.status().paused, false);
+    assert.equal(s.status().pending, 1);
+    assert.equal(
+      (await s.runManual(async () => ({ status: "unresolved" }))).status,
+      "unresolved",
+    );
+    assert.equal(
+      (await s.runManual(async () => ({ status: "done" }))).status,
+      "done",
+    );
+    clock.advance(1000);
+    await s.waitForIdle();
+    assert.equal(runs, 1);
+    await s.shutdown();
+    s = new MemoryScheduler(options);
+    s.start();
+    await s.waitForSignals();
+    clock.advance(1000);
+    await s.waitForIdle();
+    assert.equal(runs, 1);
+    await s.activity();
+    clock.advance(0);
+    await s.waitForIdle();
+    assert.equal(runs, 2);
+    await s.shutdown();
+  }));
+
+test("legacy unresolved migration retries each pending directory and newer activity once", () =>
+  fixture(async (root, runtime, sessions) => {
+    const clock = new Clock();
+    const other = join(root, "z-other");
+    const runs: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const options = {
+      project: root,
+      runtimeDir: runtime,
+      sessionDir: sessions,
+      clock,
+      debounceMs: 0,
+      cooldownMs: 0,
+      retryMs: 1,
+      automatic: false,
+      work: async (path: string) => {
+        runs.push(path);
+        if (runs.length === 1) await gate;
+        return { status: "unresolved" as const };
+      },
+    };
+    let s = new MemoryScheduler(options);
+    await s.activity();
+    await s.shutdown();
+    const db = new Database(join(runtime, "scheduler.sqlite"));
+    db.prepare("UPDATE directories SET pending=2 WHERE path=?").run(sessions);
+    db.prepare("INSERT INTO directories VALUES (?,1,0)").run(other);
+    db.prepare("UPDATE meta SET paused=1,status='unresolved'").run();
+    db.close();
+    s = new MemoryScheduler({ ...options, automatic: true });
+    assert.equal(s.status().paused, false);
+    assert.equal(s.status().pending, 2);
+    s.start();
+    await s.waitForSignals();
+    clock.advance(0);
+    assert.deepEqual(runs, [sessions]);
+    await s.activity();
+    release();
+    await s.waitForIdle();
+    clock.advance(1);
+    await s.waitForIdle();
+    clock.advance(1);
+    await s.waitForIdle();
+    assert.deepEqual(runs, [sessions, other, sessions]);
+    assert.equal(s.status().pending, 2);
+    clock.advance(1000000);
+    await s.waitForIdle();
+    assert.equal(runs.length, 3);
+    await s.shutdown();
+  }));
+
 test("activity coalesces, respects cooldown, and stays project isolated", () =>
   fixture(async (root, runtime, sessions) => {
     const clock = new Clock();

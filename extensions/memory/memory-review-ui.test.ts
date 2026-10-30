@@ -4,6 +4,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import extension from "./index.ts";
+import { MemoryScheduler } from "./scheduler.ts";
 
 test("review controls work headlessly; UI feedback clears and reports persist", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "memory-review-ui-")),
@@ -231,6 +232,77 @@ test("review status and full review report untrusted, uninitialized and unconfig
       ctx,
     );
     assert.equal(report.details.report.events[0].status, "error");
+    const other = new MemoryScheduler({
+      project: cwd,
+      runtimeDir: join(cwd, ".pi", "memory", ".runtime", "review-scheduler"),
+      sessionDir: cwd,
+      automatic: false,
+      work: async () => ({ status: "done" }),
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const running = other.runManual(async () => {
+      await held;
+      return { status: "done" };
+    });
+    try {
+      const busy = await tool.execute(
+        "",
+        { action: "full" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.match(busy.content[0].text, /already active.*wait/i);
+      assert.equal(busy.details.active, true);
+      assert.notEqual(busy.details.failed, true);
+      const during = await tool.execute(
+        "",
+        { action: "status" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(during.details.report.events[0].status, "error");
+    } finally {
+      release();
+      await running;
+    }
+    try {
+      await other.waitForIdle();
+      await other.runManual(async () => ({
+        status: "unresolved",
+        detail:
+          "Review found an unresolved evidence or authority conflict; inspect before resuming.",
+      }));
+      await other.waitForIdle();
+      const unresolved = await tool.execute(
+        "",
+        { action: "status" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(unresolved.details.report.status.paused, false);
+      assert.match(
+        unresolved.content[0].text,
+        /Run \/memory-review full again to retry/,
+      );
+      assert.doesNotMatch(unresolved.content[0].text, /before resuming/);
+      const retry = await tool.execute(
+        "",
+        { action: "full" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.match(retry.content[0].text, /explicitly configured/);
+      assert.doesNotMatch(retry.content[0].text, /paused|resume/);
+    } finally {
+      await other.shutdown();
+    }
     await handlers.get("session_shutdown")!({}, ctx);
   } finally {
     if (old === undefined) delete process.env.PI_CODING_AGENT_DIR;

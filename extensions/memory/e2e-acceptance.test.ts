@@ -271,7 +271,10 @@ test(
           }),
       });
       await scheduler.activity();
-      await waitFor(() => scheduler!.status().paused, "protected conflict");
+      await waitFor(
+        () => scheduler!.status().status === "unresolved",
+        "protected conflict",
+      );
       assert.equal(scheduler.status().status, "unresolved");
       const after = await store.list();
       assert.deepEqual(after.counts, {
@@ -316,7 +319,10 @@ test(
       assert.equal(await inject(first), undefined); // no replacement in an active session
       phase = "opposite";
       scheduler.resume();
-      await waitFor(() => scheduler!.status().paused, "opposite claim");
+      await waitFor(
+        () => scheduler!.status().status === "unresolved",
+        "opposite claim",
+      );
       assert.ok(
         !(await store.list()).memories.some((x) => x.content === conflictText),
       );

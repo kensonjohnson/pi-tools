@@ -293,7 +293,7 @@ export class MemoryScheduler {
           "ALTER TABLE review_events ADD COLUMN review_progress TEXT",
         );
       this.db.exec(
-        "CREATE TABLE IF NOT EXISTS directory_turn (path TEXT PRIMARY KEY, sequence INTEGER NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS directory_turn (path TEXT PRIMARY KEY, sequence INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS unresolved_generations (path TEXT PRIMARY KEY, generation INTEGER NOT NULL)",
       );
       this.db
         .prepare("INSERT OR IGNORE INTO meta VALUES (1, ?, 0, 0, 0, 'idle')")
@@ -303,6 +303,20 @@ export class MemoryScheduler {
         .get() as { project: string };
       if (meta.project !== this.options.project)
         throw new Error("scheduler state belongs to another project");
+      // Older schedulers did not record the unresolved generation. Allow pending
+      // work to run once rather than guessing which directories were assessed.
+      this.db.transaction(() => {
+        const legacy = this.db
+          .prepare("SELECT paused,inflight,status FROM meta WHERE id=1")
+          .get() as { paused: number; inflight: number; status: string };
+        if (
+          legacy.paused &&
+          !legacy.inflight &&
+          legacy.status === "unresolved"
+        ) {
+          this.db.prepare("UPDATE meta SET paused=0 WHERE id=1").run();
+        }
+      })();
     } catch (error) {
       this.db.close();
       throw error;
@@ -598,11 +612,14 @@ export class MemoryScheduler {
     if (!claim) throw new Error("project review is active");
     try {
       this.cancelled = false;
-      this.db
-        .prepare(
-          "UPDATE meta SET inflight=0, paused=0, status='pending' WHERE id=1",
-        )
-        .run();
+      this.db.transaction(() => {
+        this.db.prepare("DELETE FROM unresolved_generations").run();
+        this.db
+          .prepare(
+            "UPDATE meta SET inflight=0, paused=0, status='pending' WHERE id=1",
+          )
+          .run();
+      })();
     } finally {
       this.release(claim);
     }
@@ -776,10 +793,7 @@ export class MemoryScheduler {
               detail:
                 "Cancellation was requested from another process; work may have completed. Inspect before retrying.",
             };
-          const paused =
-            externallyPaused ||
-            outcome.status === "uncertain" ||
-            outcome.status === "unresolved";
+          const paused = externallyPaused || outcome.status === "uncertain";
           this.db
             .prepare("UPDATE meta SET inflight=0,paused=?,status=? WHERE id=1")
             .run(paused ? 1 : 0, outcome.status);
@@ -885,13 +899,19 @@ export class MemoryScheduler {
     if (this.closed || this.running || this.options.automatic === false) return;
     if (this.timer !== undefined) this.clock.clearTimeout(this.timer);
     let state: SchedulerStatus;
+    let eligible: unknown;
     try {
       state = this.status();
+      eligible = this.db
+        .prepare(
+          "SELECT 1 FROM directories d LEFT JOIN unresolved_generations u ON u.path=d.path WHERE d.pending>d.completed AND d.pending>COALESCE(u.generation,0) LIMIT 1",
+        )
+        .get();
     } catch {
       this.retrySignals();
       return;
     }
-    if (!state.pending || state.paused) {
+    if (!state.pending || state.paused || !eligible) {
       this.timer = undefined;
       return;
     }
@@ -965,7 +985,7 @@ export class MemoryScheduler {
       if (this.clock.now() < meta.cooldown) return;
       const item = this.db
         .prepare(
-          "SELECT d.path,d.pending FROM directories d LEFT JOIN directory_turn t ON t.path=d.path WHERE d.pending>d.completed ORDER BY COALESCE(t.sequence,0),d.path LIMIT 1",
+          "SELECT d.path,d.pending FROM directories d LEFT JOIN directory_turn t ON t.path=d.path LEFT JOIN unresolved_generations u ON u.path=d.path WHERE d.pending>d.completed AND d.pending>COALESCE(u.generation,0) ORDER BY COALESCE(t.sequence,0),d.path LIMIT 1",
         )
         .get() as { path: string; pending: number } | undefined;
       if (!item) return;
@@ -1025,12 +1045,17 @@ export class MemoryScheduler {
             detail:
               "Cancellation was requested from another process; work may have completed. Inspect before retrying.",
           };
+        if (outcome.status === "unresolved")
+          this.db
+            .prepare(
+              "INSERT INTO unresolved_generations(path,generation) VALUES (?,?) ON CONFLICT(path) DO UPDATE SET generation=MAX(generation,excluded.generation)",
+            )
+            .run(item.path, item.pending);
         const pause =
           externallyPaused ||
           this.detached ||
           this.cancelled ||
-          outcome.status === "uncertain" ||
-          outcome.status === "unresolved";
+          outcome.status === "uncertain";
         this.db
           .prepare(
             "UPDATE meta SET inflight=0,paused=?,status=?,cooldown=? WHERE id=1",

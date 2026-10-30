@@ -335,6 +335,19 @@ function safeChangeText(detail: string): string {
     .trim();
   return clean.length > 150 ? `${clean.slice(0, 149)}…` : clean;
 }
+function displayUnresolvedDetail(detail: string): string {
+  if (
+    detail ===
+    "Review found an unresolved evidence or authority conflict; inspect before resuming."
+  )
+    return "Review found an unresolved evidence or authority conflict; inspect the report before retrying.";
+  return SAFE_REVIEW_OUTCOME_DETAILS.has(detail) ||
+    detail ===
+      "Review found an unresolved evidence or authority conflict; inspect the report before retrying."
+    ? detail
+    : "Unresolved review. Details are unavailable or hidden; inspect the report before retrying.";
+}
+
 export function formatReviewStatus(
   report: ReviewStatusReport,
   omittedEvents = 0,
@@ -384,6 +397,10 @@ export function formatReviewStatus(
     );
   else if (s.inflight)
     lines.push("Next: Review is running. Check status again after it settles.");
+  else if (s.status === "unresolved")
+    lines.push(
+      "Next: Inspect the unresolved outcome. Run /memory-review full again to retry; unresolved work may remain.",
+    );
   lines.push("", "Recent runs (each run is separate):");
   if (!report.events.length) lines.push("  None.");
   for (const event of report.events) {
@@ -403,12 +420,10 @@ export function formatReviewStatus(
     lines.push(`- ${timestamp(event.at)} | ${mode} | ${status}`);
     if (event.status === "error" || event.status === "uncertain")
       lines.push(`  ${safeReviewDetail(event.detail)}`);
+    else if (event.status === "unresolved")
+      lines.push(`  ${displayUnresolvedDetail(event.detail)}`);
     else if (SAFE_REVIEW_OUTCOME_DETAILS.has(event.detail))
       lines.push(`  ${event.detail}`);
-    else if (event.status === "unresolved")
-      lines.push(
-        "  Unresolved review. Details are unavailable or hidden; inspect before resuming.",
-      );
     const repair = /^Reassigned (\d{1,9}) duplicate memory ID\(s\)\./.exec(
       event.detail,
     );
@@ -742,7 +757,12 @@ export default function (pi: ExtensionAPI) {
         const safeResult =
           result.status === "error" || result.status === "uncertain"
             ? { ...result, detail: safeReviewDetail(result.detail) }
-            : result;
+            : result.status === "unresolved"
+              ? {
+                  ...result,
+                  detail: displayUnresolvedDetail(result.detail ?? ""),
+                }
+              : result;
         const repair = safeResult.changes?.find(
           (change) => change.id === "duplicate-id-repair",
         );
@@ -750,7 +770,15 @@ export default function (pi: ExtensionAPI) {
         const summary = review
           ? ` This run evaluated ${review.pages} page(s)${review.resumedAtOffset ? ` starting at offset ${review.resumedAtOffset}` : ""}; ${safeResult.changes?.length ?? 0} change(s) recorded in this run. ${review.evidenceGaps === undefined ? "Evidence coverage is unknown." : `${review.evidenceGaps} page(s) reported insufficient evidence; ${review.limitedPages ?? 0} had limited coverage. Discovery was truncated on ${review.discoveryTruncatedPages ?? 0} page(s), search incomplete on ${review.searchIncompletePages ?? 0}, and cross-page candidates truncated on ${review.candidatesTruncatedPages ?? 0}. ${review.pages - review.evidenceGaps - (review.limitedPages ?? 0)} page evaluation(s) had no coverage metadata. Coverage is not verification.`}${review.resumedAtOffset ? " Earlier runs are listed separately in review status." : ""}`
           : "";
-        const text = `Full memory review ${safeResult.status}: ${safeResult.detail ?? ""}${summary}${repair ? ` ${repair.detail}` : ""}${safeResult.nextOffset === undefined ? "" : ` Progress saved at offset ${safeResult.nextOffset}; run /memory-review full to continue.`}`;
+        const detail =
+          safeResult.status === "unresolved"
+            ? displayUnresolvedDetail(safeResult.detail ?? "")
+            : (safeResult.detail ?? "");
+        const retry =
+          safeResult.status === "unresolved"
+            ? " Run /memory-review full again to retry; the conflict may remain."
+            : "";
+        const text = `Full memory review ${safeResult.status}: ${detail}${retry}${summary}${repair ? ` ${repair.detail}` : ""}${safeResult.nextOffset === undefined ? "" : ` Progress saved at offset ${safeResult.nextOffset}; run /memory-review full to continue.`}`;
         return textResult(text, { action, result: safeResult });
       }
       const settings = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);
@@ -776,7 +804,9 @@ export default function (pi: ExtensionAPI) {
           detail:
             event.status === "error" || event.status === "uncertain"
               ? safeReviewDetail(event.detail)
-              : event.detail.slice(0, 400),
+              : event.status === "unresolved"
+                ? displayUnresolvedDetail(event.detail)
+                : event.detail.slice(0, 400),
           changes: event.changes.slice(0, 5).map((change) => ({
             ...change,
             detail: change.detail.slice(0, 150),
@@ -795,6 +825,14 @@ export default function (pi: ExtensionAPI) {
         { action, report },
       );
     } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === "project review is active"
+      )
+        return textResult(
+          "Memory review is already active. Wait for it to finish, then try again.",
+          { action, active: true },
+        );
       const detail = safeReviewDetail(
         error instanceof Error ? error.message : undefined,
       );

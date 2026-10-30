@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { MemoryScheduler } from "./scheduler.ts";
 import Database from "better-sqlite3";
 
-test("reports persist bounded changes, unresolved outcomes and explicit resume", async () => {
+test("reports persist bounded changes and unresolved outcomes without blocking manual retry", async () => {
   const root = await mkdtemp(join(tmpdir(), "review-report-")),
     runtimeDir = join(root, "runtime"),
     sessionDir = join(root, "sessions");
@@ -48,19 +48,18 @@ test("reports persist bounded changes, unresolved outcomes and explicit resume",
     }));
     await scheduler.waitForIdle();
     assert.equal(unresolved.status, "unresolved");
-    assert.equal(scheduler.status().paused, true);
+    assert.equal(scheduler.status().paused, false);
     assert.equal(scheduler.report().events.length, 20);
     assert.match(scheduler.report().events[0].detail, /conflicts/);
     await scheduler.shutdown();
     scheduler = new MemoryScheduler(opts);
-    assert.equal(scheduler.status().paused, true);
-    assert.equal(scheduler.report().events[0].status, "unresolved");
-    await assert.rejects(
-      scheduler.runManual(async () => ({ status: "done" })),
-      /paused/,
-    );
-    scheduler.resume({ schedule: false });
     assert.equal(scheduler.status().paused, false);
+    assert.equal(scheduler.report().events[0].status, "unresolved");
+    assert.equal(
+      (await scheduler.runManual(async () => ({ status: "done" }))).status,
+      "done",
+    );
+    await scheduler.waitForIdle();
     const state = new Database(join(runtimeDir, "scheduler.sqlite"));
     state.exec("UPDATE meta SET inflight=1,status='manual-running' WHERE id=1");
     state.close();

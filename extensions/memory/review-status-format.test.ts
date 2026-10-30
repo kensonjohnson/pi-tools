@@ -48,7 +48,7 @@ test("formats empty and pending states without triggering work", () => {
   assert.doesNotMatch(paused, /secret/);
 });
 
-test("explains paused unresolved insufficient evidence and its page summary", () => {
+test("explains unresolved insufficient evidence and its page summary without requiring resume", () => {
   const event: SchedulerReport["events"][number] = {
     at: Date.UTC(2025, 0, 1),
     mode: "manual",
@@ -69,12 +69,12 @@ test("explains paused unresolved insufficient evidence and its page summary", ()
     },
   };
   const text = formatReviewStatus({
-    status: { ...status(), paused: true, status: "unresolved" },
+    status: { ...status(), status: "unresolved" },
     configuredModel: "p/model",
     historyEnabled: true,
     events: [event],
   });
-  assert.match(text, /State: paused/);
+  assert.match(text, /State: idle/);
   assert.match(text, /Insufficient evidence for this memory page/);
   assert.match(text, /Pages: 3; changes: 0/);
   assert.match(text, /Started at offset: 4/);
@@ -84,10 +84,45 @@ test("explains paused unresolved insufficient evidence and its page summary", ()
     /Discovery truncated: 1; search incomplete: 0; candidates truncated: 0/,
   );
   assert.match(text, /Coverage is not verification/);
-  assert.match(
-    text,
-    /inspect the latest outcome before using \/memory-review resume/i,
-  );
+  assert.match(text, /Run \/memory-review full again to retry/);
+  assert.doesNotMatch(text, /\/memory-review resume/);
+});
+
+test("preserves inspection guidance for paused uncertain and cancelled reviews", () => {
+  for (const state of ["uncertain", "cancelled"]) {
+    const text = formatReviewStatus({
+      status: { ...status(), paused: true, status: state },
+      configuredModel: null,
+      historyEnabled: false,
+      events: [],
+    });
+    assert.match(
+      text,
+      /Inspect the latest outcome before using \/memory-review resume/,
+    );
+  }
+});
+
+test("legacy unresolved detail does not require resume", () => {
+  const text = formatReviewStatus({
+    status: { ...status(), status: "unresolved" },
+    configuredModel: null,
+    historyEnabled: false,
+    events: [
+      {
+        at: 0,
+        mode: "manual",
+        status: "unresolved",
+        detail:
+          "Review found an unresolved evidence or authority conflict; inspect before resuming.",
+        changes: [],
+        changesTotal: 0,
+        changesOmitted: 0,
+      },
+    ],
+  });
+  assert.match(text, /evidence or authority conflict/);
+  assert.doesNotMatch(text, /resum/);
 });
 
 test("explains incremental evidence gaps, running state, and hides model reasons", () => {
