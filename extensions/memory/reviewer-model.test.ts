@@ -79,6 +79,29 @@ test("review model requires explicit available authenticated text chat model and
   );
 });
 
+test("review model does not impose its own input or output caps", async () => {
+  let options: any;
+  const long = "x".repeat(600_000);
+  const registry: any = {
+    find: () => ({ input: ["text"] }),
+    getApiKeyAndHeaders: async () => ({ ok: true }),
+    complete: async (_model: unknown, context: any, requestOptions: any) => {
+      options = requestOptions;
+      assert.ok(context.messages[0].content.includes(long));
+      return {
+        stopReason: "stop",
+        content: [{ type: "text", text: JSON.stringify({ content: long }) }],
+      };
+    },
+  };
+  const result = await new PiReviewerModel(registry, "p/m").generate({
+    instruction: "test",
+    data: { content: long },
+  });
+  assert.deepEqual(result, { content: long });
+  assert.equal(Object.hasOwn(options, "maxTokens"), false);
+});
+
 test("review model accepts exactly one bare or fenced JSON value", async () => {
   let text = "";
   const registry: any = {
@@ -151,7 +174,7 @@ test("review model accepts exactly one bare or fenced JSON value", async () => {
     });
   }
   text = "x".repeat(64 * 1024 + 1);
-  await assert.rejects(generate(), /response exceeds byte limit/);
+  await assert.rejects(generate(), /malformed JSON/);
   registry.complete = async () => ({
     stopReason: "stop",
     content: [
@@ -159,7 +182,7 @@ test("review model accepts exactly one bare or fenced JSON value", async () => {
       { type: "text", text: "x".repeat(40_000) },
     ],
   });
-  await assert.rejects(generate(), /response exceeds byte limit/);
+  await assert.rejects(generate(), /malformed JSON/);
 });
 
 test("review model rejects incomplete and failed responses without provider details", async () => {
