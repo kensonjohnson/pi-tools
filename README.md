@@ -102,6 +102,8 @@ Background review can send project session text, existing memories, and selected
 
 Use `/memory-review` or `/memory-review status` to inspect a bounded report, `/memory-review full` to start or continue a manual full review, and `/memory-review cancel` or `/memory-review resume` to control pending work. Full-review progress is saved between passes; use `/memory-review full --restart` to discard the saved cursor and start again, including when the memory snapshot has changed. The `memory_review` tool exposes the same controls, with `restart: true` for a full-review restart. Reports include recent outcomes and bounded change details, with counts for omitted changes. Inspect uncertain outcomes before resuming; cancellation may not stop work already in progress. Manual review uses the same evidence and application path as background review and can change memory. It requires a trusted project and an explicitly configured reviewer model, even when session-history review is disabled.
 
+A finished full review means the model completed a bounded pass, not that every memory was verified. Reports disclose evidence gaps and truncated discovery; inspect them before relying on the result. Repository discovery and search are bounded, and likely cross-page duplicates are candidates rather than an exhaustive comparison.
+
 `memory_consolidate` has changed: it now starts a model-based full review that may apply changes, rather than returning a duplicate preview. Its legacy `since` option is rejected; omit it to run a full review. `memory_learn` remains a suggestion-only preview.
 
 ### `subagents`

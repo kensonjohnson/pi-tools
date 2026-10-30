@@ -49,6 +49,17 @@ export type SchedulerOutcome = {
   changes?: Array<{ id: string; detail: string }>;
   nextOffset?: number;
   fullSnapshot?: string;
+  review?: ReviewProgress;
+};
+/** Per-invocation counts, not a claim that memories were verified. */
+export type ReviewProgress = {
+  pages: number;
+  resumedAtOffset: number;
+  evidenceGaps?: number;
+  limitedPages?: number;
+  discoveryTruncatedPages?: number;
+  searchIncompletePages?: number;
+  candidatesTruncatedPages?: number;
 };
 export type SchedulerReportEvent = {
   at: number;
@@ -58,6 +69,7 @@ export type SchedulerReportEvent = {
   changes: Array<{ id: string; detail: string }>;
   changesTotal: number;
   changesOmitted: number;
+  review?: ReviewProgress;
 };
 declare const manualResumeBrand: unique symbol;
 export type ManualResumePermit = { readonly [manualResumeBrand]: true };
@@ -260,6 +272,10 @@ export class MemoryScheduler {
         this.db.exec(
           "ALTER TABLE review_events ADD COLUMN changes_total INTEGER NOT NULL DEFAULT 0",
         );
+      if (!columns.some((column) => column.name === "review_progress"))
+        this.db.exec(
+          "ALTER TABLE review_events ADD COLUMN review_progress TEXT",
+        );
       this.db.exec(
         "CREATE TABLE IF NOT EXISTS directory_turn (path TEXT PRIMARY KEY, sequence INTEGER NOT NULL)",
       );
@@ -345,7 +361,7 @@ export class MemoryScheduler {
     }
     const rows = this.db
       .prepare(
-        "SELECT at,mode,status,detail,changes,changes_total FROM review_events ORDER BY id DESC LIMIT 20",
+        "SELECT at,mode,status,detail,changes,changes_total,review_progress FROM review_events ORDER BY id DESC LIMIT 20",
       )
       .all() as Array<{
       at: number;
@@ -354,6 +370,7 @@ export class MemoryScheduler {
       detail: string;
       changes: string;
       changes_total: number;
+      review_progress: string | null;
     }>;
     return {
       status: this.status(),
@@ -362,7 +379,14 @@ export class MemoryScheduler {
           row.changes,
         ) as SchedulerReportEvent["changes"];
         const changesTotal = Math.max(row.changes_total, changes.length);
+        let review: ReviewProgress | undefined;
+        try {
+          if (row.review_progress) review = JSON.parse(row.review_progress);
+        } catch {
+          /* Ignore malformed optional progress from old state. */
+        }
         return {
+          ...(review ? { review } : {}),
           at: row.at,
           mode: row.mode,
           status: row.status,
@@ -386,9 +410,39 @@ export class MemoryScheduler {
     const changes = (outcome.changes ?? [])
       .slice(0, 12)
       .map((x) => ({ id: clean(x.id, 100), detail: clean(x.detail, 200) }));
+    const progress = outcome.review;
+    const count = (value: unknown) =>
+      typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+        ? value
+        : undefined;
+    const pages = count(progress?.pages),
+      resumedAtOffset = count(progress?.resumedAtOffset),
+      evidenceGaps = count(progress?.evidenceGaps),
+      limitedPages = count(progress?.limitedPages),
+      discoveryTruncatedPages = count(progress?.discoveryTruncatedPages),
+      searchIncompletePages = count(progress?.searchIncompletePages),
+      candidatesTruncatedPages = count(progress?.candidatesTruncatedPages);
+    const review =
+      pages === undefined || resumedAtOffset === undefined
+        ? null
+        : JSON.stringify({
+            pages,
+            resumedAtOffset,
+            ...(evidenceGaps === undefined ? {} : { evidenceGaps }),
+            ...(limitedPages === undefined ? {} : { limitedPages }),
+            ...(discoveryTruncatedPages === undefined
+              ? {}
+              : { discoveryTruncatedPages }),
+            ...(searchIncompletePages === undefined
+              ? {}
+              : { searchIncompletePages }),
+            ...(candidatesTruncatedPages === undefined
+              ? {}
+              : { candidatesTruncatedPages }),
+          });
     this.db
       .prepare(
-        "INSERT INTO review_events(at,mode,status,detail,changes,changes_total) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO review_events(at,mode,status,detail,changes,changes_total,review_progress) VALUES (?,?,?,?,?,?,?)",
       )
       .run(
         this.clock.now(),
@@ -397,6 +451,7 @@ export class MemoryScheduler {
         clean(outcome.detail ?? "", 800),
         JSON.stringify(changes),
         (outcome.changes ?? []).length,
+        review,
       );
     this.db.exec(
       "DELETE FROM review_events WHERE id NOT IN (SELECT id FROM review_events ORDER BY id DESC LIMIT 20)",

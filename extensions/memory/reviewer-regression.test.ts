@@ -11,7 +11,7 @@ const batch = (ack: () => void): ReviewBatch => ({
   path: "/fake",
   sessionId: "s",
   leaf: "leaf",
-  items: [],
+  items: [{ id: "u", role: "user", text: "Review these project facts." }],
   more: false,
   acknowledge: ack,
 });
@@ -35,7 +35,12 @@ test("incremental review of 201 memories requires each snapshot-bound page befor
     generate: async ({ instruction, data }: any) =>
       instruction.startsWith("Select")
         ? { paths: [] }
-        : (assert.ok(data.memories.length <= 50), { action: "no_change" }),
+        : (assert.ok(data.memories.length <= 50),
+          {
+            action: "no_change",
+            evidenceSufficient: true,
+            reason: "Session reviewed.",
+          }),
   };
   const reviewer = new MemoryReviewer({
     project: "/project",

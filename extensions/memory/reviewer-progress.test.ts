@@ -25,15 +25,19 @@ async function fixture(
     await rm(cwd, { recursive: true, force: true });
   }
 }
-function noChange(store: MemoryManager, cwd: string) {
+function noChange(store: MemoryManager, cwd: string, paths: string[] = []) {
   return new MemoryReviewer({
     project: cwd,
     store,
     model: {
       generate: async ({ instruction }) =>
         instruction.startsWith("Select")
-          ? { paths: [] }
-          : { action: "no_change" },
+          ? { paths }
+          : {
+              action: "no_change",
+              evidenceSufficient: true,
+              reason: "Supplied evidence was reviewed.",
+            },
     },
   });
 }
@@ -100,7 +104,7 @@ test("acknowledgement failure after add retries without creating duplicates", ()
     const retry = await reviewer.review({ batch });
     assert.equal(retry.status, "unchanged");
     assert.equal(ack, 0);
-    const finalPass = noChange(store, cwd);
+    const finalPass = noChange(store, cwd, ["fact.txt"]);
     await assert.rejects(finalPass.review({ batch }), /checkpoint changed/);
     assert.equal((await finalPass.review({ batch })).acknowledged, true);
     assert.equal(ack, 2);

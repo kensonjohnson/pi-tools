@@ -69,7 +69,11 @@ test("incremental pages survive reviewer and process-style restarts, and stale s
               offsets.push(Number(data.memories[0]?.id.slice(3) ?? 1201));
               return { paths: [] };
             }
-            return { action: "no_change" };
+            return {
+              action: "no_change",
+              evidenceSufficient: true,
+              reason: "Session reviewed.",
+            };
           },
         },
       });
@@ -142,7 +146,11 @@ test("appends during paged review retain the original session boundary", async (
               observed.push(data.session.map((item: any) => item.id));
               return { paths: [] };
             }
-            return { action: "no_change" };
+            return {
+              action: "no_change",
+              evidenceSufficient: true,
+              reason: "Session reviewed.",
+            };
           },
         },
       });
@@ -252,7 +260,11 @@ test("branch replacement or truncation discards prior page progress", async () =
                 });
                 return { paths: [] };
               }
-              return { action: "no_change" };
+              return {
+                action: "no_change",
+                evidenceSufficient: true,
+                reason: "Session reviewed.",
+              };
             },
           },
         });
@@ -322,7 +334,7 @@ test("incremental cursor resumes across independent processes", async () => {
     const core = new URL("./core.ts", import.meta.url).href;
     const reviewer = new URL("./reviewer.ts", import.meta.url).href;
     const scheduler = new URL("./scheduler.ts", import.meta.url).href;
-    const script = `import { MemoryManager } from ${JSON.stringify(core)}; import { MemoryReviewer } from ${JSON.stringify(reviewer)}; import { reviewProjectSessions } from ${JSON.stringify(scheduler)}; const [root,dir,checkpoint]=process.argv.slice(1); const store=new MemoryManager(root,{semanticEnabled:false}); let n=0; const r=new MemoryReviewer({project:root,store,model:{generate:async()=>++n%2?{paths:[]}:{action:'no_change'}}}); const out=await reviewProjectSessions({project:root,sessionDir:dir,checkpointFile:checkpoint,reviewer:r,signal:new AbortController().signal}); console.log(out.status); await store.close();`;
+    const script = `import { MemoryManager } from ${JSON.stringify(core)}; import { MemoryReviewer } from ${JSON.stringify(reviewer)}; import { reviewProjectSessions } from ${JSON.stringify(scheduler)}; const [root,dir,checkpoint]=process.argv.slice(1); const store=new MemoryManager(root,{semanticEnabled:false}); let n=0; const r=new MemoryReviewer({project:root,store,model:{generate:async()=>++n%2?{paths:[]}:{action:'no_change',evidenceSufficient:true,reason:'Session reviewed.'}}}); const out=await reviewProjectSessions({project:root,sessionDir:dir,checkpointFile:checkpoint,reviewer:r,signal:new AbortController().signal}); console.log(out.status); await store.close();`;
     const run = () =>
       spawnSync(
         process.execPath,

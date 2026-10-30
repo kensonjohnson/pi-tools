@@ -77,6 +77,7 @@ test("bounded manual continuation survives reload and /memory-review full contin
         },
       }),
     );
+    await writeFile(join(cwd, "evidence.txt"), "Fixture evidence.\n");
     const saved = snapshot(1201);
     MemoryManager.prototype.captureAddPrecondition = async () => saved;
     let calls = 0;
@@ -101,7 +102,14 @@ test("bounded manual continuation survives reload and /memory-review full contin
           content: [
             {
               type: "text",
-              text: ++calls % 2 ? '{"paths":[]}' : '{"action":"no_change"}',
+              text:
+                ++calls % 2
+                  ? calls === 1
+                    ? '{"paths":[]}'
+                    : '{"paths":["evidence.txt"]}'
+                  : calls === 2
+                    ? '{"action":"no_change","reason":"Evidence missing","evidenceSufficient":false}'
+                    : '{"action":"no_change","reason":"Fixture review","evidenceSufficient":true}',
             },
           ],
         }),
@@ -141,6 +149,16 @@ test("bounded manual continuation survives reload and /memory-review full contin
       .execute("", { action: "full" }, undefined, undefined, ctx);
     assert.equal(first.details.result.status, "pending");
     assert.equal(first.details.result.nextOffset, 1200);
+    assert.deepEqual(first.details.result.review, {
+      pages: 24,
+      resumedAtOffset: 0,
+      evidenceGaps: 1,
+      limitedPages: 23,
+      discoveryTruncatedPages: 0,
+      searchIncompletePages: 0,
+      candidatesTruncatedPages: 0,
+    });
+    assert.match(first.content[0].text, /Coverage is not verification/);
     assert.equal(calls, 48);
     await a.handlers.get("session_shutdown")!({}, ctx);
     const b = harness();
@@ -161,6 +179,34 @@ test("bounded manual continuation survives reload and /memory-review full contin
       .get("memory_review")
       .execute("", { action: "status" }, undefined, undefined, ctx);
     assert.equal(after.details.report.status.manualContinuation, undefined);
+    assert.match(
+      after.details.report.eventScope,
+      /one run, not the cumulative review/,
+    );
+    assert.deepEqual(
+      after.details.report.events.slice(0, 2).map((event: any) => event.review),
+      [
+        {
+          pages: 1,
+          resumedAtOffset: 1200,
+          evidenceGaps: 0,
+          limitedPages: 1,
+          discoveryTruncatedPages: 0,
+          searchIncompletePages: 0,
+          candidatesTruncatedPages: 0,
+        },
+        {
+          pages: 24,
+          resumedAtOffset: 0,
+          evidenceGaps: 1,
+          limitedPages: 23,
+          discoveryTruncatedPages: 0,
+          searchIncompletePages: 0,
+          candidatesTruncatedPages: 0,
+        },
+      ],
+    );
+    assert.match(after.details.report.events[0].detail, /do not verify/i);
     await b.handlers.get("session_shutdown")!({}, ctx);
   } finally {
     MemoryManager.prototype.captureAddPrecondition = original;

@@ -38,6 +38,8 @@ test("manual full review follows pages and restarts after a mutation", async () 
   });
   assert.equal(result.status, "done");
   assert.equal(result.changes?.length, 1);
+  assert.deepEqual(result.review, { pages: 3, resumedAtOffset: 0 });
+  assert.match(result.detail!, /do not verify/i);
   assert.deepEqual(offsets, [undefined, undefined, 50]);
 });
 test("full review exposes bounded continuation without silently restarting", async () => {
@@ -65,7 +67,72 @@ test("full review exposes bounded continuation without silently restarting", asy
     fullSnapshot: first.fullSnapshot,
   });
   assert.equal(next.status, "done");
+  assert.deepEqual(first.review, { pages: 1, resumedAtOffset: 0 });
+  assert.deepEqual(next.review, { pages: 1, resumedAtOffset: 50 });
   assert.deepEqual(offsets, [undefined, 50]);
+});
+test("manual review aggregates bounded evidence gap counts without retaining evidence", async () => {
+  let calls = 0;
+  const reviewer: any = {
+    review: async () =>
+      ++calls === 1
+        ? {
+            status: "unchanged",
+            nextOffset: 50,
+            fullSnapshot: "hash",
+            audit: {
+              coverage: "insufficient",
+              discoveryTruncated: true,
+              searchIncomplete: true,
+              candidatesTruncated: true,
+            },
+          }
+        : {
+            status: "unchanged",
+            detail: "Limited evidence.",
+            audit: {
+              coverage: "limited",
+              discoveryTruncated: false,
+              searchIncomplete: false,
+              candidatesTruncated: false,
+            },
+          },
+  };
+  const result = await reviewAllMemories({
+    reviewer,
+    signal: new AbortController().signal,
+  });
+  assert.equal(result.status, "done");
+  assert.equal(calls, 2);
+  assert.deepEqual(result.review, {
+    pages: 2,
+    resumedAtOffset: 0,
+    evidenceGaps: 1,
+    limitedPages: 1,
+    discoveryTruncatedPages: 1,
+    searchIncompletePages: 1,
+    candidatesTruncatedPages: 1,
+  });
+});
+test("unresolved model reason is not included in the manual outcome", async () => {
+  const reviewer: any = {
+    review: async () => ({
+      status: "unresolved",
+      detail: "secret model text",
+      audit: {
+        coverage: "insufficient",
+        discoveryTruncated: false,
+        searchIncomplete: false,
+        candidatesTruncated: false,
+      },
+    }),
+  };
+  const result = await reviewAllMemories({
+    reviewer,
+    signal: new AbortController().signal,
+  });
+  assert.equal(result.status, "unresolved");
+  assert.doesNotMatch(JSON.stringify(result), /secret model text/);
 });
 test("failure after a partial apply is uncertain, not automatically retried", async () => {
   let i = 0;

@@ -515,13 +515,19 @@ export default function (pi: ExtensionAPI) {
         const repair = safeResult.changes?.find(
           (change) => change.id === "duplicate-id-repair",
         );
-        const text = `Full memory review ${safeResult.status}: ${safeResult.detail ?? ""}${repair ? ` ${repair.detail}` : ""}${safeResult.nextOffset === undefined ? "" : ` Progress saved at offset ${safeResult.nextOffset}; run /memory-review full to continue.`}`;
+        const review = safeResult.review;
+        const summary = review
+          ? ` This run evaluated ${review.pages} page(s)${review.resumedAtOffset ? ` starting at offset ${review.resumedAtOffset}` : ""}; ${safeResult.changes?.length ?? 0} change(s) recorded in this run. ${review.evidenceGaps === undefined ? "Evidence coverage is unknown." : `${review.evidenceGaps} page(s) reported insufficient evidence; ${review.limitedPages ?? 0} had limited coverage. Discovery was truncated on ${review.discoveryTruncatedPages ?? 0} page(s), search incomplete on ${review.searchIncompletePages ?? 0}, and cross-page candidates truncated on ${review.candidatesTruncatedPages ?? 0}. ${review.pages - review.evidenceGaps - (review.limitedPages ?? 0)} page evaluation(s) had no coverage metadata. Coverage is not verification.`}${review.resumedAtOffset ? " Earlier runs are listed separately in review status." : ""}`
+          : "";
+        const text = `Full memory review ${safeResult.status}: ${safeResult.detail ?? ""}${summary}${repair ? ` ${repair.detail}` : ""}${safeResult.nextOffset === undefined ? "" : ` Progress saved at offset ${safeResult.nextOffset}; run /memory-review full to continue.`}`;
         return textResult(text, { action, result: safeResult });
       }
       const settings = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);
       const raw = control.report();
       const report = {
         status: raw.status,
+        eventScope:
+          "Each event covers one run, not the cumulative review; older runs may be omitted.",
         configuredModel:
           getSettingValue<string>(
             settings,

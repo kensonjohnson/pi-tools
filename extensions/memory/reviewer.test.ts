@@ -319,9 +319,9 @@ test("manual full review uses the same no-change path", () =>
         return { action: "no_change" };
       }),
     });
-    assert.deepEqual(await r.review(), {
-      status: "unchanged",
-      detail: "No supported changes proposed.",
-      acknowledged: false,
-    });
+    const result = await r.review();
+    assert.equal(result.status, "unchanged");
+    assert.equal(result.acknowledged, false);
+    assert.match(result.detail, /insufficient evidence/i);
+    assert.equal(result.audit?.coverage, "insufficient");
   }));

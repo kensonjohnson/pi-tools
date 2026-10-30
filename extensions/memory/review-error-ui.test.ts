@@ -82,9 +82,14 @@ test("manual review reports safe model failures in command, tool and status", as
       created: "2026-01-01",
       content: "private fact",
     });
+    const secondRow = JSON.stringify({
+      id: "private@example.com",
+      created: "2026-01-01",
+      content: "private fact two",
+    });
     await writeFile(
       join(cwd, ".pi", "memory", "knowledge.ndjson"),
-      `${row}\n${row}\n`,
+      `${row}\n${secondRow}\n`,
     );
     ctx.hasUI = false;
     const db = new Database(
@@ -114,7 +119,7 @@ test("manual review reports safe model failures in command, tool and status", as
         rows.map(({ id, ...rest }) => rest),
         [
           { created: "2026-01-01", content: "private fact" },
-          { created: "2026-01-01", content: "private fact" },
+          { created: "2026-01-01", content: "private fact two" },
         ],
       );
       return {
@@ -158,7 +163,7 @@ test("manual review reports safe model failures in command, tool and status", as
     // A different process can finish or recover a repair before this review.
     await writeFile(
       join(cwd, ".pi", "memory", "knowledge.ndjson"),
-      `${row}\n${row}\n`,
+      `${row}\n${secondRow}\n`,
     );
     const external = new NdjsonMemoryStore(
       cwd,

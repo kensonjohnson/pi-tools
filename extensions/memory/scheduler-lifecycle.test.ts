@@ -87,7 +87,9 @@ test("configured reviewer scans both the explicit session parent and configured 
               {
                 type: "text",
                 text:
-                  calls % 2 === 1 ? '{"paths":[]}' : '{"action":"no_change"}',
+                  calls % 2 === 1
+                    ? '{"paths":[]}'
+                    : '{"action":"no_change","evidenceSufficient":true,"reason":"Session reviewed."}',
               },
             ],
           };

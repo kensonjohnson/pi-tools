@@ -246,7 +246,11 @@ test(
               },
               reason: "User reported the opposite claim.",
             };
-          return { action: "no_change" };
+          return {
+            action: "no_change",
+            evidenceSufficient: true,
+            reason: "Session evidence reviewed.",
+          };
         },
       };
       const runtime = join(root, "scheduler");

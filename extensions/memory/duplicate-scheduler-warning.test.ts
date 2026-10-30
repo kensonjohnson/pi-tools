@@ -33,7 +33,12 @@ test("configured background review repairs duplicates and resumes activity", asy
       created: "2026-01-01",
       content: "fact",
     });
-    await writeFile(join(memory, "knowledge.ndjson"), `${row}\n${row}\n`);
+    const secondRow = JSON.stringify({
+      id: "duplicate",
+      created: "2026-01-01",
+      content: "second fact",
+    });
+    await writeFile(join(memory, "knowledge.ndjson"), `${row}\n${secondRow}\n`);
     await mkdir(join(cwd, "sessions"));
     await writeFile(
       join(cwd, "sessions", "s.jsonl"),
@@ -105,7 +110,9 @@ test("configured background review repairs duplicates and resumes activity", asy
               {
                 type: "text",
                 text:
-                  ++modelCalls % 2 ? '{"paths":[]}' : '{"action":"no_change"}',
+                  ++modelCalls % 2
+                    ? '{"paths":[]}'
+                    : '{"action":"no_change","evidenceSufficient":true,"reason":"Session reviewed."}',
               },
             ],
           };

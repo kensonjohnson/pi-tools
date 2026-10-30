@@ -201,7 +201,11 @@ test("cancelled pre-apply work survives shutdown and resumes from unacknowledged
         calls++;
         return instruction.startsWith("Select")
           ? { paths: [] }
-          : { action: "no_change" };
+          : {
+              action: "no_change",
+              evidenceSufficient: true,
+              reason: "Session evidence reviewed.",
+            };
       },
     };
     const resumed = make(model);
