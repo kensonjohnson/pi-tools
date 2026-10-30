@@ -13,6 +13,121 @@ type Registry = Pick<
   "find" | "getApiKeyAndHeaders" | "complete"
 >;
 
+// JSON.parse accepts duplicate keys. Detect decoded duplicates in every object,
+// including nested objects, before returning its result. Input is already valid JSON.
+function rejectDuplicateKeys(text: string): void {
+  const stack: Array<Set<string> | null> = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "{") stack.push(new Set());
+    else if (c === "[") stack.push(null);
+    else if (c === "}" || c === "]") stack.pop();
+    else if (c === '"') {
+      const start = i++;
+      while (i < text.length) {
+        if (text[i] === "\\") i += 2;
+        else if (text[i] === '"') break;
+        else i++;
+      }
+      let next = i + 1;
+      while (next < text.length && /[ \t\r\n]/.test(text[next])) next++;
+      if (text[next] === ":") {
+        const keys = stack[stack.length - 1];
+        if (!keys) throw new Error("invalid key");
+        const key = JSON.parse(text.slice(start, i + 1)) as string;
+        if (keys.has(key)) throw new Error("duplicate key");
+        keys.add(key);
+      }
+    }
+  }
+}
+
+function parseJson(text: string): unknown {
+  const value = JSON.parse(text);
+  rejectDuplicateKeys(text);
+  return value;
+}
+
+// Extract composite values from prose without trying every nested opening brace.
+// A malformed outer candidate is never rescued by a valid inner fragment.
+function extractCompositeValues(text: string): unknown[] {
+  const values: unknown[] = [];
+  const stack: string[] = [];
+  let start = -1;
+  let quoted = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (c === "\\") escaped = true;
+      else if (c === '"') quoted = false;
+      continue;
+    }
+    if (c === '"') {
+      quoted = true;
+    } else if (c === "{" || c === "[") {
+      if (!stack.length) start = i;
+      stack.push(c);
+    } else if (c === "}" || c === "]") {
+      if (!stack.length || stack.pop() !== (c === "}" ? "{" : "["))
+        throw new Error("invalid candidate");
+      if (!stack.length) values.push(parseJson(text.slice(start, i + 1)));
+    }
+  }
+  if (quoted || stack.length) throw new Error("incomplete candidate");
+  return values;
+}
+
+function extractSingleJson(content: string): unknown {
+  const trimmed = content.trim();
+  let bare: unknown;
+  let validBare = false;
+  try {
+    bare = JSON.parse(trimmed);
+    validBare = true;
+  } catch {
+    // Wrapped values are handled below.
+  }
+  if (validBare) {
+    rejectDuplicateKeys(trimmed);
+    return bare;
+  }
+  const values: unknown[] = [];
+  // Walk each line once. Fences must occupy complete lines, and any stray
+  // delimiter fails closed. Prose scalars are not treated as proposals: the
+  // reviewer schemas require an object, and ordinary words can be JSON tokens.
+  let cursor = 0;
+  let outsideStart = 0;
+  let fenceStart = -1;
+  while (cursor < content.length) {
+    const end = content.indexOf("\n", cursor);
+    const lineEnd = end < 0 ? content.length : end;
+    const line = content.slice(cursor, lineEnd).replace(/\r$/, "");
+    const next = end < 0 ? content.length : end + 1;
+    if (line.includes("```")) {
+      if (fenceStart < 0) {
+        if (end < 0 || !/^[ \t]*```[^`\r]*$/.test(line))
+          throw new Error("invalid fence");
+        values.push(
+          ...extractCompositeValues(content.slice(outsideStart, cursor)),
+        );
+        fenceStart = next;
+      } else {
+        if (!/^[ \t]*```[ \t]*$/.test(line)) throw new Error("invalid fence");
+        values.push(parseJson(content.slice(fenceStart, cursor)));
+        fenceStart = -1;
+        outsideStart = next;
+      }
+    }
+    cursor = next;
+  }
+  if (fenceStart >= 0) throw new Error("invalid fence");
+  values.push(...extractCompositeValues(content.slice(outsideStart)));
+  if (values.length !== 1) throw new Error("ambiguous candidates");
+  return values[0];
+}
+
 /** Explicitly configured chat model only. No parent-model or provider fallback. */
 export class PiReviewerModel implements ReviewerModel {
   constructor(privateRegistry: Registry, configured: string) {
@@ -75,22 +190,24 @@ export class PiReviewerModel implements ReviewerModel {
         : "other";
       throw new Error(`review model did not complete: ${reason}`);
     }
-    const content = response.content
-      .filter((block) => block.type === "text")
-      .map((block) => block.text)
-      .join("");
-    if (Buffer.byteLength(content) > 64 * 1024)
-      throw new Error("review model response exceeds byte limit");
-    // Accept only a complete bare JSON value or one complete Markdown fence.
-    // Never extract a JSON fragment from prose or from multiple code blocks.
-    const trimmed = content.trim();
-    const fence = /^```(?:json)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/i.exec(trimmed);
+    const chunks: string[] = [];
+    let bytes = 0;
+    for (const block of response.content) {
+      if (block.type !== "text") continue;
+      bytes += Buffer.byteLength(block.text);
+      if (bytes > 64 * 1024)
+        throw new Error("review model response exceeds byte limit");
+      chunks.push(block.text);
+    }
+    const content = chunks.join("");
     try {
-      return JSON.parse(fence ? fence[1] : trimmed);
+      return extractSingleJson(content);
     } catch {
+      // JSON.parse errors may include response text. Never propagate them.
+      const trimmed = content.trim();
       const shape = !trimmed
         ? "empty text"
-        : fence
+        : /^```(?:json)?[ \t]*\r?\n[\s\S]*?\r?\n```$/i.test(trimmed)
           ? "invalid fenced JSON"
           : "invalid JSON or unsupported wrapper";
       throw new Error(

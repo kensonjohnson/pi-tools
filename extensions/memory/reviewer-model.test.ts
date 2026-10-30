@@ -102,20 +102,45 @@ test("review model accepts exactly one bare or fenced JSON value", async () => {
     '```json\n{"ok":true}\n```',
     '```JSON\r\n{"ok":true}\r\n```',
     '```\n{"ok":true}\n```',
+    'Here is the result: {"ok":true} Thanks.',
+    'In 2024 this is true and null: {"ok":true} 42',
+    '{"ok":true,"left":{"x":1},"right":{"x":2}}',
+    'Result:\n```javascript\n{"ok":true}\n```\nDone.',
+    'Ignore the quoted "{not a candidate}". {"ok":true}',
+    '{"ok":true, "nested":{"x":"} [ \\""}}',
   ]) {
-    assert.deepEqual(await generate(), { ok: true });
+    const result = (await generate()) as any;
+    assert.equal(result.ok, true);
   }
+  text = 'Prose\n```json\n[1, {"x": "} ["}]\n```\nEnd';
+  assert.deepEqual(await generate(), [1, { x: "} [" }]);
+  text = "Prose\n```json\nfalse\n```\nEnd";
+  assert.equal(await generate(), false);
+  text = '"a bare JSON string"';
+  assert.equal(await generate(), "a bare JSON string");
   const secret = "secret-provider-content";
   for (text of [
-    `Here is JSON: {"secret":"${secret}"}`,
-    '```json\n{"ok":true}\n```\nExtra prose',
+    `Here is JSON: {"secret":"${secret}"} and {"other":true}`,
     '```json\n{"ok":true}\n```\n```json\n{"ok":false}\n```',
     '```json\n{"ok":true} {"ok":false}\n```',
     '```json\n{"ok":\n```',
     '```json\n{"ok":true}',
     '{"ok":',
-    '```javascript\n{"ok":true}\n```',
+    '{"outer": {"ok":true} invalid}',
+    '{"ok":true,"ok":false}',
+    '{"ok":true,"nested":[{"x":1,"x":2}]}',
+    '{"ok":true,"a":1,"\\u0061":2}',
+    'Result: {"ok":true,"ok":false}',
+    '```json\n{"ok":true,"nested":{"x":1,"x":2}}\n```',
+    '{"ok":true,"secret-provider-content":1,"secret-provider-content":2}',
+    "```json\n".repeat(3000),
+    'Result: {"ok":true} {"broken":',
+    'Result: {"ok":true} [broken]',
+    'Result: {"ok":true} and "unterminated {',
+    '```json\n{"ok":true}\n```\n{"ok":false}',
     `not JSON ${secret}`,
+    'before ```json\n{"ok":true}\n```',
+    '```json\n{"ok":true}\n```\n```json\nnull\n```',
     "",
   ]) {
     await assert.rejects(generate(), (error: Error) => {
@@ -125,6 +150,16 @@ test("review model accepts exactly one bare or fenced JSON value", async () => {
       return true;
     });
   }
+  text = "x".repeat(64 * 1024 + 1);
+  await assert.rejects(generate(), /response exceeds byte limit/);
+  registry.complete = async () => ({
+    stopReason: "stop",
+    content: [
+      { type: "text", text: "x".repeat(40_000) },
+      { type: "text", text: "x".repeat(40_000) },
+    ],
+  });
+  await assert.rejects(generate(), /response exceeds byte limit/);
 });
 
 test("review model rejects incomplete and failed responses without provider details", async () => {
