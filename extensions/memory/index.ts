@@ -31,6 +31,7 @@ import {
   persistSchedulerActivity,
   reviewProjectSessions,
   type SchedulerOptions,
+  type SchedulerReport,
 } from "./scheduler.ts";
 import {
   createConfiguredPiMemoryReviewer,
@@ -199,6 +200,11 @@ function safeReviewDetail(detail: unknown): string {
     "Cancelled; a partial apply may have occurred. Inspect before retrying.",
     "Cancellation or shutdown may have interrupted an apply; inspect before retrying.",
     "Cancellation was requested from another process; work may have completed. Inspect before retrying.",
+    "A review stopped while marked in flight; inspect before resuming.",
+    "Previous review was interrupted; inspect before resuming.",
+    "Review outcome is uncertain; inspect before resuming.",
+    "Shutdown timed out while work was active.",
+    "Some session sources are incomplete or unavailable.",
   ];
   if (known.includes(detail)) return detail;
   if (/duplicate (?:memory )?ids?/i.test(detail))
@@ -212,6 +218,157 @@ function safeReviewDetail(detail: unknown): string {
   if (detail.startsWith("review model did not complete:"))
     return "Review model did not complete. Check the model provider and configuration.";
   return "Review failed. Check the reviewer model configuration and .pi/memory files; inspect before retrying.";
+}
+
+const SAFE_REVIEW_OUTCOME_DETAILS = new Set([
+  "Insufficient evidence for this memory page; inspect evidence gaps.",
+  "Review found an unresolved evidence or authority conflict; inspect before resuming.",
+  "Incremental review has insufficient evidence; batch remains unacknowledged for retry.",
+  "Unresolved evidence or authority conflict.",
+  "Exact duplicate memory requires review; no safe duplicate removal was proposed.",
+  "Memory citation does not establish an exact same-category duplicate.",
+  "Existing memory authority is unknown.",
+  "Explicit guidance is protected without a demonstrably later direct user instruction.",
+  "Memory is already in that category.",
+  "Independent evidence assessment found unsupported or uncertain support.",
+  "Matching memory exists; re-review remains required.",
+  "Possible duplicate or opposite-sense memory requires review.",
+  "Full model review pass finished. Evidence gaps may remain; no-change decisions do not verify that memories are current.",
+  "Full review reached its pass limit; request another review to continue.",
+  "Review pass limit reached; work remains pending.",
+  "More session entries remain.",
+  "The explicitly opened session filename is not JSONL; activity remains pending.",
+  "Review was cancelled; activity remains pending.",
+  "Background session review completed.",
+]);
+
+type ReviewStatusReport = {
+  status: SchedulerReport["status"];
+  configuredModel: string | null;
+  historyEnabled: boolean;
+  events: SchedulerReport["events"];
+};
+
+// Provider diagnostics are allowlisted; recorded changes are bounded and
+// cleaned for terminal display, while structured details remain unchanged.
+function safeChangeText(detail: string): string {
+  const clean = detail
+    .replace(/(?:\x1b\]|\x9d)[\s\S]*?(?:\x07|\x1b\\|\x9c|$)/g, "")
+    .replace(/(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b[ -/]*[0-~]/g, "")
+    .replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return clean.length > 150 ? `${clean.slice(0, 149)}…` : clean;
+}
+export function formatReviewStatus(
+  report: ReviewStatusReport,
+  omittedEvents = 0,
+): string {
+  const s = report.status;
+  const timestamp = (value: number) => {
+    const date = new Date(value);
+    return Number.isFinite(date.getTime()) ? date.toLocaleString() : "unknown";
+  };
+  const model = report.configuredModel;
+  const safeModel =
+    model && model.length <= 120 && /^[\w.-]+\/[\w.:-]+$/.test(model)
+      ? model
+      : model
+        ? "configured (name hidden)"
+        : "not configured";
+  const state = s.paused
+    ? `paused${s.inflight ? " (work in flight)" : ""}`
+    : s.inflight
+      ? "running"
+      : "idle";
+  const lines = [
+    "Memory review report",
+    `State: ${state}`,
+    `Scheduler status: ${["idle", "pending", "running", "manual-running", "done", "error", "unresolved", "uncertain", "cancelled", "interrupted-uncertain", "shutdown-uncertain", "unsupported-session"].includes(s.status) ? s.status : "unknown"}`,
+    `Pending: ${s.pending}; unsupported sessions: ${s.unsupportedSessions}`,
+    `History review: ${report.historyEnabled ? "enabled" : "disabled"}`,
+    `Reviewer model: ${safeModel}`,
+  ];
+  if (s.unpersistedActivities || s.activityFlushPending)
+    lines.push(
+      `Activity awaiting persistence: ${s.unpersistedActivities}${s.activityFlushPending ? " (flush pending)" : ""}`,
+    );
+  if (s.manualContinuation)
+    lines.push(
+      `Full review continuation: offset ${s.manualContinuation.offset}`,
+    );
+  if (s.cooldownUntil > 0)
+    lines.push(`Cooldown until: ${timestamp(s.cooldownUntil)}`);
+  if (s.paused && s.inflight)
+    lines.push(
+      "Next: Work may still finish. Wait for it to settle, then inspect before resuming.",
+    );
+  else if (s.paused)
+    lines.push(
+      "Next: Inspect the latest outcome before using /memory-review resume. To continue a full review, use /memory-review full after resuming.",
+    );
+  else if (s.inflight)
+    lines.push("Next: Review is running. Check status again after it settles.");
+  lines.push("", "Recent runs (each run is separate):");
+  if (!report.events.length) lines.push("  None.");
+  for (const event of report.events) {
+    const mode = event.mode === "manual" ? "manual" : "background";
+    const status = [
+      "done",
+      "pending",
+      "error",
+      "unresolved",
+      "uncertain",
+      "unsupported-session",
+      "repair",
+      "cancelled",
+    ].includes(event.status)
+      ? event.status
+      : "unknown";
+    lines.push(`- ${timestamp(event.at)} | ${mode} | ${status}`);
+    if (event.status === "error" || event.status === "uncertain")
+      lines.push(`  ${safeReviewDetail(event.detail)}`);
+    else if (SAFE_REVIEW_OUTCOME_DETAILS.has(event.detail))
+      lines.push(`  ${event.detail}`);
+    else if (event.status === "unresolved")
+      lines.push(
+        "  Unresolved review. Details are unavailable or hidden; inspect before resuming.",
+      );
+    const repair = /^Reassigned (\d{1,9}) duplicate memory ID\(s\)\./.exec(
+      event.detail,
+    );
+    if (event.status === "repair" && repair)
+      lines.push(`  Reassigned ${repair[1]} duplicate memory ID(s).`);
+    if (event.review) {
+      const count = (value: unknown) =>
+        typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+          ? String(value)
+          : "unknown";
+      const r = event.review;
+      lines.push(`  Pages: ${count(r.pages)}; changes: ${event.changesTotal}`);
+      if (r.resumedAtOffset)
+        lines.push(`  Started at offset: ${count(r.resumedAtOffset)}`);
+      if (r.evidenceGaps === undefined)
+        lines.push("  Evidence coverage: unknown.");
+      else
+        lines.push(
+          `  Evidence: ${count(r.evidenceGaps)} insufficient, ${count(r.limitedPages)} limited page(s). Discovery truncated: ${count(r.discoveryTruncatedPages)}; search incomplete: ${count(r.searchIncompletePages)}; candidates truncated: ${count(r.candidatesTruncatedPages)}. Coverage is not verification.`,
+        );
+    } else if (event.changesTotal)
+      lines.push(`  Changes: ${event.changesTotal}`);
+    for (const change of event.changes)
+      lines.push(
+        `  - ${safeChangeText(change.detail) || "Change recorded (no description)"}`,
+      );
+    if (event.changesOmitted)
+      lines.push(`  ${event.changesOmitted} change(s) omitted.`);
+  }
+  if (omittedEvents)
+    lines.push(`${omittedEvents} recent run(s) omitted from this report.`);
+  if (report.events.length + omittedEvents >= 20)
+    lines.push("Older runs may have been removed from history.");
+  return lines.join("\n");
 }
 
 function textResult(text: string, details?: unknown) {
@@ -557,7 +714,10 @@ export default function (pi: ExtensionAPI) {
         })),
       };
       return textResult(
-        `Memory review report:\n${JSON.stringify(report, null, 2)}`,
+        formatReviewStatus(
+          report,
+          Math.max(0, raw.events.length - report.events.length),
+        ),
         { action, report },
       );
     } catch (error) {
