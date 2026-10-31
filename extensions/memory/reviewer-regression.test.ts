@@ -37,7 +37,7 @@ test("incremental review of 201 memories requires each snapshot-bound page befor
   const model: any = {
     generate: async ({ instruction, data }: any) => {
       if (instruction.startsWith("Select")) return { paths: [] };
-      reviewed += data.memories.length;
+      if (!data.comparisonOnly) reviewed += data.memories.length;
       return {
         action: "no_change",
         evidenceSufficient: true,

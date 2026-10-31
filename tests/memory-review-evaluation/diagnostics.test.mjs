@@ -101,4 +101,39 @@ test("summaries expose only fixed labels, counts and fragment metadata", () => {
     finalOutcome: { status: "done", detailCode: "SECRET" },
   });
   assert.ok(!JSON.stringify(outcome).includes("SECRET"));
+  assert.equal(
+    summarize(
+      {
+        instruction:
+          "Independently compare this evidence fragment against the target",
+      },
+      { verdict: "no_conflict" },
+    ).stage,
+    "evidence_crosscheck",
+  );
+  assert.equal(
+    summarize(
+      { instruction: "Independently assess whether removing target" },
+      {},
+    ).stage,
+    "semantic_assessment",
+  );
+  const totals = sanitizeDiagnostics({
+    entries: [],
+    omitted: 0,
+    stageTotals: {
+      evidence_crosscheck: {
+        attempts: 4,
+        errors: 1,
+        elapsedMs: 123,
+        secret: "SECRET",
+      },
+      assessment: { attempts: 1, errors: 2, elapsedMs: 1 },
+      SECRET: { attempts: 1, errors: 0, elapsedMs: 1 },
+    },
+  });
+  assert.deepEqual(totals.stageTotals, {
+    evidence_crosscheck: { attempts: 4, errors: 1, elapsedMs: 123 },
+  });
+  assert.ok(!JSON.stringify(totals).includes("SECRET"));
 });

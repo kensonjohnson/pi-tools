@@ -49,12 +49,18 @@ function model(
     generate: async ({ instruction, data }) =>
       instruction.startsWith("Select")
         ? { paths }
-        : instruction.startsWith("Independently")
+        : instruction.startsWith("Independently classify")
           ? {
-              verdict: "supported",
-              reason: "Full source supports the proposal.",
+              authority: "fact",
+              noInstructionOrPreference: true,
+              reason: "Descriptive fact.",
             }
-          : decide(data),
+          : instruction.startsWith("Independently")
+            ? {
+                verdict: "supported",
+                reason: "Full source supports the proposal.",
+              }
+            : decide(data),
   };
 }
 
@@ -183,7 +189,9 @@ test("instruction conflicts remain unresolved and assistant-only claims cannot a
         reason: "Assistant claims it.",
       })),
     });
-    await assert.rejects(a.review({ batch: b.batch }), /direct user message/);
+    const invalid = await a.review({ batch: b.batch });
+    assert.equal(invalid.status, "unresolved");
+    assert.match(invalid.detail, /direct user message/);
     assert.equal(b.count(), 0);
   }));
 
@@ -205,10 +213,9 @@ test("full context prevents substring negation and stale evidence fails before m
         ["fact.txt"],
       ),
     });
-    await assert.rejects(
-      bad.review({ batch: b.batch }),
-      /complete source paragraph/,
-    );
+    const invalid = await bad.review({ batch: b.batch });
+    assert.equal(invalid.status, "unresolved");
+    assert.match(invalid.detail, /complete source paragraph/);
     let captures = 0;
     const wrapper = {
       captureAddPrecondition: async () => {
@@ -274,7 +281,10 @@ test("fabricated ids, uncertain assessments and duplicate claims do not apply", 
         reason: "Claimed stale.",
       })),
     });
-    await assert.rejects(forged.review({ batch: b.batch }), /unknown memory/);
+    assert.equal(
+      (await forged.review({ batch: b.batch })).status,
+      "unresolved",
+    );
     const uncertain = new Reviewer({
       project: cwd,
       store,

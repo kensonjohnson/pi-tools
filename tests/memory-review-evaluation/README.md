@@ -18,6 +18,12 @@ The adapter runs with a fresh HOME and TMPDIR and only PATH and LANG inherited b
 
 For the opt-in Pi reviewer adapter and its bounded execution settings, see [PI-ADAPTER.md](PI-ADAPTER.md).
 
+## Copy-first acceptance checklist
+
+Before an approved provider run, record the source revision and dirty state, model, limits, fixture exclusions, and a private plan for reviewing retained output. Do not run alongside a memory writer. Reviewers should agree in advance which present-day claims and explicit instructions to check; the three built-in string checks are only sentinels, not a complete benchmark. No session history enters the fixture, so it cannot independently establish instruction authority or supersession.
+
+For an actionable run, require a reported reviewer outcome and inspect limits, gaps, evaluations and net changes. Treat pending, unresolved, uncertain, errors, missing coverage, truncated coverage, and zero evaluations on a nonempty snapshot as unresolved, not successful. Compare retained before and after files privately. For each selected stale claim, verify the original change and any replacement against current source. Verify explicit instructions, including conditions and authority, against their original context. Check additions and unrelated removals too. A no-change run does not demonstrate that the reviewer can correct known stale claims; a changed stale string alone does not establish a correct correction. Record findings and remaining evidence gaps before deciding whether a separate actual-memory change is warranted. Never copy the fixture back automatically.
+
 ## Reading results
 
 `evaluation` is `fail` if any known stale claim remains, `incomplete` if the reviewer is missing or unfinished, coverage is missing or limited, a fixture is absent, or changes need human review, and `pass` only if no such flags exist. `flags` lists all detected problems, including those masked by `fail`. Removal or rewording of a stale claim requires human review, so this fixture ordinarily cannot report `pass` after correcting one; the automated checks alone cannot certify a replacement. A pass would still not prove general correctness. The no-op baseline reports failure when known stale claims are present.

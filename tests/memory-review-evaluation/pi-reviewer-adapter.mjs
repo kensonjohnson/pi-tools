@@ -17,10 +17,14 @@ import { MemoryReviewer } from "../../extensions/memory/reviewer.ts";
 import { PiReviewerModel } from "../../extensions/memory/reviewer-model.ts";
 import { summarize, summarizeOutcome } from "./diagnostics.mjs";
 import { reviewAllMemories } from "../../extensions/memory/manual-review.ts";
+import {
+  createTrackedReviewStore,
+  trackReviewResults,
+} from "../../extensions/memory/index.ts";
 import { ModelRuntime, ModelRegistry } from "@earendil-works/pi-coding-agent";
 
 const checkout = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-async function validateProject(project, nonce) {
+export async function validateProject(project, nonce) {
   if (!project || !nonce || !/^[a-f0-9]{64}$/.test(nonce))
     throw new Error("Missing evaluation marker");
   const root = await realpath(project);
@@ -82,6 +86,18 @@ export function runtimeOptions(
   };
 }
 
+// Match production's per-review dispatch guard and confirmed-write tracking.
+export function createEvaluationReviewer(manager, changes, dispatch, options) {
+  return trackReviewResults(
+    new MemoryReviewer({
+      ...options,
+      store: createTrackedReviewStore(manager, changes, dispatch),
+    }),
+    changes,
+    dispatch,
+  );
+}
+
 // Injectable fake model is used only by tests. CLI always uses PiReviewerModel.
 export async function execute({
   project,
@@ -108,6 +124,8 @@ export async function execute({
     controller.abort();
   }, timeoutMs);
   const store = new MemoryManager(root, { semanticEnabled: false });
+  const confirmedChanges = [];
+  const dispatch = { count: 0 };
   let status = "error",
     errorCode = "setup_failed";
   const diagnostics = {
@@ -115,11 +133,53 @@ export async function execute({
     omitted: 0,
     reviewOutcomes: [],
     reviewOutcomesOmitted: 0,
+    stageTotals: {},
   };
   const runtimeDir = join(root, ".evaluation-runtime");
   let traceSequence = 0;
+  // Traces can contain provider, source, and memory data. Never forward errors
+  // from this best-effort diagnostic path into the public outcome.
+  const traceError = async (location, error) => {
+    if (!privateTrace) return;
+    try {
+      const text =
+        error instanceof Error
+          ? error.stack || `${error.name}: ${error.message}`
+          : typeof error === "string"
+            ? error
+            : "Non-Error exception";
+      const name = `private-error-${String(++traceSequence).padStart(6, "0")}.json`;
+      await writeFile(
+        join(runtimeDir, name),
+        JSON.stringify({ location, error: text.slice(0, 65536) }),
+        { mode: 0o600, flag: "wx" },
+      );
+    } catch {
+      // Preserve the original failure even if tracing fails.
+    }
+  };
+  const traceResult = async (kind, result) => {
+    if (!privateTrace) return;
+    try {
+      const name = `private-${kind}-${String(++traceSequence).padStart(6, "0")}.json`;
+      await writeFile(join(runtimeDir, name), JSON.stringify(result), {
+        mode: 0o600,
+        flag: "wx",
+      });
+    } catch {
+      // Diagnostic failures must not change review behavior.
+    }
+  };
   const instrument = (inner) => ({
     generate: async (request) => {
+      const stage = summarize(request, undefined).stage;
+      const totals = (diagnostics.stageTotals[stage] ??= {
+        attempts: 0,
+        errors: 0,
+        elapsedMs: 0,
+      });
+      const started = performance.now();
+      totals.attempts++;
       try {
         const result = await inner.generate(request);
         const summary = summarize(request, result);
@@ -135,10 +195,17 @@ export async function execute({
         else diagnostics.omitted++;
         return result;
       } catch (error) {
+        await traceError("model_generate", error);
+        totals.errors++;
         if (diagnostics.entries.length < 200)
           diagnostics.entries.push(summarize(request, undefined, true));
         else diagnostics.omitted++;
         throw error;
+      } finally {
+        totals.elapsedMs += Math.max(
+          0,
+          Math.round(performance.now() - started),
+        );
       }
     },
   });
@@ -157,9 +224,8 @@ export async function execute({
           return model.generate(request);
         },
       };
-      reviewer = new MemoryReviewer({
+      reviewer = createEvaluationReviewer(store, confirmedChanges, dispatch, {
         project: root,
-        store,
         model: instrument(bounded),
         contextWindow: 10000,
       });
@@ -205,9 +271,8 @@ export async function execute({
       const slash = modelName.indexOf("/");
       const lookup = () =>
         registry.find(modelName.slice(0, slash), modelName.slice(slash + 1));
-      reviewer = new MemoryReviewer({
+      reviewer = createEvaluationReviewer(store, confirmedChanges, dispatch, {
         project: root,
-        store,
         model: instrument(new PiReviewerModel(registry, modelName)),
         continuationKey: modelName,
         contextWindow: () => lookup()?.contextWindow,
@@ -216,7 +281,14 @@ export async function execute({
     }
     const review = reviewer.review.bind(reviewer);
     reviewer.review = async (options) => {
-      const result = await review(options);
+      let result;
+      try {
+        result = await review(options);
+      } catch (error) {
+        await traceError("review", error);
+        throw error;
+      }
+      await traceResult("review-result", result);
       if (diagnostics.reviewOutcomes.length < 200)
         diagnostics.reviewOutcomes.push(summarizeOutcome(result));
       else diagnostics.reviewOutcomesOmitted++;
@@ -227,10 +299,11 @@ export async function execute({
       signal: controller.signal,
       maxPasses,
     });
+    await traceResult("final-outcome", outcome);
     diagnostics.finalOutcome = summarizeOutcome(outcome);
     status = outcome.status;
     pages = outcome.review?.pages ?? 0;
-    changes = outcome.changes?.length ?? 0;
+    changes = confirmedChanges.length || outcome.changes?.length || 0;
     if (outcome.review) {
       coverage = {};
       for (const key of [
@@ -265,6 +338,7 @@ export async function execute({
     }
     if (status === "pending") limit = true;
   } catch (error) {
+    await traceError("execute", error);
     // Only exact host-generated messages map to codes; never expose exception text.
     const message = error instanceof Error ? error.message : "";
     if (message === "review model unavailable or not a chat model")
@@ -281,7 +355,10 @@ export async function execute({
     )
       errorCode = "config_invalid";
     else if (calls > 0) errorCode = "review_failed";
-    status = limit ? "pending" : "error";
+    if (confirmedChanges.length) {
+      changes = confirmedChanges.length;
+      status = "uncertain";
+    } else status = limit ? "pending" : "error";
   } finally {
     clearTimeout(timer);
     await store.close();

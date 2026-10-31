@@ -90,20 +90,26 @@ test("manual edits during automatic apply are preserved and leave a durable unce
       generate: async ({ instruction, data }: any) =>
         instruction.startsWith("Select")
           ? { paths: ["browser.txt"] }
-          : instruction.startsWith("Independently")
-            ? { verdict: "supported", reason: "Current repository evidence." }
-            : {
-                action: "update",
-                id: old.id,
-                content: "Browser uses Playwright.",
-                targetAuthority: "fact",
-                citation: {
-                  kind: "file",
-                  id: data.files[0].id,
-                  quote: "Browser backend: Playwright.",
+          : instruction.startsWith("Independently classify")
+            ? {
+                authority: "fact",
+                noInstructionOrPreference: true,
+                reason: "Descriptive fact.",
+              }
+            : instruction.startsWith("Independently")
+              ? { verdict: "supported", reason: "Current repository evidence." }
+              : {
+                  action: "update",
+                  id: old.id,
+                  content: "Browser uses Playwright.",
+                  targetAuthority: "fact",
+                  citation: {
+                    kind: "file",
+                    id: data.files[0].id,
+                    quote: "Browser backend: Playwright.",
+                  },
+                  reason: "Browser implementation changed.",
                 },
-                reason: "Browser implementation changed.",
-              },
     };
     const checkpoint = join(runtime, "progress.json");
     const scheduler = new MemoryScheduler({

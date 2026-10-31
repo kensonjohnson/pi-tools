@@ -52,6 +52,7 @@ test("reports persist bounded changes and unresolved outcomes without blocking m
         snapshotMemories: 4,
         gapReasons: {
           no_evidence: 1,
+          candidates_truncated: 2,
           secret: 99,
           model_insufficient: -1,
         } as any,
@@ -64,12 +65,17 @@ test("reports persist bounded changes and unresolved outcomes without blocking m
     assert.match(scheduler.report().events[0].detail, /conflicts/);
     assert.deepEqual(scheduler.report().events[0].review?.gapReasons, {
       no_evidence: 1,
+      candidates_truncated: 2,
     });
     assert.equal(scheduler.report().events[0].review?.memoryEvaluations, 4);
     await scheduler.shutdown();
     scheduler = new MemoryScheduler(opts);
     assert.equal(scheduler.status().paused, false);
     assert.equal(scheduler.report().events[0].status, "unresolved");
+    assert.equal(
+      scheduler.report().events[0].review?.gapReasons?.candidates_truncated,
+      2,
+    );
     assert.equal(
       (await scheduler.runManual(async () => ({ status: "done" }))).status,
       "done",

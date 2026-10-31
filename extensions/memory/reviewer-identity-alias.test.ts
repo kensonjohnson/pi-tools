@@ -4,7 +4,28 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryManager } from "./core.ts";
-import { MemoryReviewer } from "./reviewer.ts";
+import { MemoryReviewer as BaseMemoryReviewer } from "./reviewer.ts";
+
+// This fixture's existing targets are descriptive facts.
+class MemoryReviewer extends BaseMemoryReviewer {
+  constructor(options: ConstructorParameters<typeof BaseMemoryReviewer>[0]) {
+    const model = options.model;
+    super({
+      ...options,
+      model: {
+        ...model,
+        generate: (request) =>
+          request.instruction.startsWith("Independently classify")
+            ? Promise.resolve({
+                authority: "fact",
+                noInstructionOrPreference: true,
+                reason: "Descriptive fact.",
+              })
+            : model.generate(request),
+      },
+    });
+  }
+}
 import { SessionReview } from "./session-review.ts";
 
 test("host alias maps an unfit memory ID to its exact mutation precondition", async () => {

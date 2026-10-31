@@ -29,36 +29,42 @@ test("evidence-supported paraphrased merge updates one record and removes its du
           generate: async ({ instruction, data }: any) =>
             instruction.startsWith("Select")
               ? { paths: ["queue.txt"] }
-              : instruction.startsWith("Independently")
+              : instruction.startsWith("Independently classify")
                 ? {
-                    verdict: "supported",
-                    reason: "The file supports both claims.",
+                    authority: "fact",
+                    noInstructionOrPreference: true,
+                    reason: "Descriptive fact.",
                   }
-                : action === "update"
+                : instruction.startsWith("Independently")
                   ? {
-                      action,
-                      id: first.id,
-                      content: "The queue persists data on local disk.",
-                      targetAuthority: "fact",
-                      reason:
-                        "Combine the duplicate descriptions with the current source.",
-                      citation: {
-                        kind: "file",
-                        id: data.files[0].id,
-                        quote: "Queue data is stored on local disk.",
-                      },
+                      verdict: "supported",
+                      reason: "The file supports both claims.",
                     }
-                  : {
-                      action,
-                      id: second.id,
-                      targetAuthority: "fact",
-                      reason: "The updated record covers the same fact.",
-                      citation: {
-                        kind: "file",
-                        id: data.files[0].id,
-                        quote: "Queue data is stored on local disk.",
+                  : action === "update"
+                    ? {
+                        action,
+                        id: first.id,
+                        content: "The queue persists data on local disk.",
+                        targetAuthority: "fact",
+                        reason:
+                          "Combine the duplicate descriptions with the current source.",
+                        citation: {
+                          kind: "file",
+                          id: data.files[0].id,
+                          quote: "Queue data is stored on local disk.",
+                        },
+                      }
+                    : {
+                        action,
+                        id: second.id,
+                        targetAuthority: "fact",
+                        reason: "The updated record covers the same fact.",
+                        citation: {
+                          kind: "file",
+                          id: data.files[0].id,
+                          quote: "Queue data is stored on local disk.",
+                        },
                       },
-                    },
         },
       });
     assert.equal((await create("update").review()).status, "applied");

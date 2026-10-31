@@ -282,7 +282,7 @@ async function copySource(source, dest) {
   }
 }
 
-async function command(argv, root, verbose, nonce, forwardEnv) {
+async function command(argv, root, verbose, nonce, forwardEnv, retain) {
   const home = join(root, ".evaluation-home");
   await mkdir(home, { mode: 0o700 });
   return new Promise((resolvePromise, reject) => {
@@ -301,6 +301,7 @@ async function command(argv, root, verbose, nonce, forwardEnv) {
         LANG: "C.UTF-8",
         MEMORY_EVALUATION_PROJECT: root,
         MEMORY_EVALUATION_NONCE: nonce,
+        MEMORY_EVALUATION_RETAINED: retain ? "1" : "0",
       },
       stdio: [
         "ignore",
@@ -364,7 +365,7 @@ export async function run({
     let adapterFailed = false;
     if (argv.length) {
       try {
-        await command(argv, root, showRaw, nonce, forwardEnv);
+        await command(argv, root, showRaw, nonce, forwardEnv, retain);
       } catch {
         adapterFailed = true;
       }
@@ -441,6 +442,7 @@ if (
           "PATH",
           "MEMORY_EVALUATION_PROJECT",
           "MEMORY_EVALUATION_NONCE",
+          "MEMORY_EVALUATION_RETAINED",
           "NODE_OPTIONS",
         ].includes(x),
     ) ||

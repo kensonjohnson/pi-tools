@@ -26,7 +26,7 @@ for (const mutation of [false, true])
       const reviewer = new MemoryReviewer({
         project: root,
         store,
-        contextWindow: 1100,
+        contextWindow: 1200,
         model: {
           generate: async ({ instruction, data }: any) => {
             if (instruction.startsWith("Select")) {

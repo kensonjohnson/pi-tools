@@ -88,7 +88,12 @@ test("manual review aggregates bounded evidence gap counts without retaining evi
               candidatesTruncated: true,
               pageCount: 50,
               totalMemories: 51,
-              gapReasons: ["no_evidence", "no_evidence", "private secret"],
+              gapReasons: [
+                "no_evidence",
+                "no_evidence",
+                "candidates_truncated",
+                "private secret",
+              ],
             },
           }
         : {
@@ -118,7 +123,7 @@ test("manual review aggregates bounded evidence gap counts without retaining evi
     candidatesTruncatedPages: 1,
     memoryEvaluations: 50,
     snapshotMemories: 51,
-    gapReasons: { no_evidence: 1 },
+    gapReasons: { no_evidence: 1, candidates_truncated: 1 },
   });
 });
 test("continuation retains insufficient prefix across scheduler instances", () =>

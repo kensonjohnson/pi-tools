@@ -38,6 +38,43 @@ test("counts stale claims and flags changed instructions for human review", () =
   assert.equal(result.counts.changed, 1);
 });
 
+test("each stale sentinel is independently counted without flagging historical picker observations", () => {
+  const before = [
+    entry(
+      "crash",
+      "browser_start in extensions/browser-tools/index.ts spawns a hard-coded macOS Brave path without an error listener",
+    ),
+    entry(
+      "backend",
+      "Browser Tools uses puppeteer-core with per-call CDP connections",
+    ),
+    entry(
+      "picker",
+      "The preliminary picker supports one selection on visible unframed owned pages",
+    ),
+    entry(
+      "history",
+      "A local headed Chromium fixture reproduced a button activation after a picker input-gate CDP session detached.",
+    ),
+  ];
+  const result = compare(before, [
+    entry("crash", "The Brave launch failure is now handled."),
+    before[2],
+    before[3],
+  ]);
+  assert.equal(result.stale.brave_crash.status, "removed_or_reworded_review");
+  assert.equal(result.stale.brave_crash.originalIdsChanged, 1);
+  assert.equal(result.stale.brave_backend.status, "removed_or_reworded_review");
+  assert.equal(result.stale.brave_backend.originalIdsRemoved, 1);
+  assert.equal(result.stale.picker_single_unframed.status, "still_present");
+  const historicalOnly = compare([before[3]], [before[3]]);
+  assert.ok(
+    Object.values(historicalOnly.stale).every(
+      (x) => x.status === "fixture_absent",
+    ),
+  );
+});
+
 test("tracks rewording and instruction category moves without claiming semantic preservation", () => {
   const before = [
     entry(
@@ -138,6 +175,10 @@ test("strict mode exits nonzero for a known-stale offline baseline", async () =>
 
 test("adapter changes only disposable copy, and cleanup happens on success and failure", async () => {
   const source = await mkdtemp(join(tmpdir(), "memory-eval-source-"));
+  const priorTmp = process.env.TMPDIR;
+  const privateTmp = join(source, "temp");
+  await mkdir(privateTmp);
+  process.env.TMPDIR = privateTmp;
   try {
     const dir = join(source, ".pi", "memory");
     await mkdir(dir, { recursive: true });
@@ -168,6 +209,16 @@ test("adapter changes only disposable copy, and cleanup happens on success and f
     assert.equal(failed.adapterFailed, true);
     assert.equal(failed.counts.distinctChanged, 1);
     assert.equal(failed.evaluation, "incomplete");
+    const malicious = await run({
+      source,
+      argv: [
+        process.execPath,
+        "-e",
+        `require('fs').writeFileSync('.memory-evaluation-outcome.json', JSON.stringify({status:'error',calls:0,pages:0,changes:null,coverage:null,readOnly:{sessionEvidence:'missing',routeReason:'SECRET'}}))`,
+      ],
+    });
+    assert.ok(!JSON.stringify(malicious).includes("SECRET"));
+    assert.equal(malicious.reviewer.readOnly, undefined);
     const reportScript = `${script}; require('fs').writeFileSync('.memory-evaluation-outcome.json', JSON.stringify({status:'error',calls:2,pages:0,changes:null,coverage:null}))`;
     const partial = await run({
       source,
@@ -224,6 +275,8 @@ test("adapter changes only disposable copy, and cleanup happens on success and f
     assert.ok(retainedFailure.retainedProject);
     await rm(retainedFailure.retainedProject, { recursive: true, force: true });
   } finally {
+    if (priorTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = priorTmp;
     await rm(source, { recursive: true, force: true });
   }
 });

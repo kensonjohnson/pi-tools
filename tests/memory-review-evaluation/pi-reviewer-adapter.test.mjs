@@ -12,14 +12,213 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { run } from "./evaluate.mjs";
-import { execute, runtimeOptions } from "./pi-reviewer-adapter.mjs";
+import {
+  execute,
+  runtimeOptions,
+  createEvaluationReviewer,
+} from "./pi-reviewer-adapter.mjs";
+import { MemoryManager } from "../../extensions/memory/core.ts";
+import { reviewAllMemories } from "../../extensions/memory/manual-review.ts";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
 const adapter = new URL("./pi-reviewer-adapter.mjs", import.meta.url).href;
 const driver = `import { execute } from ${JSON.stringify(adapter)};
 const model = {generate: async ({instruction}) => instruction.startsWith('Select') ? {paths:[]} : {action:'no_change',reason:'Reviewed HIDDEN_SENTINEL',evidenceSufficient:true}};
 await execute({project:process.env.MEMORY_EVALUATION_PROJECT,nonce:process.env.MEMORY_EVALUATION_NONCE,model,privateTrace:process.env.MEMORY_REVIEW_PRIVATE_TRACE==='1',maxCalls:Number(process.argv[1]),maxPasses:100,timeoutMs:30000});`;
+
+test("tracked evaluation distinguishes stale targets from dispatched failures without replay", async () => {
+  for (const mode of ["stale", "dispatched"]) {
+    const root = await mkdtemp(join(tmpdir(), "memory-eval-tracked-"));
+    const manager = new MemoryManager(root, { semanticEnabled: false });
+    try {
+      await manager.init();
+      const first = (
+        await manager.remember(
+          "knowledge",
+          "The project uses pnpm for package management.",
+        )
+      ).memory;
+      const second = (
+        await manager.remember(
+          "knowledge",
+          "The project package manager is pnpm.",
+        )
+      ).memory;
+      const third = (
+        await manager.remember(
+          "knowledge",
+          "The project uses pnpm to manage packages.",
+        )
+      ).memory;
+      const changes = [];
+      const dispatch = { count: 0 };
+      const original = manager.forgetWithSnapshot.bind(manager);
+      let dispatched = 0;
+      manager.forgetWithSnapshot = async (...args) => {
+        dispatched++;
+        if (mode === "dispatched" && dispatched === 2)
+          throw new Error("unknown memory target");
+        return original(...args);
+      };
+      let proposals = 0;
+      const reviewer = createEvaluationReviewer(manager, changes, dispatch, {
+        project: root,
+        model: {
+          generate: async ({ instruction }) => {
+            if (instruction.startsWith("Select")) return { paths: [] };
+            if (instruction.startsWith("Independently classify"))
+              return {
+                authority: "fact",
+                noInstructionOrPreference: true,
+                reason: "Descriptive fact.",
+              };
+            if (instruction.startsWith("Independently"))
+              return {
+                verdict: "supported",
+                reason: "Supported.",
+                fullyEntailed: true,
+                noUniqueDetails: true,
+                noContradiction: true,
+                noExplicitInstruction: true,
+              };
+            proposals++;
+            const target =
+              mode === "dispatched" && proposals > 1 ? second : first;
+            const retained =
+              mode === "dispatched" && proposals > 1 ? third : second;
+            return {
+              action: "remove",
+              id: target.id,
+              targetAuthority: "fact",
+              reason: "Redundant.",
+              citation: {
+                kind: "memory",
+                id: retained.id,
+                quote: retained.content,
+              },
+            };
+          },
+        },
+      });
+      const outcome = await reviewAllMemories({
+        reviewer,
+        signal: new AbortController().signal,
+      });
+      assert.equal(
+        outcome.status,
+        mode === "stale" ? "unresolved" : "uncertain",
+      );
+      assert.equal(proposals, 2);
+      assert.equal(dispatch.count, mode === "stale" ? 1 : 2);
+      assert.equal(changes.length, 1);
+      assert.equal(outcome.changes.length, 1);
+    } finally {
+      await manager.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("private exception traces are opt-in, private, suppressed in reports and cleaned", async () => {
+  const source = await mkdtemp(join(tmpdir(), "memory-eval-source-"));
+  const priorTrace = process.env.MEMORY_REVIEW_PRIVATE_TRACE;
+  const priorTmp = process.env.TMPDIR;
+  const privateTmp = join(source, "temp");
+  await mkdir(privateTmp);
+  process.env.TMPDIR = privateTmp;
+  const errorDriver = `import { execute } from ${JSON.stringify(adapter)};
+await execute({project:process.env.MEMORY_EVALUATION_PROJECT,nonce:process.env.MEMORY_EVALUATION_NONCE,privateTrace:process.env.MEMORY_REVIEW_PRIVATE_TRACE==='1',model:{generate:async()=>{throw new Error('PRIVATE_ERROR_SENTINEL')}}});`;
+  const argv = [process.execPath, "--input-type=module", "-e", errorDriver];
+  try {
+    const dir = join(source, ".pi", "memory");
+    await mkdir(dir, { recursive: true });
+    for (const category of ["knowledge", "practices", "decisions"])
+      await writeFile(
+        join(dir, `${category}.ndjson`),
+        category === "knowledge"
+          ? JSON.stringify({
+              id: randomUUID(),
+              created: new Date().toISOString(),
+              content: "A fact",
+            }) + "\n"
+          : "",
+      );
+    delete process.env.MEMORY_REVIEW_PRIVATE_TRACE;
+    const untraced = await run({ source, argv, retain: true });
+    try {
+      assert.equal(untraced.reviewer.status, "error");
+      assert.ok(!JSON.stringify(untraced).includes("PRIVATE_ERROR_SENTINEL"));
+      await assert.rejects(
+        stat(join(untraced.retainedProject, ".evaluation-runtime")),
+        { code: "ENOENT" },
+      );
+    } finally {
+      await rm(untraced.retainedProject, { recursive: true, force: true });
+    }
+    process.env.MEMORY_REVIEW_PRIVATE_TRACE = "1";
+    const cli = spawnSync(
+      process.execPath,
+      [
+        new URL("./evaluate.mjs", import.meta.url).pathname,
+        "--env=MEMORY_REVIEW_PRIVATE_TRACE",
+        "--",
+        ...argv,
+      ],
+      { cwd: source, encoding: "utf8" },
+    );
+    assert.equal(cli.status, 0);
+    assert.ok(!`${cli.stdout}${cli.stderr}`.includes("PRIVATE_ERROR_SENTINEL"));
+    assert.equal(JSON.parse(cli.stdout).reviewer.status, "error");
+    const traced = await run({
+      source,
+      argv,
+      retain: true,
+      forwardEnv: ["MEMORY_REVIEW_PRIVATE_TRACE"],
+    });
+    try {
+      assert.ok(!JSON.stringify(traced).includes("PRIVATE_ERROR_SENTINEL"));
+      const runtime = join(traced.retainedProject, ".evaluation-runtime");
+      assert.equal((await stat(runtime)).mode & 0o777, 0o700);
+      const names = (await readdir(runtime)).filter((name) =>
+        name.startsWith("private-error-"),
+      );
+      assert.ok(names.length > 0);
+      const file = join(runtime, names[0]);
+      assert.equal((await stat(file)).mode & 0o777, 0o600);
+      const entry = JSON.parse(await readFile(file, "utf8"));
+      assert.match(entry.error, /PRIVATE_ERROR_SENTINEL/);
+      assert.ok(
+        ["model_generate", "review", "execute"].includes(entry.location),
+      );
+    } finally {
+      await rm(traced.retainedProject, { recursive: true, force: true });
+    }
+    const before = (await readdir(tmpdir()))
+      .filter((name) => name.startsWith("memory-evaluation-"))
+      .sort();
+    const cleaned = await run({
+      source,
+      argv,
+      forwardEnv: ["MEMORY_REVIEW_PRIVATE_TRACE"],
+    });
+    assert.ok(!JSON.stringify(cleaned).includes("PRIVATE_ERROR_SENTINEL"));
+    assert.deepEqual(
+      (await readdir(tmpdir()))
+        .filter((name) => name.startsWith("memory-evaluation-"))
+        .sort(),
+      before,
+    );
+  } finally {
+    if (priorTrace === undefined)
+      delete process.env.MEMORY_REVIEW_PRIVATE_TRACE;
+    else process.env.MEMORY_REVIEW_PRIVATE_TRACE = priorTrace;
+    if (priorTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = priorTmp;
+    await rm(source, { recursive: true, force: true });
+  }
+});
 
 test("rejects an unmarked checkout before initializing a store", async () => {
   await assert.rejects(
@@ -80,6 +279,10 @@ test("runtime configuration opts into absolute auth and model config paths", () 
 
 test("real reviewer traverses disposable pages with fake model and reports bounded incomplete runs", async () => {
   const source = await mkdtemp(join(tmpdir(), "memory-eval-source-"));
+  const priorTmp = process.env.TMPDIR;
+  const privateTmp = join(source, "temp");
+  await mkdir(privateTmp);
+  process.env.TMPDIR = privateTmp;
   try {
     const dir = join(source, ".pi", "memory");
     await mkdir(dir, { recursive: true });
@@ -101,6 +304,11 @@ test("real reviewer traverses disposable pages with fake model and reports bound
     assert.equal(limited.reviewer.status, "pending");
     assert.equal(limited.reviewer.reason, "limit");
     assert.equal(limited.reviewer.calls, 1);
+    const limitedTotals = Object.values(
+      limited.reviewer.diagnostics.stageTotals,
+    );
+    assert.ok(limitedTotals.reduce((n, x) => n + x.attempts, 0) >= 1);
+    assert.ok(limitedTotals.every((x) => Number.isSafeInteger(x.elapsedMs)));
     const full = await run({
       source,
       argv: [process.execPath, "--input-type=module", "-e", driver, "300"],
@@ -127,6 +335,10 @@ test("real reviewer traverses disposable pages with fake model and reports bound
           x.proposals[0].citationKind === "other",
       ),
     );
+    assert.ok(
+      full.reviewer.diagnostics.stageTotals.evidence_selection.attempts > 0,
+    );
+    assert.ok(full.reviewer.diagnostics.stageTotals.decision.attempts > 0);
     assert.ok(full.reviewer.diagnostics.reviewOutcomes.length > 0);
     assert.equal(full.reviewer.diagnostics.finalOutcome.status, "unresolved");
     assert.ok(!JSON.stringify(full).includes("HIDDEN_SENTINEL"));
@@ -176,6 +388,27 @@ test("real reviewer traverses disposable pages with fake model and reports bound
           assert.ok(!("request" in data));
         }
         assert.ok(found);
+        const resultFiles = (await readdir(traceDir)).filter(
+          (name) =>
+            name.startsWith("private-review-result-") ||
+            name.startsWith("private-final-outcome-"),
+        );
+        assert.ok(
+          resultFiles.some((name) => name.startsWith("private-review-result-")),
+        );
+        assert.ok(
+          resultFiles.some((name) => name.startsWith("private-final-outcome-")),
+        );
+        for (const name of resultFiles) {
+          const file = join(traceDir, name);
+          assert.equal((await stat(file)).mode & 0o777, 0o600);
+          const result = JSON.parse(await readFile(file, "utf8"));
+          assert.equal(typeof result.status, "string");
+          if (name.startsWith("private-final-outcome-")) {
+            assert.equal(result.status, "unresolved");
+            assert.equal(typeof result.detail, "string");
+          }
+        }
         assert.ok(!JSON.stringify(traced).includes("HIDDEN_SENTINEL"));
         assert.equal(
           await readFile(join(dir, "knowledge.ndjson"), "utf8"),
@@ -246,6 +479,8 @@ test("real reviewer traverses disposable pages with fake model and reports bound
       else process.env.MEMORY_REVIEW_AUTH_PATH = previousAuth;
     }
   } finally {
+    if (priorTmp === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = priorTmp;
     await rm(source, { recursive: true, force: true });
   }
 });

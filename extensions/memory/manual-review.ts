@@ -1,5 +1,9 @@
 import type { MemoryReviewer } from "./reviewer.ts";
-import { REVIEW_GAP_REASONS } from "./scheduler.ts";
+import {
+  REVIEW_GAP_REASONS,
+  reviewResultChanges,
+  reviewResultUnresolved,
+} from "./scheduler.ts";
 import type {
   ReviewGapReason,
   IncrementalFragmentProgress,
@@ -18,6 +22,7 @@ export async function reviewAllMemories(options: {
   onProgress?: (cursor: ManualCursor | undefined) => void;
 }): Promise<SchedulerOutcome> {
   const changes: Array<{ id: string; detail: string }> = [];
+  let lastUnresolved: SchedulerOutcome["unresolved"];
   let offset = options.fullOffset,
     snapshot = options.fullSnapshot;
   let pages = 0;
@@ -61,6 +66,7 @@ export async function reviewAllMemories(options: {
           signal: options.signal,
           fullOffset: offset,
           fullSnapshot: snapshot,
+          continueFactualUpdates: true,
           ...(options.onProgress
             ? {
                 onFragmentProgress: (progress: {
@@ -124,24 +130,76 @@ export async function reviewAllMemories(options: {
         if (audit.searchIncomplete) searchIncompletePages++;
         if (audit.candidatesTruncated) candidatesTruncatedPages++;
       }
-      if (result.status === "uncertain" || result.status === "unresolved")
+      const applied = reviewResultChanges(result);
+      changes.push(...applied);
+      if (
+        applied.length ||
+        result.status === "applied" ||
+        result.status === "uncertain"
+      )
+        options.onProgress?.(undefined);
+      const unresolved = reviewResultUnresolved(result);
+      if (unresolved) lastUnresolved = unresolved;
+      // Confirmed progress permits a fresh snapshot pass. Never retry an
+      // uncertain dispatch, and stop when a pass makes no changes.
+      if (
+        result.status !== "uncertain" &&
+        (result.status === "unresolved" || unresolved) &&
+        applied.length
+      ) {
+        offset = undefined;
+        snapshot = undefined;
+        snapshotHasGaps = false;
+        continue;
+      }
+      if (
+        result.status === "uncertain" ||
+        result.status === "unresolved" ||
+        unresolved
+      )
         return {
-          status: result.status,
+          status: result.status === "uncertain" ? "uncertain" : "unresolved",
           detail:
-            result.status === "unresolved"
-              ? audit?.coverage === "insufficient"
-                ? "Insufficient evidence for this memory page; inspect evidence gaps."
-                : "Review found an unresolved evidence or authority conflict; inspect before resuming."
-              : "Review outcome is uncertain; inspect before resuming.",
+            result.status === "uncertain"
+              ? "Review outcome is uncertain; inspect before resuming."
+              : changes.length
+                ? "Review made changes but remains unresolved; inspect the report before retrying."
+                : audit?.coverage === "insufficient"
+                  ? "Insufficient evidence for this memory page; inspect evidence gaps."
+                  : "Review found an unresolved evidence or authority conflict; inspect before resuming.",
           changes,
+          ...(lastUnresolved ? { unresolved: lastUnresolved } : {}),
           review: progress(),
         };
       if (result.status === "applied") {
-        changes.push({
-          id: result.memoryId ?? "unknown",
-          detail: result.detail,
-        });
-        options.onProgress?.(undefined);
+        if (result.nextOffset !== undefined) {
+          if (!result.fullSnapshot)
+            throw new Error("manual review continuation has no snapshot");
+          // A changed page has not been independently re-reviewed. Continue
+          // with the verified snapshot, but do not claim complete coverage.
+          snapshotHasGaps = true;
+          // The durable cursor accepts positive page offsets only. Offset zero
+          // can continue in this invocation but is just a fresh start on resume.
+          if (result.nextOffset > 0)
+            options.onProgress?.({
+              offset: result.nextOffset,
+              snapshot: result.fullSnapshot,
+              evidenceGaps: true,
+            });
+          offset = result.nextOffset;
+          snapshot = result.fullSnapshot;
+          continue;
+        }
+        if (result.traversalCompleteAfterUpdates) {
+          options.onProgress?.(undefined);
+          return {
+            status: "unresolved",
+            detail:
+              "Full traversal finished with changes; inspect the changes and remaining evidence gaps.",
+            changes,
+            review: progress(),
+          };
+        }
         offset = undefined;
         snapshot = undefined;
         snapshotHasGaps = false;
@@ -164,6 +222,7 @@ export async function reviewAllMemories(options: {
           status: "unresolved",
           detail: result.detail,
           changes,
+          ...(lastUnresolved ? { unresolved: lastUnresolved } : {}),
           review: progress(),
         };
       options.onProgress?.(undefined);
@@ -173,6 +232,9 @@ export async function reviewAllMemories(options: {
           ? "Full review traversal finished with insufficient or unknown evidence; retry the full review."
           : "Full model review pass finished. Evidence gaps may remain; no-change decisions do not verify that memories are current.",
         changes,
+        ...(snapshotHasGaps && lastUnresolved
+          ? { unresolved: lastUnresolved }
+          : {}),
         review: progress(),
       };
     }
@@ -181,6 +243,7 @@ export async function reviewAllMemories(options: {
       detail:
         "Full review reached its pass limit; request another review to continue.",
       changes,
+      ...(lastUnresolved ? { unresolved: lastUnresolved } : {}),
       review: progress(),
       ...(offset === undefined
         ? {}
@@ -193,6 +256,7 @@ export async function reviewAllMemories(options: {
         detail:
           "Full review stopped after applying changes; inspect before retrying.",
         changes,
+        ...(lastUnresolved ? { unresolved: lastUnresolved } : {}),
         review: progress(),
       };
     throw error;

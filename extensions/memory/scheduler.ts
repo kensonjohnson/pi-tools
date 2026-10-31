@@ -1,8 +1,10 @@
 import {
   chmodSync,
   closeSync,
+  lstatSync,
   mkdirSync,
   openSync,
+  realpathSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -16,8 +18,9 @@ import {
   unlink,
 } from "node:fs/promises";
 import Database from "better-sqlite3";
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { SessionReview } from "./session-review.ts";
-import type { MemoryReviewer } from "./reviewer.ts";
+import type { MemoryReviewer, ReviewResult } from "./reviewer.ts";
 import type { ReviewBatch, SessionBoundary } from "./session-review.ts";
 
 export type SchedulerStatus = {
@@ -47,10 +50,63 @@ export type SchedulerOutcome = {
     | "unsupported-session";
   detail?: string;
   changes?: Array<{ id: string; detail: string }>;
+  unresolved?: ReviewUnresolved;
   nextOffset?: number;
   fullSnapshot?: string;
   review?: ReviewProgress;
 };
+export type ReviewUnresolved = {
+  proposals: number;
+  targets: string[];
+  targetsOmitted: number;
+};
+
+/** Only host-known identifiers are retained, without model text or terminal controls. */
+export function reviewResultUnresolved(
+  result: ReviewResult,
+): ReviewUnresolved | undefined {
+  const proposals =
+    Number.isSafeInteger(result.unresolvedProposals) &&
+    result.unresolvedProposals! > 0
+      ? result.unresolvedProposals!
+      : 0;
+  const targets = [
+    ...new Set(
+      (result.unresolvedTargets ?? []).filter(
+        (id): id is string =>
+          typeof id === "string" && /^[A-Za-z0-9._:-]{1,100}$/.test(id),
+      ),
+    ),
+  ];
+  if (!proposals && !targets.length) return undefined;
+  return {
+    proposals,
+    targets: targets.slice(0, 12),
+    targetsOmitted: Math.max(0, targets.length - 12),
+  };
+}
+
+export function reviewResultChanges(
+  result: ReviewResult,
+): NonNullable<SchedulerOutcome["changes"]> {
+  const retainedDetail = (id?: string) =>
+    id && /^[A-Za-z0-9._:-]{1,100}$/.test(id)
+      ? `; retained memory ID: ${id}`
+      : "";
+  if (result.changes !== undefined)
+    return result.changes.map((change) => ({
+      id: change.memoryId,
+      detail: `${change.action} applied${retainedDetail(change.retainedMemoryId)}`,
+    }));
+  return result.status === "applied" && result.memoryId
+    ? [
+        {
+          id: result.memoryId,
+          detail: `${result.detail}${retainedDetail(result.retainedMemoryId)}`,
+        },
+      ]
+    : [];
+}
 /** Per-invocation counts, not a claim that memories were verified. */
 export type ReviewProgress = {
   pages: number;
@@ -72,6 +128,7 @@ export const REVIEW_GAP_REASONS = [
   "requests_truncated",
   "search_incomplete",
   "fragment_insufficient",
+  "candidates_truncated",
 ] as const;
 export type ReviewGapReason = (typeof REVIEW_GAP_REASONS)[number];
 export type SchedulerReportEvent = {
@@ -82,6 +139,7 @@ export type SchedulerReportEvent = {
   changes: Array<{ id: string; detail: string }>;
   changesTotal: number;
   changesOmitted: number;
+  unresolved?: ReviewUnresolved;
   review?: ReviewProgress;
 };
 declare const manualResumeBrand: unique symbol;
@@ -138,7 +196,54 @@ export function incrementalBatchKey(batch: ReviewBatch): string {
     )
     .digest("hex");
 }
+declare const projectReviewClaimBrand: unique symbol;
+/** Process-local proof that the scheduler still owns its project review claim. */
+export type ProjectReviewClaim = { readonly [projectReviewClaimBrand]: true };
+const activeProjectClaims = new WeakMap<
+  object,
+  {
+    project: string;
+    signal: AbortSignal;
+    claimPath: string;
+    dev: number;
+    ino: number;
+  }
+>();
+export function assertProjectReviewClaim(
+  claim: ProjectReviewClaim,
+  project: string,
+): void {
+  const entry = claim && activeProjectClaims.get(claim);
+  if (!entry) throw new Error("project review claim is not active");
+  entry.signal.throwIfAborted();
+  try {
+    const root = realpathSync(resolve(project));
+    const expected = join(
+      root,
+      CONFIG_DIR_NAME,
+      "memory",
+      ".runtime",
+      "review-scheduler",
+      "scheduler-claim.sqlite",
+    );
+    const info = lstatSync(entry.claimPath);
+    if (
+      realpathSync(entry.project) !== root ||
+      realpathSync(entry.claimPath) !== expected ||
+      !info.isFile() ||
+      info.isSymbolicLink() ||
+      info.nlink !== 1 ||
+      info.dev !== entry.dev ||
+      info.ino !== entry.ino
+    )
+      throw new Error("invalid claim");
+  } catch {
+    throw new Error("canonical project review claim is not active");
+  }
+  entry.signal.throwIfAborted();
+}
 export type ManualProgress = {
+  readonly claim: ProjectReviewClaim;
   current?: ManualCursor;
   resumePermit?: ManualResumePermit;
   advance(cursor: ManualCursor): void;
@@ -310,6 +415,10 @@ export class MemoryScheduler {
         this.db.exec(
           "ALTER TABLE review_events ADD COLUMN review_progress TEXT",
         );
+      if (!columns.some((column) => column.name === "unresolved_progress"))
+        this.db.exec(
+          "ALTER TABLE review_events ADD COLUMN unresolved_progress TEXT",
+        );
       this.db.exec(
         "CREATE TABLE IF NOT EXISTS directory_turn (path TEXT PRIMARY KEY, sequence INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS unresolved_generations (path TEXT PRIMARY KEY, generation INTEGER NOT NULL)",
       );
@@ -409,7 +518,7 @@ export class MemoryScheduler {
     }
     const rows = this.db
       .prepare(
-        "SELECT at,mode,status,detail,changes,changes_total,review_progress FROM review_events ORDER BY id DESC LIMIT 20",
+        "SELECT at,mode,status,detail,changes,changes_total,review_progress,unresolved_progress FROM review_events ORDER BY id DESC LIMIT 20",
       )
       .all() as Array<{
       at: number;
@@ -419,6 +528,7 @@ export class MemoryScheduler {
       changes: string;
       changes_total: number;
       review_progress: string | null;
+      unresolved_progress: string | null;
     }>;
     return {
       status: this.status(),
@@ -433,8 +543,16 @@ export class MemoryScheduler {
         } catch {
           /* Ignore malformed optional progress from old state. */
         }
+        let unresolved: ReviewUnresolved | undefined;
+        try {
+          if (row.unresolved_progress)
+            unresolved = JSON.parse(row.unresolved_progress);
+        } catch {
+          /* Ignore malformed optional progress from old state. */
+        }
         return {
           ...(review ? { review } : {}),
+          ...(unresolved ? { unresolved } : {}),
           at: row.at,
           mode: row.mode,
           status: row.status,
@@ -501,7 +619,7 @@ export class MemoryScheduler {
           });
     this.db
       .prepare(
-        "INSERT INTO review_events(at,mode,status,detail,changes,changes_total,review_progress) VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO review_events(at,mode,status,detail,changes,changes_total,review_progress,unresolved_progress) VALUES (?,?,?,?,?,?,?,?)",
       )
       .run(
         this.clock.now(),
@@ -511,6 +629,7 @@ export class MemoryScheduler {
         JSON.stringify(changes),
         (outcome.changes ?? []).length,
         review,
+        outcome.unresolved ? JSON.stringify(outcome.unresolved) : null,
       );
     this.db.exec(
       "DELETE FROM review_events WHERE id NOT IN (SELECT id FROM review_events ORDER BY id DESC LIMIT 20)",
@@ -754,7 +873,25 @@ export class MemoryScheduler {
       resumePermit = {} as ManualResumePermit;
       resumePermits.set(resumePermit, { ...currentCursor });
     }
+    this.controller = new AbortController();
+    const controller = this.controller;
+    const claimPermit = {} as ProjectReviewClaim;
+    try {
+      const info = lstatSync(this.claimPath);
+      activeProjectClaims.set(claimPermit, {
+        project: this.options.project,
+        signal: controller.signal,
+        claimPath: this.claimPath,
+        dev: info.dev,
+        ino: info.ino,
+      });
+    } catch {
+      this.controller = undefined;
+      this.release(claim);
+      throw new Error("project review claim is unavailable");
+    }
     const progress: ManualProgress = {
+      claim: claimPermit,
       current: currentCursor,
       resumePermit,
       advance: (cursor) => {
@@ -794,11 +931,9 @@ export class MemoryScheduler {
         if (resumePermit) resumePermits.delete(resumePermit);
       },
     };
-    this.controller = new AbortController();
     try {
       this.options.onStatus?.("manual-running");
     } catch {}
-    const controller = this.controller;
     const abort = () => controller.abort();
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) controller.abort();
@@ -845,6 +980,7 @@ export class MemoryScheduler {
         if (!this.closed) this.options.onStatus?.(outcome.status);
         return outcome;
       } finally {
+        activeProjectClaims.delete(claimPermit);
         if (resumePermit) resumePermits.delete(resumePermit);
         signal?.removeEventListener("abort", abort);
         this.controller = undefined;
@@ -1115,6 +1251,7 @@ export class MemoryScheduler {
           "background",
           this.detached
             ? {
+                ...outcome,
                 status: "uncertain",
                 detail: "Shutdown timed out while work was active.",
               }
@@ -1296,12 +1433,28 @@ export async function reviewProjectSessions(options: {
           }
           needsPermit = false;
           fragment = undefined;
-          if (result.status === "uncertain" || result.status === "unresolved")
-            return { status: result.status, detail: result.detail, changes };
-          if (result.status === "applied") {
+          const applied = reviewResultChanges(result);
+          changes.push(...applied);
+          if (
+            applied.length ||
+            result.status === "applied" ||
+            result.status === "uncertain"
+          )
             cursors.prepare("DELETE FROM cursors WHERE path=?").run(batch.path);
-            if (result.memoryId)
-              changes.push({ id: result.memoryId, detail: result.detail });
+          const unresolved = reviewResultUnresolved(result);
+          if (
+            result.status === "uncertain" ||
+            result.status === "unresolved" ||
+            unresolved
+          )
+            return {
+              status:
+                result.status === "uncertain" ? "uncertain" : "unresolved",
+              detail: result.detail,
+              changes,
+              ...(unresolved ? { unresolved } : {}),
+            };
+          if (result.status === "applied") {
             offset = undefined;
             fullSnapshot = undefined;
             continue;

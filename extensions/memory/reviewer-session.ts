@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
@@ -74,7 +75,12 @@ async function readSession(path: string) {
       id = entry.parentId;
     }
     pathEntries.reverse();
-    return { header, entries: entries as Entry[], pathEntries };
+    return {
+      header,
+      entries: entries as Entry[],
+      pathEntries,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+    };
   } finally {
     await fd.close();
   }
@@ -176,4 +182,70 @@ export async function validateSessionBatch(
       throw new Error("invalid fork provenance");
     path = parent as string | undefined;
   }
+}
+
+/** Capture every supported user/assistant message on a persisted active branch.
+ * Unlike an incremental ReviewBatch this never resumes a checkpoint or emits chunks. */
+export async function captureCompleteSessionBatch(
+  project: string,
+  path: string,
+): Promise<{ batch: ReviewBatch; fingerprint: string }> {
+  if (!isAbsolute(path)) throw new Error("invalid session path");
+  const sources: Array<{ path: string; sha256: string }> = [];
+  const seen = new Set<string>();
+  let next: string | undefined = path;
+  let child: Awaited<ReturnType<typeof readSession>> | undefined;
+  while (next !== undefined) {
+    if (!isAbsolute(next) || seen.has(next))
+      throw new Error("invalid or cyclic fork provenance");
+    seen.add(next);
+    const source = await readSession(next);
+    if (!child) child = source;
+    sources.push({ path: next, sha256: source.sha256 });
+    const parent: unknown = source.header.parentSession;
+    if (
+      parent !== undefined &&
+      (typeof parent !== "string" || !isAbsolute(parent))
+    )
+      throw new Error("invalid fork provenance");
+    next = parent as string | undefined;
+  }
+  if (!child) throw new Error("session unavailable");
+  const items: ReviewBatch["items"] = [];
+  for (const entry of child.pathEntries) {
+    if (entry.type !== "message") continue;
+    const role = entry.message?.role;
+    if (role === "user" || role === "assistant") {
+      const text = messageText(entry.message.content, role);
+      if (text) items.push({ id: entry.id, role, text });
+    } else if (
+      !["system", "toolResult", "custom", "bashExecution"].includes(role)
+    ) {
+      throw new Error("unsupported session message role");
+    }
+  }
+  const batch: ReviewBatch = {
+    path,
+    sessionId: child.header.id,
+    leaf: child.pathEntries.at(-1)?.id ?? null,
+    ...(child.header.parentSession === undefined
+      ? {}
+      : { parentSession: child.header.parentSession }),
+    items,
+    more: false,
+    acknowledge: () => {
+      throw new Error("read-only session batch cannot be acknowledged");
+    },
+  };
+  await validateSessionBatch(project, batch);
+  for (const source of sources) {
+    if ((await readSession(source.path)).sha256 !== source.sha256)
+      throw new Error("session source changed during capture");
+  }
+  return {
+    batch,
+    fingerprint: createHash("sha256")
+      .update(JSON.stringify(sources))
+      .digest("hex"),
+  };
 }

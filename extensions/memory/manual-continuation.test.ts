@@ -100,7 +100,7 @@ test("bounded manual continuation survives reload and /memory-review full contin
           provider: "p",
           id: "model",
           input: ["text"],
-          contextWindow: 1600,
+          contextWindow: 1700,
         }),
         getApiKeyAndHeaders: async () => ({ ok: true }),
         complete: async (_model: unknown, request: any) => {
@@ -108,13 +108,18 @@ test("bounded manual continuation survives reload and /memory-review full contin
           const selecting = request.systemPrompt.includes(
             "Select evidence requests",
           );
-          const text = selecting
-            ? decisions === 0
-              ? '{"paths":[]}'
-              : '{"paths":["evidence.txt"]}'
-            : ++decisions === 1
-              ? '{"action":"no_change","reason":"Evidence missing","evidenceSufficient":false}'
-              : '{"action":"no_change","reason":"Fixture review","evidenceSufficient":true}';
+          const comparing = request.systemPrompt.includes(
+            "Compare the supplied complete target memories",
+          );
+          const text = comparing
+            ? '{"action":"no_change","reason":"Compared.","evidenceSufficient":true}'
+            : selecting
+              ? decisions === 0
+                ? '{"paths":[]}'
+                : '{"paths":["evidence.txt"]}'
+              : ++decisions === 1
+                ? '{"action":"no_change","reason":"Evidence missing","evidenceSufficient":false}'
+                : '{"action":"no_change","reason":"Fixture review","evidenceSufficient":true}';
           return { stopReason: "stop", content: [{ type: "text", text }] };
         },
       },
@@ -185,7 +190,7 @@ test("bounded manual continuation survives reload and /memory-review full contin
     await b.commands.get("memory-review").handler("full", ctx);
     for (
       let i = 0;
-      i < 100 && !notices.some((x) => /review unresolved/i.test(x));
+      i < 2000 && !notices.some((x) => /review unresolved/i.test(x));
       i++
     )
       await new Promise((resolve) => setTimeout(resolve, 10));

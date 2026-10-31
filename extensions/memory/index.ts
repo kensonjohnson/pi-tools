@@ -32,10 +32,12 @@ import {
   persistSchedulerActivity,
   reviewProjectSessions,
   type SchedulerOptions,
+  type SchedulerOutcome,
   type SchedulerReport,
 } from "./scheduler.ts";
 import {
   createConfiguredPiMemoryReviewer,
+  type MemoryReviewer,
   type ReviewerStore,
 } from "./reviewer.ts";
 import { reviewAllMemories } from "./manual-review.ts";
@@ -132,15 +134,19 @@ function isRememberResultDetails(
   );
 }
 
+type ReviewDispatchState = { count: number };
+
 export function createTrackedReviewStore(
   manager: MemoryManager,
   changes: Array<{ id: string; detail: string }>,
+  dispatch?: ReviewDispatchState,
 ): ReviewerStore {
   const text = (content: string) =>
     content.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 120);
   return {
     captureAddPrecondition: () => manager.captureAddPrecondition(),
     remember: async (...args) => {
+      if (dispatch) dispatch.count++;
       const result = await manager.remember(...args);
       if (result.created)
         changes.push({
@@ -150,6 +156,7 @@ export function createTrackedReviewStore(
       return result;
     },
     update: async (...args) => {
+      if (dispatch) dispatch.count++;
       const result = await manager.update(...args);
       if (result)
         changes.push({
@@ -159,6 +166,7 @@ export function createTrackedReviewStore(
       return result;
     },
     forget: async (...args) => {
+      if (dispatch) dispatch.count++;
       const result = await manager.forget(...args);
       if (result)
         changes.push({
@@ -167,7 +175,18 @@ export function createTrackedReviewStore(
         });
       return result;
     },
+    forgetWithSnapshot: async (...args) => {
+      if (dispatch) dispatch.count++;
+      const result = await manager.forgetWithSnapshot(...args);
+      if (result)
+        changes.push({
+          id: result.id,
+          detail: `Removed [${result.category}]: ${text(result.content)}`,
+        });
+      return result;
+    },
     move: async (...args) => {
+      if (dispatch) dispatch.count++;
       const result = await manager.move(...args);
       changes.push({
         id: result.id,
@@ -176,6 +195,63 @@ export function createTrackedReviewStore(
       return result;
     },
   };
+}
+
+// Store calls record confirmed writes even if review later fails. Only a returned
+// review result can identify the retained source of a semantic removal.
+export function trackReviewResults(
+  reviewer: MemoryReviewer,
+  changes: Array<{ id: string; detail: string }>,
+  dispatch?: ReviewDispatchState,
+): MemoryReviewer {
+  const review = reviewer.review.bind(reviewer);
+  reviewer.review = async (...args) => {
+    const before = dispatch?.count;
+    let result: Awaited<ReturnType<MemoryReviewer["review"]>>;
+    try {
+      result = await review(...args);
+    } catch (error) {
+      if (
+        dispatch &&
+        dispatch.count === before &&
+        !args[0]?.signal?.aborted &&
+        error instanceof Error &&
+        error.message === "unknown memory target"
+      )
+        return {
+          status: "unresolved",
+          detail:
+            "A proposed memory target is not present in this review page.",
+          acknowledged: false,
+        };
+      throw error;
+    }
+    const confirmed =
+      result.changes ??
+      (result.memoryId && result.retainedMemoryId
+        ? [
+            {
+              memoryId: result.memoryId,
+              retainedMemoryId: result.retainedMemoryId,
+            },
+          ]
+        : []);
+    for (const change of confirmed) {
+      const retained = change.retainedMemoryId;
+      if (!retained || !/^[A-Za-z0-9._:-]{1,100}$/.test(retained)) continue;
+      const tracked = changes.findLast(
+        (item) =>
+          item.id === change.memoryId && item.detail.startsWith("Removed ["),
+      );
+      if (tracked && !tracked.detail.includes(" (retained memory ID: "))
+        tracked.detail = tracked.detail.replace(
+          "]: ",
+          `] (retained memory ID: ${retained}): `,
+        );
+    }
+    return result;
+  };
+  return reviewer;
 }
 
 // These fixed messages contain no provider response, path, or project data.
@@ -297,6 +373,8 @@ function safeReviewDetail(detail: unknown): string {
 
 const SAFE_REVIEW_OUTCOME_DETAILS = new Set([
   "Insufficient evidence for this memory page; inspect evidence gaps.",
+  "Review made changes but remains unresolved; inspect the report before retrying.",
+  "Full traversal finished with changes; inspect the changes and remaining evidence gaps.",
   "Full review traversal finished with insufficient or unknown evidence; retry the full review.",
   "Review found an unresolved evidence or authority conflict; inspect before resuming.",
   "Incremental review has insufficient evidence; batch remains unacknowledged for retry.",
@@ -348,6 +426,28 @@ function displayUnresolvedDetail(detail: string): string {
       "Review found an unresolved evidence or authority conflict; inspect the report before retrying."
     ? detail
     : "Unresolved review. Details are unavailable or hidden; inspect the report before retrying.";
+}
+
+function formatUnresolvedReview(
+  unresolved: NonNullable<SchedulerOutcome["unresolved"]>,
+): string {
+  const count =
+    Number.isSafeInteger(unresolved.proposals) && unresolved.proposals >= 0
+      ? unresolved.proposals
+      : 0;
+  const targets = Array.isArray(unresolved.targets)
+    ? unresolved.targets
+        .filter(
+          (id) => typeof id === "string" && /^[A-Za-z0-9._:-]{1,100}$/.test(id),
+        )
+        .slice(0, 12)
+    : [];
+  const omitted =
+    Number.isSafeInteger(unresolved.targetsOmitted) &&
+    unresolved.targetsOmitted > 0
+      ? unresolved.targetsOmitted
+      : 0;
+  return `${count} unresolved proposal(s)${targets.length ? `; target IDs: ${targets.join(", ")}` : ""}${omitted ? `; ${omitted} target ID(s) omitted` : ""}.`;
 }
 
 function formatReviewDiagnostics(
@@ -416,7 +516,7 @@ export function formatReviewStatus(
     );
   else if (s.paused)
     lines.push(
-      "Next: Inspect the latest outcome before using /memory-review resume. To continue a full review, use /memory-review full after resuming.",
+      "Next: Inspect the latest outcome before using /memory-review resume; retry the same review mode explicitly.",
     );
   else if (s.inflight)
     lines.push("Next: Review is running. Check status again after it settles.");
@@ -471,6 +571,8 @@ export function formatReviewStatus(
       if (diagnostics) lines.push(`  ${diagnostics}.`);
     } else if (event.changesTotal)
       lines.push(`  Changes: ${event.changesTotal}`);
+    if (event.unresolved)
+      lines.push(`  ${formatUnresolvedReview(event.unresolved)}`);
     for (const change of event.changes)
       lines.push(
         `  - ${safeChangeText(change.detail) || "Change recorded (no description)"}`,
@@ -749,10 +851,15 @@ export default function (pi: ExtensionAPI) {
                 progress.clear();
               }
               runSignal.throwIfAborted();
-              const reviewer = await createConfiguredPiMemoryReviewer(
-                ctx,
-                createTrackedReviewStore(manager, changes),
-                repairDetail ? undefined : progress.resumePermit,
+              const dispatch = { count: 0 };
+              const reviewer = trackReviewResults(
+                await createConfiguredPiMemoryReviewer(
+                  ctx,
+                  createTrackedReviewStore(manager, changes, dispatch),
+                  repairDetail ? undefined : progress.resumePermit,
+                ),
+                changes,
+                dispatch,
               );
               const outcome = await reviewAllMemories({
                 reviewer,
@@ -805,7 +912,7 @@ export default function (pi: ExtensionAPI) {
           safeResult.status === "unresolved"
             ? " Run /memory-review full again to retry; evidence gaps or conflicts may remain."
             : "";
-        const text = `Full memory review ${safeResult.status}: ${detail}${retry}${summary}${diagnostics ? ` ${diagnostics}.` : ""}${repair ? ` ${repair.detail}` : ""}${safeResult.nextOffset === undefined ? "" : ` Progress saved at offset ${safeResult.nextOffset}; run /memory-review full to continue.`}`;
+        const text = `Full memory review ${safeResult.status}: ${detail}${retry}${summary}${diagnostics ? ` ${diagnostics}.` : ""}${safeResult.unresolved ? ` ${formatUnresolvedReview(safeResult.unresolved)}` : ""}${repair ? ` ${repair.detail}` : ""}${safeResult.nextOffset === undefined ? "" : ` Progress saved at offset ${safeResult.nextOffset}; run /memory-review full to continue.`}`;
         return textResult(text, { action, result: safeResult });
       }
       const settings = await getRuntimeSettings(ctx, CONFIG_DIR_NAME);
@@ -1073,9 +1180,14 @@ export default function (pi: ExtensionAPI) {
                 "The explicitly opened session filename is not JSONL; activity remains pending.",
               ...(changes.length ? { changes } : {}),
             };
-          const reviewer = await createConfiguredPiMemoryReviewer(
-            ctx,
-            createTrackedReviewStore(manager, changes),
+          const dispatch = { count: 0 };
+          const reviewer = trackReviewResults(
+            await createConfiguredPiMemoryReviewer(
+              ctx,
+              createTrackedReviewStore(manager, changes, dispatch),
+            ),
+            changes,
+            dispatch,
           );
           const outcome = await reviewProjectSessions({
             project: ctx.cwd,
@@ -1427,7 +1539,7 @@ export default function (pi: ExtensionAPI) {
     name: "memory_init",
     label: "Memory Init",
     description:
-      "Bootstrap .pi/memory NDJSON files, then build the local search index. Optionally seed initial knowledge/practices, or force-rebuild the index from the NDJSON source of truth.",
+      "Bootstrap .pi/memory NDJSON files, then build the local search index. Malformed lines are preserved; use memory_repair to remove them. Optionally seed initial knowledge/practices, or force-rebuild the index from the NDJSON source of truth.",
     parameters: Type.Object({
       seed: Type.Optional(
         Type.Boolean({
@@ -1456,12 +1568,8 @@ export default function (pi: ExtensionAPI) {
         ? ` created ${result.createdMemories}, skipped ${result.skippedMemories},`
         : "";
       const forceText = params.force ? " (rebuilt index)" : "";
-      const recoveryText =
-        result.recoveredLines > 0
-          ? ` Removed ${result.recoveredLines} malformed NDJSON line${result.recoveredLines === 1 ? "" : "s"}.`
-          : "";
       return textResult(
-        `Initialized memory${forceText}.${seedText}${recoveryText} Semantic ${result.semanticEnabled ? "enabled" : "fallback-only"}.`,
+        `Initialized memory${forceText}.${seedText} Semantic ${result.semanticEnabled ? "enabled" : "fallback-only"}.`,
         result,
       );
     },

@@ -102,7 +102,9 @@ test("ambiguous provider, length and rate-limit failures are not typed as contex
   await assert.rejects(
     model.generate({ instruction: "test", data: {} }),
     (error: any) =>
-      error === rate && !(error instanceof ReviewerContextOverflowError),
+      error instanceof Error &&
+      error.message === "review model provider request failed" &&
+      !(error instanceof ReviewerContextOverflowError),
   );
 });
 

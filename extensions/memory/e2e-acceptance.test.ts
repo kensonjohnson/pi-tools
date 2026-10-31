@@ -164,6 +164,12 @@ test(
         generate: async ({ instruction: prompt, data }: any) => {
           generated++;
           if (prompt.startsWith("Select")) return { paths: ["browser.txt"] };
+          if (prompt.startsWith("Independently classify"))
+            return {
+              authority: "fact",
+              noInstructionOrPreference: true,
+              reason: "Descriptive fact.",
+            };
           if (prompt.startsWith("Independently"))
             return {
               verdict: "supported",

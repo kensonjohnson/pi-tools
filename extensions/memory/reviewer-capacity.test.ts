@@ -59,7 +59,7 @@ test("capacity pages retain whole records and oversized records remain unchanged
     const reviewer = new MemoryReviewer({
       project: cwd,
       store,
-      contextWindow: 1100,
+      contextWindow: 1200,
       model: {
         generate: async ({ instruction }: any) =>
           instruction.startsWith("Select")
@@ -85,7 +85,7 @@ test("capacity pages retain whole records and oversized records remain unchanged
     const limited = new MemoryReviewer({
       project: cwd,
       store,
-      contextWindow: 1100,
+      contextWindow: 1200,
       model: {
         generate: async ({ instruction, data }: any) => {
           if (instruction.startsWith("Select")) {
@@ -143,3 +143,153 @@ test("accepts long proposed content and reasons with complete cited evidence", (
     assert.equal((await reviewer.review()).status, "applied");
     assert.equal((await store.list()).memories[0].content, content);
   }));
+
+test("all memory, session, metadata and evidence page combinations are reviewed before acknowledgement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "review-fragment-product-"));
+  const store = new MemoryManager(root, { semanticEnabled: false });
+  try {
+    await store.init();
+    await store.remember("knowledge", "memory ".repeat(2000).trim());
+    await writeFile(join(root, "source.txt"), "evidence ".repeat(1600));
+    const query = "absent-query".repeat(900);
+    let ack = 0;
+    const batch: any = {
+      path: "/fake",
+      sessionId: "s",
+      leaf: "u",
+      items: [{ id: "u", role: "user", text: "session ".repeat(2000) }],
+      more: false,
+      acknowledge: () => ack++,
+    };
+    const combinations = new Set<string>();
+    let expected = 0;
+    const reviewer = new MemoryReviewer({
+      project: root,
+      store,
+      contextWindow: 2600,
+      validateSession: async () => {},
+      model: {
+        generate: async ({ instruction, data }: any) => {
+          if (instruction.startsWith("Select"))
+            return { paths: ["source.txt"], search: [query] };
+          expected =
+            data.memoryPages *
+            data.sessionPages *
+            data.metadataPages *
+            data.evidencePages;
+          const key = [
+            data.memoryPage,
+            data.sessionPage,
+            data.metadataPage,
+            data.evidencePage,
+          ].join("/");
+          assert.ok(!combinations.has(key));
+          combinations.add(key);
+          assert.ok(JSON.stringify(data).length < 10400);
+          return {
+            action: "no_change",
+            reason: "Reviewed page.",
+            evidenceSufficient: combinations.size !== 1,
+          };
+        },
+      },
+    });
+    const result = await reviewer.review({ batch });
+    assert.ok(expected > 1, JSON.stringify(result));
+    assert.equal(combinations.size, expected);
+    assert.equal(result.status, "unresolved");
+    assert.equal(ack, 0);
+  } finally {
+    await store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("oversized search query metadata is disclosed in all context-fitting pages", async () => {
+  const root = await mkdtemp(join(tmpdir(), "review-metadata-pages-"));
+  const store = new MemoryManager(root, { semanticEnabled: false });
+  try {
+    await store.init();
+    await writeFile(join(root, "source.txt"), "other");
+    const query = "long-query".repeat(4000);
+    const chunks: string[] = [];
+    const reviewer = new MemoryReviewer({
+      project: root,
+      store,
+      contextWindow: 3000,
+      model: {
+        generate: async ({ instruction, data }: any) => {
+          if (instruction.startsWith("Select"))
+            return { paths: [], search: [query] };
+          assert.equal(data.metadataFragmented, true);
+          assert.ok(JSON.stringify(data).length < 12000);
+          chunks.push(data.searches[0].query);
+          return {
+            action: "no_change",
+            reason: "Reviewed.",
+            evidenceSufficient: true,
+          };
+        },
+      },
+    });
+    const result = await reviewer.review();
+    assert.equal(result.status, "unchanged");
+    assert.ok(chunks.length > 1);
+    assert.equal(chunks.join(""), query);
+  } finally {
+    await store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reviewer traverses all discovery and search pages and presents every match", async () => {
+  const root = await mkdtemp(join(tmpdir(), "review-pages-"));
+  const store = new MemoryManager(root, { semanticEnabled: false });
+  try {
+    await store.init();
+    const count = 4105;
+    for (let start = 0; start < count; start += 100) {
+      await Promise.all(
+        Array.from({ length: Math.min(100, count - start) }, (_, n) => {
+          const i = start + n;
+          return writeFile(
+            join(root, `source-${String(i).padStart(4, "0")}.txt`),
+            i >= count - 40 ? "needle " + "x".repeat(1000) : "other",
+          );
+        }),
+      );
+    }
+    const inventory = new Set<string>();
+    const matches = new Set<string>();
+    let pages = 0;
+    const reviewer = new MemoryReviewer({
+      project: root,
+      store,
+      contextWindow: 4000,
+      model: {
+        generate: async ({ instruction, data }: any) => {
+          if (instruction.startsWith("Select")) {
+            for (const path of data.repositoryPaths) inventory.add(path);
+            return { paths: [], search: ["needle"] };
+          }
+          pages++;
+          for (const file of data.files) matches.add(file.path);
+          return {
+            action: "no_change",
+            reason: "Reviewed.",
+            evidenceSufficient: true,
+          };
+        },
+      },
+    });
+    const result = await reviewer.review();
+    assert.equal(inventory.size, count);
+    assert.equal(matches.size, 40);
+    assert.ok(pages > 1);
+    assert.equal(result.status, "unchanged");
+    assert.equal(result.audit?.coverage, "limited");
+  } finally {
+    await store.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -63,7 +63,7 @@ test("incremental pages survive reviewer and process-style restarts, and stale s
       const reviewer = new MemoryReviewer({
         project: root,
         store,
-        contextWindow: 1500,
+        contextWindow: 1600,
         model: {
           generate: async ({ instruction, data }: any) => {
             if (instruction.startsWith("Select")) {
@@ -143,7 +143,7 @@ test("appends during paged review retain the original session boundary", async (
       const reviewer = new MemoryReviewer({
         project: root,
         store,
-        contextWindow: 1500,
+        contextWindow: 1600,
         model: {
           generate: async ({ instruction, data }: any) => {
             if (instruction.startsWith("Select")) {
@@ -348,7 +348,7 @@ test("incremental cursor resumes across independent processes", async () => {
     const core = new URL("./core.ts", import.meta.url).href;
     const reviewer = new URL("./reviewer.ts", import.meta.url).href;
     const scheduler = new URL("./scheduler.ts", import.meta.url).href;
-    const script = `import { MemoryManager } from ${JSON.stringify(core)}; import { MemoryReviewer } from ${JSON.stringify(reviewer)}; import { reviewProjectSessions } from ${JSON.stringify(scheduler)}; const [root,dir,checkpoint]=process.argv.slice(1); const store=new MemoryManager(root,{semanticEnabled:false}); const r=new MemoryReviewer({project:root,store,contextWindow:1500,model:{generate:async({instruction})=>instruction.startsWith('Select')?{paths:[]}:{action:'no_change',evidenceSufficient:true,reason:'Session reviewed.'}}}); const out=await reviewProjectSessions({project:root,sessionDir:dir,checkpointFile:checkpoint,reviewer:r,signal:new AbortController().signal}); console.log(out.status); await store.close();`;
+    const script = `import { MemoryManager } from ${JSON.stringify(core)}; import { MemoryReviewer } from ${JSON.stringify(reviewer)}; import { reviewProjectSessions } from ${JSON.stringify(scheduler)}; const [root,dir,checkpoint]=process.argv.slice(1); const store=new MemoryManager(root,{semanticEnabled:false}); const r=new MemoryReviewer({project:root,store,contextWindow:1600,model:{generate:async({instruction})=>instruction.startsWith('Select')?{paths:[]}:{action:'no_change',evidenceSufficient:true,reason:'Session reviewed.'}}}); const out=await reviewProjectSessions({project:root,sessionDir:dir,checkpointFile:checkpoint,reviewer:r,signal:new AbortController().signal}); console.log(out.status); await store.close();`;
     const run = () =>
       spawnSync(
         process.execPath,

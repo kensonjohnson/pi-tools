@@ -59,6 +59,11 @@ test("multiple valid fragment proposals apply one at a time across reviewer rest
           model: {
             generate: async ({ instruction, data }: any) => {
               if (instruction.startsWith("Select")) return { paths: [] };
+              if (instruction.startsWith("Independently compare"))
+                return {
+                  verdict: "no_conflict",
+                  reason: "No contrary evidence.",
+                };
               if (instruction.startsWith("Independently")) {
                 assessments++;
                 return { verdict: "supported", reason: "Direct statement." };

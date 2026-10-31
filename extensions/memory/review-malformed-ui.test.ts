@@ -120,18 +120,14 @@ test("malformed model diagnostics are shown in tool, status and command without 
       await new Promise((resolve) => setTimeout(resolve, 10));
     assert.ok(notices.at(-1)?.includes(diagnostic));
 
-    for (const [value, expected] of [
-      ["malformed reviewer response", "required schema"],
-      ["evidence byte limit reached", "Evidence byte limit reached"],
-      [
-        "review snapshot changed or is missing; restart at zero",
-        "Restart the full review from zero",
-      ],
-      [
-        "review model must be explicitly configured as provider/model",
-        "Configure the reviewer model as provider/model",
-      ],
+    // Provider-thrown text cannot impersonate internal reviewer diagnostics.
+    for (const value of [
+      "malformed reviewer response",
+      "evidence byte limit reached",
+      "review snapshot changed or is missing; restart at zero",
+      "review model must be explicitly configured as provider/model",
     ]) {
+      const expected = "Check the reviewer model configuration";
       injected = value;
       const result = await tool.execute(
         "",

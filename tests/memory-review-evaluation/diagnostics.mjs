@@ -20,12 +20,26 @@ const numbers = [
 const stages = [
   "evidence_selection",
   "assessment",
+  "semantic_assessment",
+  "evidence_crosscheck",
   "comparison",
   "decision",
   "other",
 ];
+const verdicts = [
+  "supported",
+  "unsupported",
+  "uncertain",
+  "irrelevant",
+  "no_conflict",
+  "needs_context",
+];
 const safeCount = (n) => Number.isSafeInteger(n) && n >= 0 && n <= 1000000;
 const detailCodes = new Map([
+  [
+    "A proposed memory target is not present in this review page.",
+    "unknown_target_before_dispatch",
+  ],
   [
     "Multiple proposals require a complete joint assessment; nothing was changed.",
     "multiple_proposals_need_joint_assessment",
@@ -101,13 +115,17 @@ export function summarize(request, value, failed = false) {
     typeof request?.instruction === "string" ? request.instruction : "";
   const stage = instruction.startsWith("Select")
     ? "evidence_selection"
-    : instruction.startsWith("Independently")
-      ? "assessment"
-      : instruction.startsWith("Compare")
-        ? "comparison"
-        : instruction.includes('Return JSON {"proposals"')
-          ? "decision"
-          : "other";
+    : instruction.startsWith("Independently compare this evidence fragment")
+      ? "evidence_crosscheck"
+      : instruction.startsWith("Independently assess whether removing")
+        ? "semantic_assessment"
+        : instruction.startsWith("Independently")
+          ? "assessment"
+          : instruction.startsWith("Compare")
+            ? "comparison"
+            : instruction.includes('Return JSON {"proposals"')
+              ? "decision"
+              : "other";
   const entry = { stage, outcome: failed ? "error" : "response" };
   const data = request?.data;
   if (data && typeof data === "object") {
@@ -179,8 +197,10 @@ export function summarize(request, value, failed = false) {
     if (proposals.length > 10000) entry.proposalsTruncated = true;
   }
   if (
-    stage === "assessment" &&
-    ["supported", "unsupported", "uncertain"].includes(value.verdict)
+    ["assessment", "semantic_assessment", "evidence_crosscheck"].includes(
+      stage,
+    ) &&
+    verdicts.includes(value.verdict)
   )
     entry.verdict = value.verdict;
   return entry;
@@ -242,8 +262,7 @@ export function sanitizeDiagnostics(value) {
         );
     }
     if (item.proposalsTruncated === true) out.proposalsTruncated = true;
-    if (["supported", "unsupported", "uncertain"].includes(item.verdict))
-      out.verdict = item.verdict;
+    if (verdicts.includes(item.verdict)) out.verdict = item.verdict;
     entries.push(out);
   }
   const result = {
@@ -253,6 +272,26 @@ export function sanitizeDiagnostics(value) {
       value.omitted + Math.max(0, value.entries.length - 200),
     ),
   };
+  if (value.stageTotals && typeof value.stageTotals === "object") {
+    result.stageTotals = {};
+    for (const stage of stages) {
+      const item = value.stageTotals[stage];
+      if (
+        item &&
+        safeCount(item.attempts) &&
+        safeCount(item.errors) &&
+        item.errors <= item.attempts &&
+        Number.isSafeInteger(item.elapsedMs) &&
+        item.elapsedMs >= 0 &&
+        item.elapsedMs <= 1000000000
+      )
+        result.stageTotals[stage] = {
+          attempts: item.attempts,
+          errors: item.errors,
+          elapsedMs: item.elapsedMs,
+        };
+    }
+  }
   if (Array.isArray(value.reviewOutcomes)) {
     const validCodes = new Set([...detailCodes.values(), "other"]);
     result.reviewOutcomes = value.reviewOutcomes
