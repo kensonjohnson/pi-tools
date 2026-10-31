@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import extension from "./index.ts";
 
-test("disabled history and unset models never trigger provider access", async () => {
+test("session lifecycle never dispatches background review or tracks activity", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "scheduler-index-"));
   const agent = await mkdtemp(join(tmpdir(), "scheduler-agent-"));
   const old = process.env.PI_CODING_AGENT_DIR;
@@ -41,6 +41,18 @@ test("disabled history and unset models never trigger provider access", async ()
       },
       {
         values: {},
+        trusted: true,
+        worker: false,
+      },
+      {
+        values: {
+          historyReview: {
+            enabled: true,
+            debounceSeconds: 0,
+            cooldownSeconds: 0,
+          },
+          models: { reviewer: "p/model" },
+        },
         trusted: true,
         worker: false,
       },
@@ -89,11 +101,17 @@ test("disabled history and unset models never trigger provider access", async ()
       };
       extension(pi);
       await handlers.get("session_start")!({}, ctx);
-      handlers.get("agent_settled")!({}, ctx);
+      await handlers.get("agent_settled")!({}, ctx);
       await new Promise((resolve) => setTimeout(resolve, 10));
       await handlers.get("session_shutdown")!({}, ctx);
     }
     assert.equal(calls, 0);
+    await assert.rejects(
+      import("node:fs/promises").then(({ access }) =>
+        access(join(cwd, ".pi", "memory", ".runtime", "review-scheduler")),
+      ),
+      { code: "ENOENT" },
+    );
   } finally {
     if (old === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = old;

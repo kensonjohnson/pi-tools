@@ -73,20 +73,17 @@ for (const hasUI of [true, false]) {
       assert.equal(warnings.length, 1);
       assert.match(warnings[0], /Duplicate memory IDs: same-id/);
       assert.match(warnings[0], /knowledge\.ndjson:1/);
-      assert.match(warnings[0], /\/memory-review full to repair/);
-      assert.match(warnings[0], /Configured background review also repairs/);
-      assert.doesNotMatch(warnings[0], /manually/);
+      assert.match(warnings[0], /resolve duplicate IDs explicitly/);
+      assert.doesNotMatch(warnings[0], /background review/);
       const recall = await tools
         .get("memory_recall")
         .execute("", { query: "not-present" }, undefined, undefined, ctx);
       assert.match(recall.content[0].text, /Duplicate memory id same-id/);
-      assert.match(recall.content[0].text, /\/memory-review full to repair/);
-      assert.doesNotMatch(recall.content[0].text, /manually/);
+      assert.match(recall.content[0].text, /resolve duplicate IDs explicitly/);
       assert.match(
         recall.details.warnings[0].message,
-        /Configured background review also repairs/,
+        /resolve duplicate IDs explicitly/,
       );
-      assert.doesNotMatch(recall.details.warnings[0].message, /manually/);
       assert.match(recall.content[0].text, /Search mode: grep/);
       assert.match(
         recall.content[0].text,
