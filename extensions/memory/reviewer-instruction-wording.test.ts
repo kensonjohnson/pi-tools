@@ -42,6 +42,12 @@ for (const [index, content] of instructions.entries())
             generate: async ({ instruction, data }: any) => {
               if (instruction.startsWith("Select"))
                 return { paths: ["source.txt"] };
+              if (instruction.includes("Independently review duplicate"))
+                return {
+                  action: "no_change",
+                  reason: "No duplicates.",
+                  evidenceSufficient: true,
+                };
               if (instruction.startsWith("Independently")) {
                 assessments++;
                 return { verdict: "supported", reason: "Supported." };
@@ -81,6 +87,12 @@ test("ordinary stale facts remain eligible for source-supported updates", () =>
         generate: async ({ instruction, data }: any) => {
           if (instruction.startsWith("Select"))
             return { paths: ["source.txt"] };
+          if (instruction.includes("Independently review duplicate"))
+            return {
+              action: "no_change",
+              reason: "No duplicates.",
+              evidenceSufficient: true,
+            };
           if (instruction.startsWith("Independently classify"))
             return {
               authority: "fact",
@@ -134,6 +146,12 @@ test("later direct instruction can supersede a matched polite instruction", () =
       model: {
         generate: async ({ instruction }: any) => {
           if (instruction.startsWith("Select")) return { paths: [] };
+          if (instruction.includes("Independently review duplicate"))
+            return {
+              action: "no_change",
+              reason: "No duplicates.",
+              evidenceSufficient: true,
+            };
           if (instruction.startsWith("Independently"))
             return {
               verdict: "supported",

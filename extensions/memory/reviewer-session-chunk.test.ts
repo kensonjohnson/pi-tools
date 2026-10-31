@@ -36,6 +36,12 @@ for (const action of ["no_change", "add"] as const)
         model: {
           generate: async ({ instruction, data }: any) => {
             if (instruction.startsWith("Select")) return { paths: [] };
+            if (instruction.includes("Independently review duplicate"))
+              return {
+                action: "no_change",
+                reason: "Reviewed.",
+                evidenceSufficient: true,
+              };
             if (instruction.startsWith("Independently compare"))
               return {
                 verdict: "no_conflict",
@@ -136,6 +142,12 @@ for (const mode of [
         model: {
           generate: async ({ instruction, data }: any) => {
             if (instruction.startsWith("Select")) return { paths: [] };
+            if (instruction.includes("Independently review duplicate"))
+              return {
+                action: "no_change",
+                reason: "Reviewed.",
+                evidenceSufficient: true,
+              };
             if (instruction.startsWith("Independently compare"))
               return {
                 verdict: "no_conflict",
@@ -219,6 +231,12 @@ test("oversized session messages are reviewed in disclosed pages before acknowle
             selected.push(data.session[0].text);
             return { paths: [] };
           }
+          if (instruction.includes("Independently review duplicate"))
+            return {
+              action: "no_change",
+              reason: "Reviewed.",
+              evidenceSufficient: true,
+            };
           assert.equal(data.sessionFragmented, true);
           assert.equal(data.session[0].text.isWellFormed(), true);
           reviewed.push(data.session[0].text);

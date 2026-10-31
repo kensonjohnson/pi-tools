@@ -38,6 +38,12 @@ function reviewer(
     model: {
       generate: async ({ instruction, data }: any) => {
         if (instruction.startsWith("Select")) return { paths: ["source.txt"] };
+        if (instruction.includes("Independently review duplicate"))
+          return {
+            action: "no_change",
+            reason: "No duplicates.",
+            evidenceSufficient: true,
+          };
         if (instruction.startsWith("Independently classify"))
           return {
             authority: "fact",
@@ -99,6 +105,12 @@ test("batch adds multiple independent facts using refreshed snapshots", () =>
         generate: async ({ instruction, data }: any) => {
           if (instruction.startsWith("Select"))
             return { paths: ["source.txt"] };
+          if (instruction.includes("Independently review duplicate"))
+            return {
+              action: "no_change",
+              reason: "No duplicates.",
+              evidenceSufficient: true,
+            };
           if (instruction.startsWith("Independently"))
             return { verdict: "supported", reason: "Source." };
           return {
@@ -176,12 +188,10 @@ test("an intervening edit stops the batch without overwriting it", () =>
 
 test("dependent proposals are rejected before writes", () =>
   fixture(async (root, store, ids) => {
-    await assert.rejects(
-      reviewer(root, store, ids, (p) => {
-        p[1].id = p[0].id;
-      }).review(),
-      /dependent reviewer proposals/,
-    );
+    const result = await reviewer(root, store, ids, (p) => {
+      p[1].id = p[0].id;
+    }).review();
+    assert.equal(result.status, "unresolved");
     assert.deepEqual(
       (await store.list()).memories.map((m) => m.content).sort(),
       ["Alpha is old.", "Beta is old."],

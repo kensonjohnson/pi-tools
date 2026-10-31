@@ -33,6 +33,8 @@ test("uncertain partial-session mutation is not automatically replayed or acknow
         .join("\n") + "\n",
     );
     let writes = 0;
+    let factPasses = 0;
+    let duplicatePasses = 0;
     const wrapped = {
       captureAddPrecondition: store.captureAddPrecondition.bind(store),
       update: store.update.bind(store),
@@ -52,7 +54,16 @@ test("uncertain partial-session mutation is not automatically replayed or acknow
       model: {
         generate: async ({ instruction, data }: any) => {
           if (instruction.startsWith("Select")) return { paths: [] };
-          if (instruction.startsWith("Independently"))
+          if (instruction.includes("Independently review duplicate")) {
+            duplicatePasses++;
+            return {
+              action: "no_change",
+              evidenceSufficient: true,
+              reason: "No duplicates.",
+            };
+          }
+          if (instruction.includes("Review factual corrections")) factPasses++;
+          else if (instruction.startsWith("Independently"))
             return { verdict: "supported", reason: "Direct statement." };
           const item = data.session.find((s: any) =>
             s.text.includes("Use Oak protocol."),
@@ -82,6 +93,8 @@ test("uncertain partial-session mutation is not automatically replayed or acknow
     });
     assert.equal(result.status, "uncertain");
     assert.equal(writes, 1);
+    assert.ok(factPasses > 0);
+    assert.equal(duplicatePasses, factPasses);
     assert.equal((await store.list()).memories.length, 1);
     await assert.rejects(access(checkpointFile));
   } finally {

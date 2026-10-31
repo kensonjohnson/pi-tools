@@ -51,6 +51,12 @@ test("active branch replacement before apply rejects stale session evidence", as
       model: {
         generate: async ({ instruction }) => {
           if (instruction.startsWith("Select")) return { paths: [] };
+          if (instruction.includes("Independently review duplicate"))
+            return {
+              action: "no_change",
+              reason: "No duplicates.",
+              evidenceSufficient: true,
+            };
           if (instruction.startsWith("Independently"))
             return {
               verdict: "supported",

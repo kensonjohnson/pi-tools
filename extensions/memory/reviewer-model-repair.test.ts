@@ -166,7 +166,9 @@ test("repaired JSON still undergoes reviewer schema validation before a write", 
             ? '{"paths":[]}'
             : calls === 2
               ? '{"action":"update",}'
-              : '{"action":"update"}',
+              : calls === 3
+                ? '{"action":"update"}'
+                : '{"action":"no_change","reason":"Reviewed.","evidenceSufficient":true}',
         ),
     };
     const update = store.update.bind(store);
@@ -181,8 +183,9 @@ test("repaired JSON still undergoes reviewer schema validation before a write", 
     });
     const result = await reviewer.review();
     assert.equal(result.status, "unresolved");
-    assert.match(result.detail, /Malformed/);
-    assert.equal(calls, 3);
+    assert.match(result.detail, /malformed/i);
+    assert.equal(result.acknowledged, false);
+    assert.equal(calls, 4);
     assert.equal(writes, 0);
   } finally {
     await store.close();
@@ -211,6 +214,12 @@ test("a reviewer disables repair for later assessments after its first write", a
         generate: async ({ instruction, data, allowRepair }: any) => {
           if (instruction.startsWith("Select"))
             return { paths: ["source.txt"] };
+          if (instruction.includes("Independently review duplicate"))
+            return {
+              action: "no_change",
+              reason: "No duplicates.",
+              evidenceSufficient: true,
+            };
           if (instruction.startsWith("Independently classify"))
             return {
               authority: "fact",

@@ -47,6 +47,12 @@ function make(
       generate: async ({ instruction, data }: any) => {
         if (instruction.startsWith("Select"))
           return { paths: ["first.txt", "second.txt"] };
+        if (instruction.includes("Independently review duplicate"))
+          return {
+            action: "no_change",
+            reason: "No duplicates.",
+            evidenceSufficient: true,
+          };
         if (instruction.startsWith("Independently classify"))
           return {
             authority: "fact",
@@ -66,11 +72,18 @@ function make(
           (file: any) => file.path === "first.txt" && !file.fragment,
         );
         if (!source)
-          return {
-            action: "unresolved",
-            reasonKind: "evidence_gap",
-            reason: "Insufficient evidence.",
-          };
+          return multiple
+            ? {
+                action: "no_change",
+                evidenceSufficient: true,
+                reason: "Reviewed this evidence page.",
+              }
+            : {
+                action: "unresolved",
+                id: ids[1],
+                reasonKind: "evidence_gap",
+                reason: "Insufficient evidence.",
+              };
         return {
           proposals: ids.slice(0, multiple ? 2 : 1).map((id, index) => ({
             action: "update",
@@ -128,7 +141,9 @@ test("unrelated evidence may permit a supported correction while the gap stays v
       reason: "This fragment discusses another subject.",
     }));
     const result = await reviewer.review();
-    assert.equal(result.status, "applied", JSON.stringify(result));
+    assert.equal(result.status, "unresolved", JSON.stringify(result));
+    assert.deepEqual(result.changes, [{ action: "update", memoryId: ids[0] }]);
+    assert.deepEqual(result.unresolvedTargets, [ids[1]]);
     assert.ok(crosschecks.some((page) => page.evidence.path === "second.txt"));
     assert.equal(result.audit?.coverage, "insufficient");
     assert.ok(result.audit?.gapReasons?.includes("fragment_insufficient"));
@@ -186,6 +201,12 @@ test("contradiction about the old target can be clarified without clearing other
           generate: async ({ instruction, data }: any) => {
             if (instruction.startsWith("Select"))
               return { paths: ["first.txt", "second.txt"] };
+            if (instruction.includes("Independently review duplicate"))
+              return {
+                action: "no_change",
+                reason: "No duplicates.",
+                evidenceSufficient: true,
+              };
             if (instruction.startsWith("Independently classify"))
               return {
                 authority: "fact",
@@ -548,7 +569,10 @@ test("large other evidence is streamed without losing content", () =>
       reason: "Unrelated.",
     }));
     const result = await reviewer.review();
-    assert.equal(result.status, "applied", JSON.stringify(result));
+    assert.equal(result.status, "unresolved", JSON.stringify(result));
+    assert.deepEqual(result.changes, [{ action: "update", memoryId: ids[0] }]);
+    assert.deepEqual(result.unresolvedTargets, [ids[1]]);
+    assert.equal(result.acknowledged, false);
     const pieces = crosschecks.filter(
       (page) => page.evidence.path === "second.txt",
     );

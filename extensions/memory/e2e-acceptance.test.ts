@@ -164,6 +164,12 @@ test(
         generate: async ({ instruction: prompt, data }: any) => {
           generated++;
           if (prompt.startsWith("Select")) return { paths: ["browser.txt"] };
+          if (prompt.includes("Independently review duplicate"))
+            return {
+              action: "no_change",
+              reason: "No duplicates.",
+              evidenceSufficient: true,
+            };
           if (prompt.startsWith("Independently classify"))
             return {
               authority: "fact",

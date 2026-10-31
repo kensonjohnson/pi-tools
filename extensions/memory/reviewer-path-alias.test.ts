@@ -37,6 +37,12 @@ for (const mutation of [false, true])
               }
               return { paths: [] };
             }
+            if (instruction.includes("Independently review duplicate"))
+              return {
+                action: "no_change",
+                reason: "Reviewed.",
+                evidenceSufficient: true,
+              };
             for (const fragment of data.repositoryIdentityFragments)
               reviewed.push(fragment.text);
             for (const file of data.files) {

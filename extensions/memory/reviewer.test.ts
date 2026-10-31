@@ -52,18 +52,24 @@ function model(
     generate: async ({ instruction, data }) =>
       instruction.startsWith("Select")
         ? { paths }
-        : instruction.startsWith("Independently classify")
+        : instruction.includes("Independently review duplicate")
           ? {
-              authority: "fact",
-              noInstructionOrPreference: true,
-              reason: "Descriptive fact.",
+              action: "no_change",
+              reason: "No duplicates.",
+              evidenceSufficient: true,
             }
-          : instruction.startsWith("Independently")
+          : instruction.startsWith("Independently classify")
             ? {
-                verdict: "supported",
-                reason: "Full source supports the proposal.",
+                authority: "fact",
+                noInstructionOrPreference: true,
+                reason: "Descriptive fact.",
               }
-            : decide(data),
+            : instruction.startsWith("Independently")
+              ? {
+                  verdict: "supported",
+                  reason: "Full source supports the proposal.",
+                }
+              : decide(data),
   };
 }
 
@@ -157,6 +163,12 @@ test("an excerpt substring is expanded and its complete file crosschecked", () =
           if (instruction.startsWith("Select"))
             return {
               excerpts: [{ path: "code.txt", query: "picker supports frames" }],
+            };
+          if (instruction.includes("Independently review duplicate"))
+            return {
+              action: "no_change",
+              reason: "No duplicates.",
+              evidenceSufficient: true,
             };
           if (instruction.startsWith("Independently classify"))
             return {
@@ -440,22 +452,28 @@ test("fabricated ids, uncertain assessments and duplicate claims do not apply", 
         generate: async ({ instruction }: any) =>
           instruction.startsWith("Select")
             ? { paths: [] }
-            : instruction.startsWith("Independently")
+            : instruction.includes("Independently review duplicate")
               ? {
-                  verdict: "uncertain",
-                  reason: "The instruction is ambiguous.",
+                  action: "no_change",
+                  reason: "No duplicates.",
+                  evidenceSufficient: true,
                 }
-              : {
-                  action: "add",
-                  category: "knowledge",
-                  content: "Cache logging is active.",
-                  citation: {
-                    kind: "session",
-                    id: "u",
-                    quote: b.batch.items[0].text,
+              : instruction.startsWith("Independently")
+                ? {
+                    verdict: "uncertain",
+                    reason: "The instruction is ambiguous.",
+                  }
+                : {
+                    action: "add",
+                    category: "knowledge",
+                    content: "Cache logging is active.",
+                    citation: {
+                      kind: "session",
+                      id: "u",
+                      quote: b.batch.items[0].text,
+                    },
+                    reason: "User discussed cache.",
                   },
-                  reason: "User discussed cache.",
-                },
       },
     });
     assert.equal(
@@ -466,7 +484,7 @@ test("fabricated ids, uncertain assessments and duplicate claims do not apply", 
     assert.equal(b.count(), 0);
   }));
 
-test("manual full review uses the same no-change path", () =>
+test("manual full review leaves insufficient no-change unresolved", () =>
   fixture(async (cwd, store) => {
     await store.remember("knowledge", "Node is installed.");
     const r = new Reviewer({
@@ -474,12 +492,16 @@ test("manual full review uses the same no-change path", () =>
       store,
       model: model((d) => {
         assert.equal(d.mode, "full");
-        return { action: "no_change" };
+        return {
+          action: "no_change",
+          reason: "Insufficient evidence.",
+          evidenceSufficient: false,
+        };
       }),
     });
     const result = await r.review();
-    assert.equal(result.status, "unchanged");
+    assert.equal(result.status, "unresolved");
     assert.equal(result.acknowledged, false);
-    assert.match(result.detail, /insufficient evidence/i);
+    assert.match(result.detail, /insufficient/i);
     assert.equal(result.audit?.coverage, "insufficient");
   }));

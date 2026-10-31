@@ -40,6 +40,13 @@ for (const stale of [false, true])
               generate: async ({ instruction, data }: any) => {
                 if (instruction.startsWith("Select"))
                   return { paths: ["evidence.txt"] };
+                if (instruction.includes("Independently review duplicate"))
+                  return {
+                    action: "no_change",
+                    reason: "Reviewed.",
+                    evidenceSufficient: true,
+                  };
+                assert.ok(instruction.includes("Review factual corrections"));
                 pages.push(data.evidencePage);
                 if (abort && pages.length === 2) control.cancel();
                 return {
@@ -86,7 +93,7 @@ test("manual fragment progress survives independent processes", async () => {
     const reviewer = new URL("./reviewer.ts", import.meta.url).href;
     const scheduler = new URL("./scheduler.ts", import.meta.url).href;
     const manual = new URL("./manual-review.ts", import.meta.url).href;
-    const script = `import {MemoryManager} from ${JSON.stringify(core)};import {MemoryReviewer} from ${JSON.stringify(reviewer)};import {MemoryScheduler} from ${JSON.stringify(scheduler)};import {reviewAllMemories} from ${JSON.stringify(manual)};import {join} from 'node:path';const [root,mode]=process.argv.slice(1);const store=new MemoryManager(root,{semanticEnabled:false});await store.init();const control=new MemoryScheduler({project:root,runtimeDir:join(root,'.pi/runtime'),sessionDir:join(root,'.pi/sessions'),automatic:false,work:async()=>({status:'done'})});if(mode==='resume')control.resume({schedule:false});const pages=[];const result=await control.runManual(async(signal,progress)=>{const reviewer=new MemoryReviewer({project:root,store,contextWindow:3000,continuationKey:'test/mock',fullContinuation:progress.resumePermit,model:{generate:async({instruction,data})=>{if(instruction.startsWith('Select'))return {paths:['evidence.txt']};pages.push(data.evidencePage);if(mode==='abort'&&pages.length===2)control.cancel();return {action:'no_change',reason:'Reviewed.',evidenceSufficient:true}}}});return reviewAllMemories({reviewer,signal,fullOffset:progress.current?.offset,fullSnapshot:progress.current?.snapshot,onProgress:(cursor)=>cursor?progress.advance(cursor):progress.clear()})});console.log(JSON.stringify({status:result.status,pages}));await control.shutdown();await store.close();`;
+    const script = `import {MemoryManager} from ${JSON.stringify(core)};import {MemoryReviewer} from ${JSON.stringify(reviewer)};import {MemoryScheduler} from ${JSON.stringify(scheduler)};import {reviewAllMemories} from ${JSON.stringify(manual)};import {join} from 'node:path';const [root,mode]=process.argv.slice(1);const store=new MemoryManager(root,{semanticEnabled:false});await store.init();const control=new MemoryScheduler({project:root,runtimeDir:join(root,'.pi/runtime'),sessionDir:join(root,'.pi/sessions'),automatic:false,work:async()=>({status:'done'})});if(mode==='resume')control.resume({schedule:false});const pages=[];const result=await control.runManual(async(signal,progress)=>{const reviewer=new MemoryReviewer({project:root,store,contextWindow:3000,continuationKey:'test/mock',fullContinuation:progress.resumePermit,model:{generate:async({instruction,data})=>{if(instruction.startsWith('Select'))return {paths:['evidence.txt']};if(instruction.includes('Independently review duplicate'))return {action:'no_change',reason:'Reviewed.',evidenceSufficient:true};if(!instruction.includes('Review factual corrections'))throw new Error('Unexpected instruction');pages.push(data.evidencePage);if(mode==='abort'&&pages.length===2)control.cancel();return {action:'no_change',reason:'Reviewed.',evidenceSufficient:true}}}});return reviewAllMemories({reviewer,signal,fullOffset:progress.current?.offset,fullSnapshot:progress.current?.snapshot,onProgress:(cursor)=>cursor?progress.advance(cursor):progress.clear()})});console.log(JSON.stringify({status:result.status,pages}));await control.shutdown();await store.close();`;
     const run = (mode: string) =>
       spawnSync(
         process.execPath,

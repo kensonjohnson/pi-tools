@@ -20,6 +20,12 @@ test("partial file receipts cannot justify mutations or clean coverage", async (
       model: {
         generate: async ({ instruction, data }: any) => {
           if (instruction.startsWith("Select")) return { paths: ["large.txt"] };
+          if (instruction.includes("Independently review duplicate"))
+            return {
+              action: "no_change",
+              reason: "Reviewed.",
+              evidenceSufficient: true,
+            };
           assert.ok(JSON.stringify(data).length < 12000);
           viewed += data.files.reduce(
             (sum: number, file: any) => sum + file.text.length,

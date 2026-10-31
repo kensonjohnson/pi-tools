@@ -96,7 +96,7 @@ test("configured background review repairs duplicates and resumes activity", asy
         find: () => ({ provider: "p", id: "m", input: ["text"] }),
         getAvailable: () => [],
         getApiKeyAndHeaders: async () => ({ ok: true }),
-        complete: async () => {
+        complete: async (_model: unknown, request: any) => {
           const rows = (
             await readFile(join(memory, "knowledge.ndjson"), "utf8")
           )
@@ -104,15 +104,15 @@ test("configured background review repairs duplicates and resumes activity", asy
             .split("\n")
             .map((line) => JSON.parse(line));
           assert.notEqual(rows[0].id, rows[1].id);
+          modelCalls++;
           return {
             stopReason: "stop",
             content: [
               {
                 type: "text",
-                text:
-                  ++modelCalls % 2
-                    ? '{"paths":[]}'
-                    : '{"action":"no_change","evidenceSufficient":true,"reason":"Session reviewed."}',
+                text: request.systemPrompt.includes("Select evidence requests")
+                  ? '{"paths":[]}'
+                  : '{"action":"no_change","evidenceSufficient":true,"reason":"Session reviewed."}',
               },
             ],
           };
@@ -159,10 +159,10 @@ test("configured background review repairs duplicates and resumes activity", asy
           .get("memory_review")
           .execute("", { action: "status" }, undefined, undefined, ctx)
       ).details.report.status;
-      if (modelCalls >= 2 && status.status === "done") break;
+      if (modelCalls >= 3 && status.status === "done") break;
     }
     assert.equal(status.paused, false);
-    assert.equal(modelCalls, 2);
+    assert.equal(modelCalls, 3);
     assert.equal(status.status, "done");
     assert.equal(status.manualContinuation, undefined);
     assert.equal(notices.length, 1);

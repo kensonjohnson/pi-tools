@@ -78,7 +78,7 @@ test("configured reviewer scans both the explicit session parent and configured 
         find: () => ({ provider: "test", id: "model", input: ["text"] }),
         getAvailable: () => [],
         getApiKeyAndHeaders: async () => ({ ok: true }),
-        complete: async () => {
+        complete: async (_model: unknown, request: any) => {
           calls++;
           if (calls === 1) await gate;
           return {
@@ -86,10 +86,9 @@ test("configured reviewer scans both the explicit session parent and configured 
             content: [
               {
                 type: "text",
-                text:
-                  calls % 2 === 1
-                    ? '{"paths":[]}'
-                    : '{"action":"no_change","evidenceSufficient":true,"reason":"Session reviewed."}',
+                text: request.systemPrompt.includes("Select evidence requests")
+                  ? '{"paths":[]}'
+                  : '{"action":"no_change","evidenceSufficient":true,"reason":"Session reviewed."}',
               },
             ],
           };
@@ -137,7 +136,7 @@ test("configured reviewer scans both the explicit session parent and configured 
       if (!found) await new Promise((resolve) => setTimeout(resolve, 10));
     }
     assert.equal(found, true);
-    assert.equal(calls, 4);
+    assert.equal(calls, 6);
     await handlers.get("session_shutdown")!({}, ctx);
   } finally {
     if (old === undefined) delete process.env.PI_CODING_AGENT_DIR;

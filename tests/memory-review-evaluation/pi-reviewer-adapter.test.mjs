@@ -68,6 +68,30 @@ test("tracked evaluation distinguishes stale targets from dispatched failures wi
         model: {
           generate: async ({ instruction }) => {
             if (instruction.startsWith("Select")) return { paths: [] };
+            if (instruction.includes("Review factual corrections"))
+              return {
+                action: "no_change",
+                reason: "No corrections.",
+                evidenceSufficient: true,
+              };
+            if (instruction.includes("Independently review duplicate")) {
+              proposals++;
+              const target =
+                mode === "dispatched" && proposals > 1 ? second : first;
+              const retained =
+                mode === "dispatched" && proposals > 1 ? third : second;
+              return {
+                action: "remove",
+                id: target.id,
+                targetAuthority: "fact",
+                reason: "Redundant.",
+                citation: {
+                  kind: "memory",
+                  id: retained.id,
+                  quote: retained.content,
+                },
+              };
+            }
             if (instruction.startsWith("Independently classify"))
               return {
                 authority: "fact",
@@ -83,22 +107,7 @@ test("tracked evaluation distinguishes stale targets from dispatched failures wi
                 noContradiction: true,
                 noExplicitInstruction: true,
               };
-            proposals++;
-            const target =
-              mode === "dispatched" && proposals > 1 ? second : first;
-            const retained =
-              mode === "dispatched" && proposals > 1 ? third : second;
-            return {
-              action: "remove",
-              id: target.id,
-              targetAuthority: "fact",
-              reason: "Redundant.",
-              citation: {
-                kind: "memory",
-                id: retained.id,
-                quote: retained.content,
-              },
-            };
+            throw new Error(`Unexpected instruction: ${instruction}`);
           },
         },
       });
@@ -299,11 +308,11 @@ test("real reviewer traverses disposable pages with fake model and reports bound
     await writeFile(join(dir, "decisions.ndjson"), "");
     const limited = await run({
       source,
-      argv: [process.execPath, "--input-type=module", "-e", driver, "1"],
+      argv: [process.execPath, "--input-type=module", "-e", driver, "3"],
     });
     assert.equal(limited.reviewer.status, "pending");
     assert.equal(limited.reviewer.reason, "limit");
-    assert.equal(limited.reviewer.calls, 1);
+    assert.equal(limited.reviewer.calls, 3);
     const limitedTotals = Object.values(
       limited.reviewer.diagnostics.stageTotals,
     );

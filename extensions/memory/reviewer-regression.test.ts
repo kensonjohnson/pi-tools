@@ -37,6 +37,12 @@ test("incremental review of 201 memories requires each snapshot-bound page befor
   const model: any = {
     generate: async ({ instruction, data }: any) => {
       if (instruction.startsWith("Select")) return { paths: [] };
+      if (instruction.includes("Independently review duplicate"))
+        return {
+          action: "no_change",
+          reason: "Reviewed.",
+          evidenceSufficient: true,
+        };
       if (!data.comparisonOnly) reviewed += data.memories.length;
       return {
         action: "no_change",
@@ -101,19 +107,25 @@ test("source changes or cancellation during mutation produce explicit uncertaint
       generate: async ({ instruction, data }: any) =>
         instruction.startsWith("Select")
           ? { paths: ["fact.txt"] }
-          : instruction.startsWith("Independently")
-            ? { verdict: "supported", reason: "Full file supports it." }
-            : {
-                action: "add",
-                category: "knowledge",
-                content: "The queue uses disk.",
-                reason: "The configuration specifies disk.",
-                citation: {
-                  kind: "file",
-                  id: data.files[0].id,
-                  quote: "Queue uses disk.",
+          : instruction.includes("Independently review duplicate")
+            ? {
+                action: "no_change",
+                reason: "No duplicates.",
+                evidenceSufficient: true,
+              }
+            : instruction.startsWith("Independently")
+              ? { verdict: "supported", reason: "Full file supports it." }
+              : {
+                  action: "add",
+                  category: "knowledge",
+                  content: "The queue uses disk.",
+                  reason: "The configuration specifies disk.",
+                  citation: {
+                    kind: "file",
+                    id: data.files[0].id,
+                    quote: "Queue uses disk.",
+                  },
                 },
-              },
     };
     const reviewer = new MemoryReviewer({
       project: cwd,

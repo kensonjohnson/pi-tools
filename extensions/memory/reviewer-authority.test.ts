@@ -68,6 +68,12 @@ for (const scenario of [
           generate: async ({ instruction, data }: any) => {
             if (instruction.startsWith("Select"))
               return { paths: ["source.txt"] };
+            if (instruction.includes("Independently review duplicate"))
+              return {
+                action: "no_change",
+                reason: "No duplicates.",
+                evidenceSufficient: true,
+              };
             if (instruction.startsWith("Independently classify")) {
               classifications++;
               return {
@@ -133,6 +139,12 @@ test("a fact label cannot override the user's preferred response format", async 
         generate: async ({ instruction, data }: any) => {
           if (instruction.startsWith("Select"))
             return { paths: ["source.txt"] };
+          if (instruction.includes("Independently review duplicate"))
+            return {
+              action: "no_change",
+              reason: "No duplicates.",
+              evidenceSufficient: true,
+            };
           if (instruction.startsWith("Independently classify")) {
             classifications++;
             return {
@@ -206,19 +218,26 @@ test("later natural-language user instruction may supersede verified earlier exp
         generate: async ({ instruction }: any) =>
           instruction.startsWith("Select")
             ? { paths: [] }
-            : instruction.startsWith("Independently")
+            : instruction.includes("Independently review duplicate")
               ? {
-                  verdict: "supported",
-                  reason: "The later instruction supersedes the earlier rule.",
+                  action: "no_change",
+                  reason: "No duplicates.",
+                  evidenceSufficient: true,
                 }
-              : {
-                  action: "remove",
-                  id: old.id,
-                  targetAuthority: "instruction",
-                  citation: { kind: "session", id: "later", quote: later },
-                  supersedes: { kind: "session", id: "first", quote: prior },
-                  reason: "The user changed the instruction.",
-                },
+              : instruction.startsWith("Independently")
+                ? {
+                    verdict: "supported",
+                    reason:
+                      "The later instruction supersedes the earlier rule.",
+                  }
+                : {
+                    action: "remove",
+                    id: old.id,
+                    targetAuthority: "instruction",
+                    citation: { kind: "session", id: "later", quote: later },
+                    supersedes: { kind: "session", id: "first", quote: prior },
+                    reason: "The user changed the instruction.",
+                  },
       },
     });
     assert.equal((await reviewer.review({ batch })).status, "applied");

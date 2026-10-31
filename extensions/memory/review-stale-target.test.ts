@@ -35,6 +35,26 @@ test("repeated stale target after successful removal stops as unresolved", async
         model: {
           generate: async ({ instruction }: any) => {
             if (instruction.startsWith("Select")) return { paths: [] };
+            if (instruction.includes("Review factual corrections"))
+              return {
+                action: "no_change",
+                reason: "No corrections.",
+                evidenceSufficient: true,
+              };
+            if (instruction.includes("Independently review duplicate")) {
+              proposals++;
+              return {
+                action: "remove",
+                id: target.id,
+                targetAuthority: "fact",
+                reason: "Redundant.",
+                citation: {
+                  kind: "memory",
+                  id: retained.id,
+                  quote: retained.content,
+                },
+              };
+            }
             if (instruction.startsWith("Independently classify"))
               return {
                 authority: "fact",
@@ -50,18 +70,7 @@ test("repeated stale target after successful removal stops as unresolved", async
                 noContradiction: true,
                 noExplicitInstruction: true,
               };
-            proposals++;
-            return {
-              action: "remove",
-              id: target.id,
-              targetAuthority: "fact",
-              reason: "Redundant.",
-              citation: {
-                kind: "memory",
-                id: retained.id,
-                quote: retained.content,
-              },
-            };
+            throw new Error(`Unexpected instruction: ${instruction}`);
           },
         },
       }),

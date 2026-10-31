@@ -32,6 +32,12 @@ test("an uncertain store mutation is never retried even if it throws the overflo
         generate: async ({ instruction, data }: any) => {
           modelCalls++;
           if (instruction.startsWith("Select")) return { paths: ["fact.txt"] };
+          if (instruction.includes("Independently review duplicate"))
+            return {
+              action: "no_change",
+              reason: "No duplicates.",
+              evidenceSufficient: true,
+            };
           if (instruction.startsWith("Independently"))
             return { verdict: "supported", reason: "Supported." };
           return {
@@ -50,7 +56,7 @@ test("an uncertain store mutation is never retried even if it throws the overflo
     });
     assert.equal((await reviewer.review()).status, "uncertain");
     assert.equal(writes, 1);
-    assert.equal(modelCalls, 3);
+    assert.equal(modelCalls, 4);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

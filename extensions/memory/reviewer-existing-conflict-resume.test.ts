@@ -67,6 +67,12 @@ test("existing proposal conflict evidence is rebuilt after a fragment checkpoint
           model: {
             generate: async ({ instruction, data }: any) => {
               if (instruction.startsWith("Select")) return { paths: [] };
+              if (instruction.includes("Independently review duplicate"))
+                return {
+                  action: "no_change",
+                  reason: "Reviewed.",
+                  evidenceSufficient: true,
+                };
               if (instruction.startsWith("Independently"))
                 return { verdict: "supported", reason: "Direct." };
               const item = data.session.find((s: any) =>

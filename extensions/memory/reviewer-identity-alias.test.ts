@@ -15,13 +15,19 @@ class MemoryReviewer extends BaseMemoryReviewer {
       model: {
         ...model,
         generate: (request) =>
-          request.instruction.startsWith("Independently classify")
+          request.instruction.includes("Independently review duplicate")
             ? Promise.resolve({
-                authority: "fact",
-                noInstructionOrPreference: true,
-                reason: "Descriptive fact.",
+                action: "no_change",
+                reason: "No duplicates.",
+                evidenceSufficient: true,
               })
-            : model.generate(request),
+            : request.instruction.startsWith("Independently classify")
+              ? Promise.resolve({
+                  authority: "fact",
+                  noInstructionOrPreference: true,
+                  reason: "Descriptive fact.",
+                })
+              : model.generate(request),
       },
     });
   }

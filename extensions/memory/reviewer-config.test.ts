@@ -53,7 +53,9 @@ test("configured trusted-project reviewer uses the selected registry model witho
             content: [
               {
                 type: "text",
-                text: calls === 1 ? '{"paths":[]}' : '{"action":"no_change"}',
+                text: context.systemPrompt.includes("Select evidence requests")
+                  ? '{"paths":[]}'
+                  : '{"action":"no_change","reason":"Reviewed.","evidenceSufficient":true}',
               },
             ],
           };
@@ -62,7 +64,7 @@ test("configured trusted-project reviewer uses the selected registry model witho
     };
     const reviewer = await createConfiguredPiMemoryReviewer(ctx, store);
     assert.equal((await reviewer.review()).status, "unchanged");
-    assert.equal(calls, 2);
+    assert.equal(calls, 3);
     ctx.isProjectTrusted = () => false;
     await assert.rejects(createConfiguredPiMemoryReviewer(ctx, store), /trust/);
   } finally {

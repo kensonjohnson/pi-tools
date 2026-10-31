@@ -125,19 +125,25 @@ test("accepts long proposed content and reasons with complete cited evidence", (
         generate: async ({ instruction, data }: any) =>
           instruction.startsWith("Select")
             ? { paths: ["fact.txt"] }
-            : instruction.startsWith("Independently")
-              ? { verdict: "supported", reason: "r".repeat(3000) }
-              : {
-                  action: "add",
-                  category: "knowledge",
-                  content,
-                  reason: "r".repeat(3000),
-                  citation: {
-                    kind: "file",
-                    id: data.files[0].id,
-                    quote: content,
+            : instruction.includes("Independently review duplicate")
+              ? {
+                  action: "no_change",
+                  reason: "No duplicates.",
+                  evidenceSufficient: true,
+                }
+              : instruction.startsWith("Independently")
+                ? { verdict: "supported", reason: "r".repeat(3000) }
+                : {
+                    action: "add",
+                    category: "knowledge",
+                    content,
+                    reason: "r".repeat(3000),
+                    citation: {
+                      kind: "file",
+                      id: data.files[0].id,
+                      quote: content,
+                    },
                   },
-                },
       },
     });
     assert.equal((await reviewer.review()).status, "applied");
@@ -172,6 +178,12 @@ test("all memory, session, metadata and evidence page combinations are reviewed 
         generate: async ({ instruction, data }: any) => {
           if (instruction.startsWith("Select"))
             return { paths: ["source.txt"], search: [query] };
+          if (instruction.includes("Independently review duplicate"))
+            return {
+              action: "no_change",
+              reason: "Reviewed.",
+              evidenceSufficient: true,
+            };
           expected =
             data.memoryPages *
             data.sessionPages *
@@ -189,7 +201,7 @@ test("all memory, session, metadata and evidence page combinations are reviewed 
           return {
             action: "no_change",
             reason: "Reviewed page.",
-            evidenceSufficient: combinations.size !== 1,
+            evidenceSufficient: combinations.size !== expected,
           };
         },
       },
@@ -221,6 +233,12 @@ test("oversized search query metadata is disclosed in all context-fitting pages"
         generate: async ({ instruction, data }: any) => {
           if (instruction.startsWith("Select"))
             return { paths: [], search: [query] };
+          if (instruction.includes("Independently review duplicate"))
+            return {
+              action: "no_change",
+              reason: "Reviewed.",
+              evidenceSufficient: true,
+            };
           assert.equal(data.metadataFragmented, true);
           assert.ok(JSON.stringify(data).length < 12000);
           chunks.push(data.searches[0].query);

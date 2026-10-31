@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -8,8 +8,12 @@ import { MemoryManager } from "./core.ts";
 import { MemoryReviewer } from "./reviewer.ts";
 import { reviewProjectSessions } from "./scheduler.ts";
 
-for (const changed of [false, true])
-  test(`incremental fragment progress ${changed ? "restarts after inventory changes" : "survives reviewer restart"}`, async () => {
+for (const scenario of [
+  "resume",
+  "inventory change",
+  "resumed mutation",
+] as const)
+  test(`incremental fragment progress ${scenario}`, async () => {
     const root = await mkdtemp(join(tmpdir(), "review-fragment-resume-"));
     const sessions = join(root, "sessions");
     await mkdir(sessions);
@@ -26,7 +30,7 @@ for (const changed of [false, true])
             type: "message",
             id: "u",
             parentId: null,
-            message: { role: "user", content: "session text ".repeat(3000) },
+            message: { role: "user", content: "Always use TLS. ".repeat(3000) },
           },
         ]
           .map(JSON.stringify)
@@ -35,8 +39,9 @@ for (const changed of [false, true])
       const firstPages: number[] = [],
         resumedPages: number[] = [];
       const controller = new AbortController();
-      const makeReviewer = (pages: number[], abort: boolean) =>
-        new MemoryReviewer({
+      let reviewDetail = "";
+      const makeReviewer = (pages: number[], abort: boolean) => {
+        const reviewer = new MemoryReviewer({
           project: root,
           store,
           contextWindow: 3000,
@@ -44,8 +49,33 @@ for (const changed of [false, true])
           model: {
             generate: async ({ instruction, data }: any) => {
               if (instruction.startsWith("Select")) return { paths: [] };
+              if (instruction.includes("Independently review duplicate"))
+                return {
+                  action: "no_change",
+                  reason: "Reviewed.",
+                  evidenceSufficient: true,
+                };
+              if (instruction.startsWith("Independently"))
+                return { verdict: "supported", reason: "Direct statement." };
+              assert.ok(instruction.includes("Review factual corrections"));
               pages.push(data.sessionPage);
               if (abort && pages.length === 2) controller.abort();
+              if (
+                !abort &&
+                scenario === "resumed mutation" &&
+                data.sessionPage === 2
+              )
+                return {
+                  action: "add",
+                  category: "practices",
+                  content: "Always use TLS.",
+                  reason: "Direct instruction.",
+                  citation: {
+                    kind: "session",
+                    id: data.session[0].id,
+                    quote: data.session[0].text,
+                  },
+                };
               return {
                 action: "no_change",
                 reason: "Reviewed.",
@@ -54,6 +84,14 @@ for (const changed of [false, true])
             },
           },
         });
+        const review = reviewer.review.bind(reviewer);
+        reviewer.review = async (...args) => {
+          const result = await review(...args);
+          reviewDetail = result.detail;
+          return result;
+        };
+        return reviewer;
+      };
       await assert.rejects(
         reviewProjectSessions({
           project: root,
@@ -64,7 +102,8 @@ for (const changed of [false, true])
         }),
       );
       assert.deepEqual(firstPages, [1, 2]);
-      if (changed) await writeFile(join(root, "new.txt"), "new evidence");
+      if (scenario === "inventory change")
+        await writeFile(join(root, "new.txt"), "new evidence");
       const result = await reviewProjectSessions({
         project: root,
         sessionDir: sessions,
@@ -72,10 +111,24 @@ for (const changed of [false, true])
         reviewer: makeReviewer(resumedPages, false),
         signal: new AbortController().signal,
       });
-      assert.equal(result.status, "done");
+      assert.equal(
+        result.status,
+        scenario === "resumed mutation" ? "unresolved" : "done",
+      );
       assert.ok(resumedPages.length > 0);
-      assert.equal(resumedPages[0], changed ? 1 : 2);
-      if (!changed) assert.ok(!resumedPages.includes(1));
+      assert.equal(resumedPages[0], scenario === "inventory change" ? 1 : 2);
+      if (scenario !== "inventory change") assert.ok(!resumedPages.includes(1));
+      if (scenario === "resumed mutation") {
+        assert.match(
+          reviewDetail,
+          /prior fragment review reasons are unavailable/i,
+        );
+        await assert.rejects(access(checkpointFile));
+        assert.deepEqual(
+          (await store.list()).memories.map((memory) => memory.content),
+          ["A small fact."],
+        );
+      }
     } finally {
       await store.close();
       await rm(root, { recursive: true, force: true });
@@ -109,7 +162,7 @@ test("incremental fragment checkpoints resume across independent processes", asy
     const core = new URL("./core.ts", import.meta.url).href;
     const reviewer = new URL("./reviewer.ts", import.meta.url).href;
     const scheduler = new URL("./scheduler.ts", import.meta.url).href;
-    const script = `import { MemoryManager } from ${JSON.stringify(core)}; import { MemoryReviewer } from ${JSON.stringify(reviewer)}; import { reviewProjectSessions } from ${JSON.stringify(scheduler)}; const [root,sessions,checkpoint,mode]=process.argv.slice(1); const store=new MemoryManager(root,{semanticEnabled:false}); const controller=new AbortController(); const pages=[]; const reviewer=new MemoryReviewer({project:root,store,contextWindow:3000,continuationKey:'test/mock',model:{generate:async({instruction,data})=>{if(instruction.startsWith('Select')) return {paths:[]}; pages.push(data.sessionPage); if(mode==='abort' && pages.length===2) controller.abort(); return {action:'no_change',reason:'Reviewed.',evidenceSufficient:true};}}}); let status; try { status=(await reviewProjectSessions({project:root,sessionDir:sessions,checkpointFile:checkpoint,reviewer,signal:controller.signal})).status; } catch { status='aborted'; } console.log(JSON.stringify({status,pages})); await store.close();`;
+    const script = `import { MemoryManager } from ${JSON.stringify(core)}; import { MemoryReviewer } from ${JSON.stringify(reviewer)}; import { reviewProjectSessions } from ${JSON.stringify(scheduler)}; const [root,sessions,checkpoint,mode]=process.argv.slice(1); const store=new MemoryManager(root,{semanticEnabled:false}); const controller=new AbortController(); const pages=[]; const reviewer=new MemoryReviewer({project:root,store,contextWindow:3000,continuationKey:'test/mock',model:{generate:async({instruction,data})=>{if(instruction.startsWith('Select')) return {paths:[]}; if(instruction.includes('Independently review duplicate')) return {action:'no_change',reason:'Reviewed.',evidenceSufficient:true}; if(!instruction.includes('Review factual corrections')) throw new Error('Unexpected instruction'); pages.push(data.sessionPage); if(mode==='abort' && pages.length===2) controller.abort(); return {action:'no_change',reason:'Reviewed.',evidenceSufficient:true};}}}); let status; try { status=(await reviewProjectSessions({project:root,sessionDir:sessions,checkpointFile:checkpoint,reviewer,signal:controller.signal})).status; } catch { status='aborted'; } console.log(JSON.stringify({status,pages})); await store.close();`;
     const run = (mode: string) =>
       spawnSync(
         process.execPath,

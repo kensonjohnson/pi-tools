@@ -53,6 +53,32 @@ test("tracked semantic removal records target and retained source in persisted r
         model: {
           generate: async ({ instruction }: any) => {
             if (instruction.startsWith("Select")) return { paths: [] };
+            if (instruction.includes("Review factual corrections"))
+              return {
+                action: "no_change",
+                reason: "Reviewed.",
+                evidenceSufficient: true,
+              };
+            if (instruction.includes("Independently review duplicate")) {
+              if (proposed)
+                return {
+                  action: "no_change",
+                  reason: "Reviewed.",
+                  evidenceSufficient: true,
+                };
+              proposed = true;
+              return {
+                action: "remove",
+                id: target.id,
+                targetAuthority: "fact",
+                reason: "Redundant.",
+                citation: {
+                  kind: "memory",
+                  id: retained.id,
+                  quote: retained.content,
+                },
+              };
+            }
             if (instruction.startsWith("Independently classify"))
               return {
                 authority: "fact",
@@ -60,24 +86,7 @@ test("tracked semantic removal records target and retained source in persisted r
                 reason: "Descriptive fact.",
               };
             if (instruction.startsWith("Independently")) return supported;
-            if (proposed)
-              return {
-                action: "no_change",
-                reason: "Reviewed.",
-                evidenceSufficient: true,
-              };
-            proposed = true;
-            return {
-              action: "remove",
-              id: target.id,
-              targetAuthority: "fact",
-              reason: "Redundant.",
-              citation: {
-                kind: "memory",
-                id: retained.id,
-                quote: retained.content,
-              },
-            };
+            throw new Error(`Unexpected instruction: ${instruction}`);
           },
         },
       }),

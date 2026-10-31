@@ -40,6 +40,12 @@ for (const verdict of ["supported", "uncertain"] as const)
           model: {
             generate: async ({ instruction, data }: any) => {
               if (instruction.startsWith("Select")) return { paths: [] };
+              if (instruction.includes("Independently review duplicate"))
+                return {
+                  action: "no_change",
+                  reason: "Reviewed.",
+                  evidenceSufficient: true,
+                };
               if (instruction.startsWith("Independently compare"))
                 return {
                   verdict: "no_conflict",
@@ -139,6 +145,12 @@ test("scheduler acknowledges source-validated long-message chunks only after eac
         model: {
           generate: async ({ instruction, data }: any) => {
             if (instruction.startsWith("Select")) return { paths: [] };
+            if (instruction.includes("Independently review duplicate"))
+              return {
+                action: "no_change",
+                reason: "Reviewed.",
+                evidenceSufficient: true,
+              };
             assert.equal(data.sessionFragmented, true);
             assert.ok(data.session[0].chunk);
             if (rejectNext) rejected = data.session[0].text;

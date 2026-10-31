@@ -64,14 +64,16 @@ test("startup SQLite contention spools settled activity and retries without bloc
         find: () => ({ provider: "test", id: "model", input: ["text"] }),
         getAvailable: () => [],
         getApiKeyAndHeaders: async () => ({ ok: true }),
-        complete: async () => {
+        complete: async (_model: unknown, request: any) => {
           calls++;
           return {
             stopReason: "stop",
             content: [
               {
                 type: "text",
-                text: calls % 2 ? '{"paths":[]}' : '{"action":"no_change"}',
+                text: request.systemPrompt.includes("Select evidence requests")
+                  ? '{"paths":[]}'
+                  : '{"action":"no_change","reason":"Reviewed.","evidenceSufficient":true}',
               },
             ],
           };
@@ -112,9 +114,9 @@ test("startup SQLite contention spools settled activity and retries without bloc
     lock.exec("ROLLBACK");
     lock.close();
     lock = undefined;
-    for (let i = 0; i < 250 && calls < 2; i++)
+    for (let i = 0; i < 250 && calls < 3; i++)
       await new Promise((resolve) => setTimeout(resolve, 10));
-    assert.equal(calls, 2);
+    assert.equal(calls, 3);
     await handlers.get("session_shutdown")!({}, ctx);
   } finally {
     lock?.close();

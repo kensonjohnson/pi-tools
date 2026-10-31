@@ -90,19 +90,25 @@ test("acknowledgement failure after add retries without creating duplicates", ()
         generate: async ({ instruction, data }: any) =>
           instruction.startsWith("Select")
             ? { paths: ["fact.txt"] }
-            : instruction.startsWith("Independently")
-              ? { verdict: "supported", reason: "Source is consistent." }
-              : {
-                  action: "add",
-                  reason: "The file records the fact.",
-                  category: "knowledge",
-                  content: "Database stores files.",
-                  citation: {
-                    kind: "file",
-                    id: data.files[0].id,
-                    quote: "Database stores files.",
+            : instruction.includes("Independently review duplicate")
+              ? {
+                  action: "no_change",
+                  reason: "No duplicates.",
+                  evidenceSufficient: true,
+                }
+              : instruction.startsWith("Independently")
+                ? { verdict: "supported", reason: "Source is consistent." }
+                : {
+                    action: "add",
+                    reason: "The file records the fact.",
+                    category: "knowledge",
+                    content: "Database stores files.",
+                    citation: {
+                      kind: "file",
+                      id: data.files[0].id,
+                      quote: "Database stores files.",
+                    },
                   },
-                },
       },
     });
     assert.equal((await reviewer.review({ batch })).status, "applied");
@@ -135,8 +141,13 @@ test("no-change cannot acknowledge an altered memory snapshot", () =>
       model: {
         generate: async ({ instruction }) => {
           if (instruction.startsWith("Select")) return { paths: [] };
-          await store.remember("knowledge", "A concurrent edit.");
-          return { action: "no_change" };
+          if (instruction.includes("Review factual corrections"))
+            await store.remember("knowledge", "A concurrent edit.");
+          return {
+            action: "no_change",
+            reason: "Reviewed.",
+            evidenceSufficient: true,
+          };
         },
       },
     });

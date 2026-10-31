@@ -111,14 +111,15 @@ test("bounded manual continuation survives reload and /memory-review full contin
           const comparing = request.systemPrompt.includes(
             "Compare the supplied complete target memories",
           );
-          const text = comparing
-            ? '{"action":"no_change","reason":"Compared.","evidenceSufficient":true}'
-            : selecting
-              ? decisions === 0
-                ? '{"paths":[]}'
-                : '{"paths":["evidence.txt"]}'
-              : ++decisions === 1
-                ? '{"action":"no_change","reason":"Evidence missing","evidenceSufficient":false}'
+          const duplicate = request.systemPrompt.includes(
+            "Independently review duplicate",
+          );
+          if (!comparing && !duplicate && !selecting) decisions++;
+          const text =
+            comparing || duplicate
+              ? '{"action":"no_change","reason":"Compared.","evidenceSufficient":true}'
+              : selecting
+                ? '{"paths":["evidence.txt"]}'
                 : '{"action":"no_change","reason":"Fixture review","evidenceSufficient":true}';
           return { stopReason: "stop", content: [{ type: "text", text }] };
         },
@@ -166,9 +167,8 @@ test("bounded manual continuation survives reload and /memory-review full contin
     assert.deepEqual(first.details.result.review, {
       pages: 24,
       resumedAtOffset: 0,
-      evidenceGaps: 1,
-      gapReasons: { model_insufficient: 1, no_evidence: 1 },
-      limitedPages: 23,
+      evidenceGaps: 0,
+      limitedPages: 24,
       discoveryTruncatedPages: 0,
       searchIncompletePages: 0,
       candidatesTruncatedPages: 0,
@@ -190,12 +190,12 @@ test("bounded manual continuation survives reload and /memory-review full contin
     await b.commands.get("memory-review").handler("full", ctx);
     for (
       let i = 0;
-      i < 2000 && !notices.some((x) => /review unresolved/i.test(x));
+      i < 2000 && !notices.some((x) => /review done/i.test(x));
       i++
     )
       await new Promise((resolve) => setTimeout(resolve, 10));
     assert.ok(
-      notices.some((x) => /review unresolved/i.test(x)),
+      notices.some((x) => /review done/i.test(x)),
       JSON.stringify(notices),
     );
     assert.ok(calls > initialCalls);
@@ -224,9 +224,8 @@ test("bounded manual continuation survives reload and /memory-review full contin
         {
           pages: 24,
           resumedAtOffset: 0,
-          evidenceGaps: 1,
-          gapReasons: { model_insufficient: 1, no_evidence: 1 },
-          limitedPages: 23,
+          evidenceGaps: 0,
+          limitedPages: 24,
           discoveryTruncatedPages: 0,
           searchIncompletePages: 0,
           candidatesTruncatedPages: 0,
@@ -237,7 +236,7 @@ test("bounded manual continuation survives reload and /memory-review full contin
     );
     assert.match(
       after.details.report.events[0].detail,
-      /insufficient or unknown evidence/i,
+      /no-change decisions do not verify/i,
     );
     await b.handlers.get("session_shutdown")!({}, ctx);
   } finally {

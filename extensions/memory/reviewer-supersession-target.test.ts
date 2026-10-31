@@ -46,17 +46,31 @@ for (const scenario of [
           generate: async ({ instruction }) =>
             instruction.startsWith("Select")
               ? { paths: [] }
-              : {
-                  action: scenario.action,
-                  id: old.id,
-                  ...(scenario.action === "update"
-                    ? { content: scenario.content }
-                    : {}),
-                  targetAuthority: "instruction",
-                  citation: { kind: "session", id: "b", quote: scenario.later },
-                  supersedes: { kind: "session", id: "a", quote: scenario.old },
-                  reason: "Claimed supersession.",
-                },
+              : instruction.includes("Independently review duplicate")
+                ? {
+                    action: "no_change",
+                    reason: "No duplicates.",
+                    evidenceSufficient: true,
+                  }
+                : {
+                    action: scenario.action,
+                    id: old.id,
+                    ...(scenario.action === "update"
+                      ? { content: scenario.content }
+                      : {}),
+                    targetAuthority: "instruction",
+                    citation: {
+                      kind: "session",
+                      id: "b",
+                      quote: scenario.later,
+                    },
+                    supersedes: {
+                      kind: "session",
+                      id: "a",
+                      quote: scenario.old,
+                    },
+                    reason: "Claimed supersession.",
+                  },
         },
       });
       assert.equal((await r.review({ batch })).status, "unresolved");
@@ -96,21 +110,31 @@ test("matched later direct replacement for the same subject can update protected
         generate: async ({ instruction }) =>
           instruction.startsWith("Select")
             ? { paths: [] }
-            : instruction.startsWith("Independently")
+            : instruction.includes("Independently review duplicate")
               ? {
-                  verdict: "supported",
-                  reason:
-                    "Later direct instruction replaces the previous rule.",
+                  action: "no_change",
+                  reason: "No duplicates.",
+                  evidenceSufficient: true,
                 }
-              : {
-                  action: "update",
-                  id: old.id,
-                  content: later,
-                  targetAuthority: "instruction",
-                  citation: { kind: "session", id: "b", quote: later },
-                  supersedes: { kind: "session", id: "a", quote: old.content },
-                  reason: "The user changed the rule.",
-                },
+              : instruction.startsWith("Independently")
+                ? {
+                    verdict: "supported",
+                    reason:
+                      "Later direct instruction replaces the previous rule.",
+                  }
+                : {
+                    action: "update",
+                    id: old.id,
+                    content: later,
+                    targetAuthority: "instruction",
+                    citation: { kind: "session", id: "b", quote: later },
+                    supersedes: {
+                      kind: "session",
+                      id: "a",
+                      quote: old.content,
+                    },
+                    reason: "The user changed the rule.",
+                  },
       },
     });
     assert.equal((await r.review({ batch })).status, "applied");
