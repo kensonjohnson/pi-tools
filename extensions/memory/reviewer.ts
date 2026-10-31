@@ -739,6 +739,7 @@ export class MemoryReviewer {
     if (this.learnedInputBudget !== undefined)
       inputBudget = Math.min(inputBudget ?? Infinity, this.learnedInputBudget);
     let reselection: ReselectionState | undefined;
+    let restartFragments = false;
     for (;;) {
       options.signal?.throwIfAborted();
       try {
@@ -748,7 +749,13 @@ export class MemoryReviewer {
           validContext,
           validOutput,
           reselection,
+          restartFragments,
         );
+        if ("restartFragments" in result) {
+          restartFragments = true;
+          reselection = undefined;
+          continue;
+        }
         if ("reselection" in result) {
           reselection = result.reselection;
           continue;
@@ -792,7 +799,12 @@ export class MemoryReviewer {
     modelContext: number | undefined,
     outputCapacity: number,
     retry?: ReselectionState,
-  ): Promise<ReviewResult | { reselection: ReselectionState }> {
+    restartFragments = false,
+  ): Promise<
+    | ReviewResult
+    | { reselection: ReselectionState }
+    | { restartFragments: true }
+  > {
     const { batch, signal } = options;
     const captureSnapshot = () => this.options.store.captureAddPrecondition();
     let mutationStarted = false;
@@ -2683,6 +2695,7 @@ export class MemoryReviewer {
           .digest("hex")
       : undefined;
     const resumeIndex =
+      !restartFragments &&
       plan &&
       resumedFragment?.plan === plan &&
       resumedFragment.sufficient &&
@@ -3762,6 +3775,20 @@ export class MemoryReviewer {
         ...comparisonProposals[0].candidates,
       );
     }
+    // Earlier no-change fragments did not retain their pass reasons. Re-run
+    // them before considering any mutation, rather than applying with an
+    // incomplete set of safety observations.
+    if (
+      resumeIndex > 0 &&
+      d.action !== "no_change" &&
+      d.action !== "unresolved"
+    ) {
+      await options.onFragmentProgress!({
+        snapshot: snapshotHash,
+        fragment: { plan: plan!, index: 1, sufficient: false },
+      });
+      return { restartFragments: true };
+    }
     const gapReasons: Array<ReviewGapReason | "candidates_truncated"> = [];
     const candidatesTruncated = needsComparison && comparisonIncomplete;
     if (candidatesTruncated) gapReasons.push("candidates_truncated");
@@ -4587,14 +4614,6 @@ export class MemoryReviewer {
       return true;
     };
     const applyDecision = async (d: Decision): Promise<ReviewResult> => {
-      if (resumeIndex > 0)
-        return {
-          status: "unresolved",
-          detail:
-            "Prior fragment review reasons are unavailable after resume; no mutation was attempted.",
-          acknowledged: false,
-          audit,
-        };
       if (d.id && (!preconditions.has(d.id) || !visibleIds.has(d.id)))
         throw new Error("unknown memory target");
       let cite = d.citation!;

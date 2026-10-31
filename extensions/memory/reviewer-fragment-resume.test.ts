@@ -12,6 +12,9 @@ for (const scenario of [
   "resume",
   "inventory change",
   "resumed mutation",
+  "conflicting reason",
+  "uncertain dispatch",
+  "interrupted re-review",
 ] as const)
   test(`incremental fragment progress ${scenario}`, async () => {
     const root = await mkdtemp(join(tmpdir(), "review-fragment-resume-"));
@@ -40,10 +43,29 @@ for (const scenario of [
         resumedPages: number[] = [];
       const controller = new AbortController();
       let reviewDetail = "";
-      const makeReviewer = (pages: number[], abort: boolean) => {
+      let writes = 0;
+      let sawConflictReason = false;
+      const wrapped = {
+        captureAddPrecondition: store.captureAddPrecondition.bind(store),
+        update: store.update.bind(store),
+        forget: store.forget.bind(store),
+        move: store.move.bind(store),
+        remember: async (...args: Parameters<MemoryManager["remember"]>) => {
+          writes++;
+          const result = await store.remember(...args);
+          if (scenario === "uncertain dispatch")
+            throw new Error("post-commit failure");
+          return result;
+        },
+      };
+      const makeReviewer = (
+        pages: number[],
+        abort: boolean,
+        restartController?: AbortController,
+      ) => {
         const reviewer = new MemoryReviewer({
           project: root,
-          store,
+          store: wrapped,
           contextWindow: 3000,
           continuationKey: "test/mock",
           model: {
@@ -55,14 +77,29 @@ for (const scenario of [
                   reason: "Reviewed.",
                   evidenceSufficient: true,
                 };
-              if (instruction.startsWith("Independently"))
+              if (instruction.startsWith("Independently")) {
+                if (
+                  JSON.stringify(data.passReasons ?? []).includes(
+                    "TLS conflicts",
+                  )
+                ) {
+                  sawConflictReason = true;
+                  return {
+                    verdict: "uncertain",
+                    reason: "TLS conflicts with earlier guidance.",
+                  };
+                }
                 return { verdict: "supported", reason: "Direct statement." };
+              }
               assert.ok(instruction.includes("Review factual corrections"));
               pages.push(data.sessionPage);
               if (abort && pages.length === 2) controller.abort();
+              if (restartController && data.sessionPage === 1)
+                restartController.abort();
               if (
                 !abort &&
-                scenario === "resumed mutation" &&
+                scenario !== "resume" &&
+                scenario !== "inventory change" &&
                 data.sessionPage === 2
               )
                 return {
@@ -78,7 +115,12 @@ for (const scenario of [
                 };
               return {
                 action: "no_change",
-                reason: "Reviewed.",
+                reason:
+                  scenario === "conflicting reason" &&
+                  !abort &&
+                  data.sessionPage === 1
+                    ? "TLS conflicts with earlier guidance."
+                    : "Reviewed.",
                 evidenceSufficient: true,
               };
             },
@@ -104,30 +146,58 @@ for (const scenario of [
       assert.deepEqual(firstPages, [1, 2]);
       if (scenario === "inventory change")
         await writeFile(join(root, "new.txt"), "new evidence");
-      const result = await reviewProjectSessions({
-        project: root,
-        sessionDir: sessions,
-        checkpointFile,
-        reviewer: makeReviewer(resumedPages, false),
-        signal: new AbortController().signal,
-      });
+      const run = (
+        pages: number[],
+        signal: AbortSignal,
+        restartController?: AbortController,
+      ) =>
+        reviewProjectSessions({
+          project: root,
+          sessionDir: sessions,
+          checkpointFile,
+          reviewer: makeReviewer(pages, false, restartController),
+          signal,
+        });
+      let result;
+      if (scenario === "interrupted re-review") {
+        // Interrupt after the saved cursor has been invalidated, not the initial resume.
+        const restartController = new AbortController();
+        await assert.rejects(
+          run(resumedPages, restartController.signal, restartController),
+        );
+        assert.equal(resumedPages[0], 2);
+        assert.equal(resumedPages.at(-1), 1);
+        assert.equal(writes, 0);
+        const recoveryPages: number[] = [];
+        result = await run(recoveryPages, new AbortController().signal);
+        assert.equal(recoveryPages[0], 1);
+      } else {
+        result = await run(resumedPages, new AbortController().signal);
+      }
       assert.equal(
         result.status,
-        scenario === "resumed mutation" ? "unresolved" : "done",
+        scenario === "uncertain dispatch"
+          ? "uncertain"
+          : scenario === "conflicting reason"
+            ? "unresolved"
+            : "done",
       );
-      assert.ok(resumedPages.length > 0);
       assert.equal(resumedPages[0], scenario === "inventory change" ? 1 : 2);
-      if (scenario !== "inventory change") assert.ok(!resumedPages.includes(1));
-      if (scenario === "resumed mutation") {
-        assert.match(
-          reviewDetail,
-          /prior fragment review reasons are unavailable/i,
-        );
-        await assert.rejects(access(checkpointFile));
+      if (scenario === "resume") assert.ok(!resumedPages.includes(1));
+      if (!["resume", "inventory change"].includes(scenario)) {
+        assert.ok(resumedPages.includes(1));
+        assert.equal(writes, scenario === "conflicting reason" ? 0 : 1);
         assert.deepEqual(
-          (await store.list()).memories.map((memory) => memory.content),
-          ["A small fact."],
+          (await store.list()).memories.map((memory) => memory.content).sort(),
+          (scenario === "conflicting reason"
+            ? ["A small fact."]
+            : ["A small fact.", "Always use TLS."]
+          ).sort(),
         );
+        if (scenario === "conflicting reason")
+          assert.ok(sawConflictReason, reviewDetail);
+        if (scenario === "uncertain dispatch")
+          await assert.rejects(access(checkpointFile));
       }
     } finally {
       await store.close();
