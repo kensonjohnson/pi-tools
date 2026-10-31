@@ -4,7 +4,10 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryManager } from "./core.ts";
-import { MemoryReviewer as RealReviewer } from "./reviewer.ts";
+import {
+  MemoryReviewer as RealReviewer,
+  expandFileCitation,
+} from "./reviewer.ts";
 import type { ReviewerModel } from "./reviewer-model.ts";
 import type { ReviewBatch } from "./session-review.ts";
 const Reviewer = class extends RealReviewer {
@@ -63,6 +66,134 @@ function model(
             : decide(data),
   };
 }
+
+test("file quote expansion requires a unique match and complete enclosing paragraphs", () => {
+  assert.equal(
+    expandFileCitation(
+      'before\n  description: "picker",\nafter\n\nother',
+      '"picker"',
+    ),
+    'before\n  description: "picker",\nafter',
+  );
+  assert.equal(
+    expandFileCitation("\n  alpha beta\n\nnext", "\n  alpha"),
+    "\n  alpha beta",
+  );
+  assert.equal(
+    expandFileCitation("first\n\nalpha beta  \n", "beta  \n"),
+    "alpha beta  \n",
+  );
+  assert.equal(expandFileCitation("same\n\nsame", "same"), undefined);
+  assert.equal(expandFileCitation("one", "missing"), undefined);
+});
+
+test("a unique code substring supports a factual correction after full paragraph assessment", () =>
+  fixture(async (cwd, store) => {
+    await writeFile(
+      join(cwd, "code.txt"),
+      'register({\n  description: "picker supports frames",\n});\n',
+    );
+    const old = (
+      await store.remember("knowledge", "Picker lacks frame support.")
+    ).memory;
+    const base = model(
+      (d) => ({
+        action: "update",
+        id: old.id,
+        content: "Picker supports frames.",
+        targetAuthority: "fact",
+        reason: "Current code.",
+        citation: {
+          kind: "file",
+          id: d.files[0].id,
+          quote: '"picker supports frames"',
+        },
+      }),
+      ["code.txt"],
+    );
+    let assessed = false;
+    const reviewer = new Reviewer({
+      project: cwd,
+      store,
+      model: {
+        generate: async (input) => {
+          if (
+            input.instruction.startsWith("Independently assess the proposal")
+          ) {
+            assert.equal(
+              (input.data as any).proposal.citation.quote,
+              'register({\n  description: "picker supports frames",\n});',
+            );
+            assessed = true;
+          }
+          return base.generate(input);
+        },
+      },
+    });
+    const result = await reviewer.review();
+    assert.equal(result.status, "applied");
+    assert.equal(assessed, true);
+    assert.equal(
+      (await store.list()).memories[0].content,
+      "Picker supports frames.",
+    );
+  }));
+
+test("an excerpt substring is expanded and its complete file crosschecked", () =>
+  fixture(async (cwd, store) => {
+    const paragraph =
+      'register({\n  description: "picker supports frames",\n});';
+    const full = `Other context.\n\n${paragraph}\n`;
+    await writeFile(join(cwd, "code.txt"), full);
+    const old = (
+      await store.remember("knowledge", "Picker lacks frame support.")
+    ).memory;
+    let crosschecked = false;
+    const reviewer = new Reviewer({
+      project: cwd,
+      store,
+      model: {
+        generate: async ({ instruction, data }: any) => {
+          if (instruction.startsWith("Select"))
+            return {
+              excerpts: [{ path: "code.txt", query: "picker supports frames" }],
+            };
+          if (instruction.startsWith("Independently classify"))
+            return {
+              authority: "fact",
+              noInstructionOrPreference: true,
+              reason: "Fact.",
+            };
+          if (instruction.startsWith("Independently compare")) {
+            assert.equal(data.evidence.text, full);
+            assert.equal(data.proposal.citation.quote, paragraph);
+            crosschecked = true;
+            return { verdict: "no_conflict", reason: "No conflict." };
+          }
+          if (instruction.startsWith("Independently assess"))
+            return {
+              verdict: "supported",
+              reason: "Source supports correction.",
+            };
+          return {
+            action: "update",
+            id: old.id,
+            content: "Picker supports frames.",
+            targetAuthority: "fact",
+            reason: "Current code.",
+            citation: {
+              kind: "file",
+              id: data.files[0].id,
+              quote: '"picker supports frames"',
+            },
+          };
+        },
+      },
+    });
+    const result = await reviewer.review();
+    assert.equal(result.status, "applied");
+    assert.equal(crosschecked, true);
+  }));
 
 test("natural user instruction becomes a paraphrased durable memory", () =>
   fixture(async (cwd, store) => {
@@ -199,23 +330,40 @@ test("full context prevents substring negation and stale evidence fails before m
   fixture(async (cwd, store) => {
     await writeFile(join(cwd, "fact.txt"), "Cache enabled is false.\n");
     const b = batch([{ id: "u", role: "user", text: "Review cache." }]);
+    const base = model(
+      (d) => ({
+        action: "add",
+        category: "knowledge",
+        content: "Cache is enabled.",
+        citation: { kind: "file", id: d.files[0].id, quote: "Cache enabled" },
+        reason: "A substring claims cache enabled.",
+      }),
+      ["fact.txt"],
+    );
     const bad = new Reviewer({
       project: cwd,
       store,
-      model: model(
-        (d) => ({
-          action: "add",
-          category: "knowledge",
-          content: "Cache is enabled.",
-          citation: { kind: "file", id: d.files[0].id, quote: "Cache enabled" },
-          reason: "A substring claims cache enabled.",
-        }),
-        ["fact.txt"],
-      ),
+      model: {
+        generate: async (input) => {
+          if (
+            input.instruction.startsWith("Independently assess the proposal")
+          ) {
+            assert.equal(
+              (input.data as any).proposal.citation.quote,
+              "Cache enabled is false.",
+            );
+            return {
+              verdict: "unsupported",
+              reason: "The full paragraph negates the claim.",
+            };
+          }
+          return base.generate(input);
+        },
+      },
     });
     const invalid = await bad.review({ batch: b.batch });
     assert.equal(invalid.status, "unresolved");
-    assert.match(invalid.detail, /complete source paragraph/);
+    assert.match(invalid.detail, /Independent evidence assessment/);
     let captures = 0;
     const wrapper = {
       captureAddPrecondition: async () => {
