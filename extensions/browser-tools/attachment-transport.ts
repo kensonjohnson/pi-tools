@@ -142,7 +142,11 @@ export async function connectAttachment(
   options: { signal?: AbortSignal; timeoutMs?: number } = {},
 ): Promise<{ browser: Browser; disconnect(): void }> {
   const timeoutMs = options.timeoutMs ?? 5000;
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30000)
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > 2147483647
+  )
     throw new Error("Invalid attachment timeout");
   if (options.signal?.aborted) throw new Error("Attachment aborted");
   const controller = new AbortController();

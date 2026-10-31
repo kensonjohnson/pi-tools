@@ -11,13 +11,13 @@ import {
 } from "./recording-recovery.ts";
 
 test(
-  "recovery explicitly reports when its scan limit truncates results",
+  "recovery paginates past ten thousand matching directories",
   { timeout: 30000 },
   async () => {
     const root = await mkdtemp(join(tmpdir(), "recording-scan-cap-test-"));
     const moduleUrl = new URL("./recording-recovery.ts", import.meta.url).href;
     try {
-      const script = `import { writeFileSync } from 'node:fs'; import {join} from 'node:path'; import {listRecordingRecovery, RECORDING_RECOVERY_SCAN_LIMIT as limit} from ${JSON.stringify(moduleUrl)}; for (let i=0;i<=limit;i++) writeFileSync(join(process.env.TMPDIR, 'entry-'+i), ''); console.log(JSON.stringify(await listRecordingRecovery('owner')));`;
+      const script = `import { mkdirSync } from 'node:fs'; import {createHash} from 'node:crypto'; import {join} from 'node:path'; import {listRecordingRecovery} from ${JSON.stringify(moduleUrl)}; const key = createHash('sha256').update('owner').digest('hex'); for (let i=0;i<10002;i++) mkdirSync(join(process.env.TMPDIR, 'pi-browser-video-'+key+'-'+i.toString(36).padStart(6,'0')), {mode:0o700}); const page = await listRecordingRecovery('owner',10000,1); const controller = new AbortController(); setTimeout(() => controller.abort(), 1); let cancelled = false; try { await listRecordingRecovery('owner',10000,1,controller.signal); } catch (error) { cancelled = /cancelled/.test(String(error)); } console.log(JSON.stringify({...page,cancelled}));`;
       const child = spawnSync(
         process.execPath,
         ["--experimental-strip-types", "--input-type=module", "-e", script],
@@ -29,10 +29,11 @@ test(
       );
       assert.equal(child.status, 0, child.stderr);
       const result = JSON.parse(child.stdout);
-      assert.equal(result.scanLimit, 10000);
-      assert.equal(result.scanned, 10001);
+      assert.ok(result.scanned > 10000);
+      assert.equal(result.items.length, 1);
       assert.equal(result.truncated, true);
-      assert.equal(result.nextOffset, null);
+      assert.equal(result.nextOffset, 10001);
+      assert.equal(result.cancelled, true);
     } finally {
       await rm(root, { recursive: true, force: true });
     }

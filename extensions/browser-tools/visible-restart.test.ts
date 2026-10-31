@@ -2,12 +2,99 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter, once } from "node:events";
 import { spawn } from "node:child_process";
+import { Readable } from "node:stream";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireProfile } from "./profiles.ts";
 import { ManagedSessions } from "./sessions.ts";
+import { DownloadManager } from "./downloads.ts";
 import { createManagedBrowserExtension } from "./registration.ts";
+
+test("visible restart refuses retained native bytes both before request and before consent", async () => {
+  const root = await realpath(
+    await mkdtemp(join(tmpdir(), "visible-download-risk-")),
+  );
+  const contexts: Context[] = [];
+  const downloads = new DownloadManager({
+    sink: {
+      putBinary: async () => {
+        throw new Error("quota exceeded");
+      },
+    },
+  });
+  const sessions = new ManagedSessions({
+    launch: async () => {
+      throw new Error("unexpected");
+    },
+    profileRoot: root,
+    downloads,
+    launchPersistent: async () => {
+      const context = new Context();
+      contexts.push(context);
+      return context as never;
+    },
+  });
+  try {
+    const target = await sessions.start({
+      profile: "test",
+      headless: true,
+      artifactOwner: "owner",
+    });
+    const request: any = sessions.requestVisibleRestart(target, "owner");
+    contexts[0].page.emit("download", {
+      url: () => "https://example.test/file",
+      suggestedFilename: () => "fixture",
+      failure: async () => null,
+      createReadStream: async () => Readable.from([Buffer.from("recover")]),
+      cancel: async () => {},
+      delete: async () => {},
+    });
+    const id = downloads.list(target.sessionId)[0].id;
+    const failed = await downloads.wait(target.sessionId, id);
+    assert.equal(failed.nativeRecovery, "available_until_session_close");
+    await assert.rejects(
+      sessions.confirmVisibleRestart(
+        target.sessionId,
+        request.restartId,
+        "owner",
+      ),
+      /native recovery bytes are unexported/,
+    );
+    assert.equal(contexts[0].page.closed, false);
+    assert.equal(contexts.length, 1);
+    sessions.cancelVisibleRestart(target.sessionId, request.restartId, "owner");
+    assert.throws(
+      () => sessions.requestVisibleRestart(target, "owner"),
+      /native recovery bytes are unexported/,
+    );
+    assert.throws(
+      () => sessions.requestVisibleRestart(target, "other"),
+      /Session unavailable/,
+    );
+    await assert.rejects(
+      sessions.closeTab(target, undefined, "owner"),
+      /Tab close blocked/,
+    );
+    assert.equal(
+      (await downloads.exportNative(target.sessionId, id, join(root, "saved")))
+        .status,
+      "complete",
+    );
+    const next: any = sessions.requestVisibleRestart(target, "owner");
+    const result: any = await sessions.confirmVisibleRestart(
+      target.sessionId,
+      next.restartId,
+      "owner",
+    );
+    assert.equal(result.status, "awaiting_human");
+    assert.equal(contexts[0].page.closed, true);
+    assert.equal(contexts.length, 2);
+  } finally {
+    await sessions.shutdown();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 function deferred() {
   let resolve!: () => void;

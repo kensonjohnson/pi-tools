@@ -108,6 +108,20 @@ test("cancel and waiter abort release listeners and session teardown waits", asy
   p.emit("download", f.download);
   const id = manager.list("owner")[0].id,
     abort = new AbortController();
+  for (const timeoutMs of [300001, 2147483647]) {
+    const controller = new AbortController();
+    const waiting = manager.wait("owner", id, {
+      signal: controller.signal,
+      timeoutMs,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+    await assert.rejects(waiting, /cancelled/);
+  }
+  await assert.rejects(
+    manager.wait("owner", id, { timeoutMs: 2147483648 }),
+    /Invalid download wait timeout/,
+  );
   const waiter = manager.wait("owner", id, { signal: abort.signal });
   abort.abort();
   await assert.rejects(waiter, /cancelled/);

@@ -75,10 +75,21 @@ test(
     const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
     let page: AttachedPage | undefined;
     try {
-      page = await AttachedPage.connect(origin, "chosen", { lockRoot: dir });
+      await assert.rejects(
+        AttachedPage.connect(origin, "chosen", {
+          lockRoot: dir,
+          timeoutMs: 2147483648,
+        }),
+        /Invalid attachment timeout/,
+      );
+      page = await AttachedPage.connect(origin, "chosen", {
+        lockRoot: dir,
+        timeoutMs: 2147483647,
+      });
       const controller = new AbortController();
       const pending = page.navigate("http://example.test/", {
         signal: controller.signal,
+        timeoutMs: 2147483647,
       });
       await sent;
       controller.abort();

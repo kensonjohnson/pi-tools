@@ -1,10 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createManagedBrowserExtension } from "./registration.ts";
-import {
-  createRecordingDirectory,
-  RECORDING_RECOVERY_SCAN_LIMIT,
-} from "./recording-recovery.ts";
+import { createRecordingDirectory } from "./recording-recovery.ts";
 import { Value } from "@sinclair/typebox/value";
 import { randomUUID } from "node:crypto";
 import { rm } from "node:fs/promises";
@@ -57,7 +54,7 @@ test("registration forwards creation-time video and never relaunches on enable r
   };
   await handlers.get("session_start")!({}, ctx);
   try {
-    await tools
+    const started = await tools
       .get("browser_session")
       .execute(
         "id",
@@ -66,6 +63,9 @@ test("registration forwards creation-time video and never relaunches on enable r
         undefined,
         ctx,
       );
+    const startResult = JSON.parse(started.content[0].text);
+    assert.equal(startResult.videoDeadline.durationMs, 300000);
+    assert.match(startResult.videoDeadline.warning, /may be lost/);
     assert.equal(options.video, true);
     assert.equal(options.artifactOwner, owner);
     const recovery = await tools
@@ -96,20 +96,66 @@ test("registration forwards creation-time video and never relaunches on enable r
         ctx,
       );
       const page = JSON.parse(response.content[0].text);
-      assert.equal(page.scanLimit, RECORDING_RECOVERY_SCAN_LIMIT);
-      assert.equal(page.truncated, false);
+      assert.equal(page.truncated, page.nextOffset !== null);
       paths.push(...page.items.map((item: { path: string }) => item.path));
       if (page.nextOffset === null) break;
       offset = page.nextOffset;
     } while (true);
     assert.ok(offset >= 120);
     assert.deepEqual(new Set(paths), new Set([recoveryDir, ...extraDirs]));
+    const wide = JSON.parse(
+      (
+        await tool.execute(
+          "id",
+          { action: "recovery", limit: 1000 },
+          undefined,
+          undefined,
+          ctx,
+        )
+      ).content[0].text,
+    );
+    if (wide.artifact) {
+      let offset = 0,
+        text = "";
+      for (;;) {
+        const chunk = JSON.parse(
+          (
+            await tools
+              .get("browser_artifact")
+              .execute(
+                "id",
+                { action: "read", id: wide.artifact.id, offset },
+                undefined,
+                undefined,
+                ctx,
+              )
+          ).content[0].text,
+        );
+        text += chunk.text;
+        if (chunk.nextOffset === null) break;
+        offset = chunk.nextOffset;
+      }
+      assert.equal(JSON.parse(text).items.length, 123);
+      await assert.rejects(
+        tools
+          .get("browser_artifact")
+          .execute(
+            "id",
+            { action: "read", id: wide.artifact.id },
+            undefined,
+            undefined,
+            { ...ctx, sessionManager: { getSessionId: () => "foreign" } },
+          ),
+        /owned by another/,
+      );
+    } else assert.equal(wide.items.length, 123);
     assert.equal(
       Value.Check(tool.parameters, {
         action: "recovery",
-        offset: RECORDING_RECOVERY_SCAN_LIMIT + 1,
+        offset: 10001,
+        limit: 1000,
       }),
-      false,
+      true,
     );
     await assert.rejects(
       tools

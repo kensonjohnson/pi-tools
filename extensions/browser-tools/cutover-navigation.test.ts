@@ -82,6 +82,9 @@ test("navigation output and errors do not disclose URL credentials", async () =>
       JSON.stringify(sessions.list("owner")),
       /user|password|SECRET|PRIVATE/,
     );
+    const longUrl = "https://example.invalid/" + "a".repeat(9000);
+    await call(longUrl);
+    assert.equal(browser.page.current, longUrl);
     const data = JSON.parse(
       (await call("data:text/html,private-data")).content[0].text,
     );

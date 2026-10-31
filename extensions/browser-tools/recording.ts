@@ -19,7 +19,7 @@ export type TraceRecord = {
 };
 type Entry = {
   owner: string;
-  context: BrowserContext;
+  context?: BrowserContext;
   record: TraceRecord;
   directory?: string;
   start: Promise<void>;
@@ -43,6 +43,14 @@ export class TraceRecordings {
     maxBytes: number;
     timeoutMs: number;
   }) {
+    if (
+      !Number.isSafeInteger(options.durationMs) ||
+      options.durationMs < 1 ||
+      options.durationMs > 2147483647
+    )
+      throw new Error(
+        "Recording duration exceeds the supported Node timer range.",
+      );
     this.options = options;
   }
 
@@ -73,26 +81,6 @@ export class TraceRecordings {
         );
       this.entries.delete(sessionId);
     }
-    const owned = [...this.entries.entries()].filter(
-      ([, item]) => item.owner === owner,
-    );
-    if (owned.length >= 100 || this.entries.size >= 1000) {
-      const evictable = owned.find(
-        ([, item]) =>
-          item.settled &&
-          item.record.state === "complete" &&
-          !item.record.error,
-      );
-      if (evictable) this.entries.delete(evictable[0]);
-    }
-    if (
-      [...this.entries.values()].filter((item) => item.owner === owner)
-        .length >= 100 ||
-      this.entries.size >= 1000
-    )
-      throw new Error(
-        "Recording history capacity reached; pending recovery records are retained.",
-      );
     const entry: Entry = {
       owner,
       context,
@@ -147,6 +135,7 @@ export class TraceRecordings {
     const entry = this.entry(sessionId, owner);
     if (!entry.finish) {
       if (entry.timer) clearTimeout(entry.timer);
+      entry.timer = undefined;
       entry.finish = this.finalize(entry);
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -174,6 +163,7 @@ export class TraceRecordings {
         throw new Error("Private recording directory unavailable.");
       const path = join(entry.directory, "trace.zip");
       entry.record.state = "finalizing";
+      if (!entry.context) throw new Error("Trace context unavailable.");
       await entry.context.tracing.stop({ path });
       const signal = AbortSignal.timeout(this.options.timeoutMs);
       const artifact = await this.options.sink.putBinary(
@@ -202,6 +192,8 @@ export class TraceRecordings {
           entry.record.recoveryDirectory = entry.directory;
         }
       }
+      entry.context = undefined;
+      entry.start = Promise.resolve();
       entry.settled = true;
     }
   }

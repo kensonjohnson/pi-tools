@@ -45,9 +45,32 @@ test("attachment discovery rejects redirects, malformed endpoints and cancellati
       sessions.attachExternal(`${origin}/path`, "owner"),
       /origin/,
     );
-    const attached = await sessions.attachExternal(origin, "owner");
     await assert.rejects(
-      sessions.attachmentTargets(attached.attachmentId, "owner"),
+      sessions.attachExternal(origin, "owner", undefined, 2147483648),
+      /Invalid attachment timeout/,
+    );
+    const attached = await sessions.attachExternal(
+      origin,
+      "owner",
+      undefined,
+      2147483647,
+    );
+    await assert.rejects(
+      sessions.attachmentTargets(
+        attached.attachmentId,
+        "owner",
+        undefined,
+        2147483648,
+      ),
+      /Invalid attachment discovery timeout/,
+    );
+    await assert.rejects(
+      sessions.attachmentTargets(
+        attached.attachmentId,
+        "owner",
+        undefined,
+        2147483647,
+      ),
       /redirect/,
     );
     assert.deepEqual(sessions.listAttachments("owner"), []);

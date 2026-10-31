@@ -22,6 +22,17 @@ export type VideoRecord = {
     error?: string;
   }[];
   recoveryDirectory?: string;
+  deadlineClosure?: {
+    reason: "deadline" | "video_unavailable";
+    riskAssessment: "observed" | "unknown";
+    downloadRisks: {
+      sessionId: string;
+      id: string;
+      state: string;
+      nativeRecovery: string | null;
+    }[];
+    warning: string;
+  };
   error?: string;
 };
 type EbmlElement = { id: number; start: number; end: number };
@@ -241,6 +252,14 @@ export class VideoRecordings {
     timeoutMs: number;
     maxBytes: number;
   }) {
+    if (
+      !Number.isSafeInteger(options.durationMs) ||
+      options.durationMs < 1 ||
+      options.durationMs > 2147483647
+    )
+      throw new Error(
+        "Recording duration exceeds the supported Node timer range.",
+      );
     this.options = options;
   }
   private entry(sessionId: string, owner: string): Entry {
@@ -257,23 +276,6 @@ export class VideoRecordings {
   async prepare(sessionId: string, owner: string): Promise<string> {
     if (this.entries.has(sessionId))
       throw new Error("Duplicate video session.");
-    const owned = [...this.entries.entries()].filter(
-      ([, item]) => item.owner === owner,
-    );
-    if (owned.length >= 100 || this.entries.size >= 1000) {
-      const evictable = owned.find(
-        ([, item]) => item.record.state === "complete",
-      );
-      if (evictable) this.entries.delete(evictable[0]);
-    }
-    if (
-      this.entries.size >= 1000 ||
-      [...this.entries.values()].filter((item) => item.owner === owner)
-        .length >= 100
-    )
-      throw new Error(
-        "Video recording history capacity reached; pending recovery records are retained.",
-      );
     // Reserve before filesystem work, so concurrent starts cannot bypass admission.
     const entry: Entry = {
       owner,
@@ -296,25 +298,18 @@ export class VideoRecordings {
     sessionId: string,
     owner: string,
     context: BrowserContext,
-    onDeadline: () => void,
+    onDeadline: (reason: "deadline" | "video_unavailable") => void,
   ): void {
     const entry = this.entry(sessionId, owner);
     const capture = (page: Page) => {
       if (entry.pages.has(page) || entry.overflow) return;
-      if (entry.native.length >= 100) {
-        entry.overflow = true;
-        entry.record.error =
-          "Video page limit exceeded; the private directory is retained for recovery.";
-        onDeadline();
-        return;
-      }
       entry.pages.add(page);
       const video = page.video();
       if (!video) {
         entry.overflow = true;
         entry.record.error =
           "Native page video unavailable; private directory retained.";
-        onDeadline();
+        onDeadline("video_unavailable");
         return;
       }
       const id = randomUUID();
@@ -327,7 +322,26 @@ export class VideoRecordings {
     for (const page of context.pages()) capture(page);
     entry.record.state = "recording";
     if (!entry.overflow)
-      entry.timer = setTimeout(onDeadline, this.options.durationMs);
+      entry.timer = setTimeout(
+        () => onDeadline("deadline"),
+        this.options.durationMs,
+      );
+  }
+  noteDeadlineClosure(
+    sessionId: string,
+    owner: string,
+    reason: "deadline" | "video_unavailable",
+    downloadRisks: NonNullable<VideoRecord["deadlineClosure"]>["downloadRisks"],
+    riskUnknown = false,
+  ): void {
+    const entry = this.entry(sessionId, owner);
+    entry.record.deadlineClosure = {
+      reason,
+      riskAssessment: riskUnknown ? "unknown" : "observed",
+      downloadRisks: structuredClone(downloadRisks),
+      warning:
+        "Recording closure was requested. Active or unexported native downloads may be destroyed; availability after closure is unknown. Downloads started during closure may not appear in this list.",
+    };
   }
   /** Called only after confirmed owned context/browser closure. */
   async closed(sessionId: string, owner: string): Promise<boolean> {
@@ -342,6 +356,7 @@ export class VideoRecordings {
     }
     if (!entry.finish) {
       if (entry.timer) clearTimeout(entry.timer);
+      entry.timer = undefined;
       entry.finish = this.finalize(entry);
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -368,90 +383,118 @@ export class VideoRecordings {
   markUnverified(sessionId: string, owner: string, message: string): void {
     const entry = this.entry(sessionId, owner);
     if (entry.timer) clearTimeout(entry.timer);
+    entry.timer = undefined;
     entry.record.state = "unknown";
     entry.record.recoveryDirectory = entry.directory;
     entry.record.error = message;
   }
-  private async finalize(entry: Entry): Promise<void> {
-    entry.record.state = "finalizing";
+  /** Abandon in-memory native handles only after closure/finalization has become unverified. */
+  releaseUnverified(sessionId: string, owner: string): void {
+    const entry = this.entry(sessionId, owner);
+    if (entry.finish) return; // In-flight finalization still needs its native handles.
     if (entry.context && entry.listener) {
       try {
         entry.context.off("page", entry.listener);
       } catch {
-        entry.overflow = true;
+        entry.record.error = `${entry.record.error ?? "Video cleanup unverified."} Page listener removal is unverified.`;
       }
     }
-    const savedPaths: { path: string; identity: Stats }[] = [];
-    for (const native of entry.native) {
-      const record = entry.record.videos.find((item) => item.id === native.id)!;
-      try {
-        const path = resolve(await native.video.path());
-        if (dirname(path) !== resolve(entry.directory))
-          throw new Error(
-            "Native video path is outside its private directory.",
-          );
-        const expected = await lstat(path);
-        if (
-          !expected.isFile() ||
-          expected.isSymbolicLink() ||
-          expected.nlink !== 1
-        )
-          throw new Error("Unsafe native video file.");
-        const file = await open(
-          path,
-          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-        );
+    entry.pages.clear();
+    entry.native = [];
+    entry.context = undefined;
+    entry.listener = undefined;
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.timer = undefined;
+  }
+  private async finalize(entry: Entry): Promise<void> {
+    entry.record.state = "finalizing";
+    try {
+      if (entry.context && entry.listener) {
         try {
-          const identity = await file.stat();
-          if (!sameVideo(expected, identity))
-            throw new Error("Native video changed before validation.");
-          await validateNativeWebm(file, identity);
-          const finished = { value: false };
-          record.artifact = await this.options.sink.putBinary(
-            entry.owner,
-            videoBytes(file, identity, finished),
-            {
-              maxBytes: this.options.maxBytes,
-              signal: AbortSignal.timeout(this.options.timeoutMs),
-            },
-          );
-          if (!finished.value)
+          entry.context.off("page", entry.listener);
+        } catch {
+          entry.overflow = true;
+        }
+      }
+      const savedPaths: { path: string; identity: Stats }[] = [];
+      for (const [index, native] of entry.native.entries()) {
+        const record = entry.record.videos[index];
+        try {
+          const path = resolve(await native.video.path());
+          if (dirname(path) !== resolve(entry.directory))
             throw new Error(
-              "Video sink did not consume and verify the complete file; publication is unverified.",
+              "Native video path is outside its private directory.",
             );
-          record.state = "complete";
-          savedPaths.push({ path, identity });
-        } finally {
-          await file.close();
+          const expected = await lstat(path);
+          if (
+            !expected.isFile() ||
+            expected.isSymbolicLink() ||
+            expected.nlink !== 1
+          )
+            throw new Error("Unsafe native video file.");
+          const file = await open(
+            path,
+            constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+          );
+          try {
+            const identity = await file.stat();
+            if (!sameVideo(expected, identity))
+              throw new Error("Native video changed before validation.");
+            await validateNativeWebm(file, identity);
+            const finished = { value: false };
+            record.artifact = await this.options.sink.putBinary(
+              entry.owner,
+              videoBytes(file, identity, finished),
+              {
+                maxBytes: this.options.maxBytes,
+                signal: AbortSignal.timeout(this.options.timeoutMs),
+              },
+            );
+            if (!finished.value)
+              throw new Error(
+                "Video sink did not consume and verify the complete file; publication is unverified.",
+              );
+            record.state = "complete";
+            savedPaths.push({ path, identity });
+          } finally {
+            await file.close();
+          }
+        } catch (error) {
+          record.state = "failed";
+          record.error = String(error).slice(0, 300);
+          entry.overflow = true;
         }
-      } catch (error) {
-        record.state = "failed";
-        record.error = String(error).slice(0, 300);
-        entry.overflow = true;
       }
-    }
-    if (!entry.overflow) {
-      try {
-        for (const { path, identity } of savedPaths) {
-          const current = await lstat(path);
-          if (current.isSymbolicLink() || !sameVideo(identity, current))
-            throw new Error("Native video path changed; refusing cleanup.");
-          await unlink(path);
+      if (!entry.overflow) {
+        try {
+          for (const { path, identity } of savedPaths) {
+            const current = await lstat(path);
+            if (current.isSymbolicLink() || !sameVideo(identity, current))
+              throw new Error("Native video path changed; refusing cleanup.");
+            await unlink(path);
+          }
+          await rmdir(entry.directory);
+        } catch {
+          entry.overflow = true;
         }
-        await rmdir(entry.directory);
-      } catch {
-        entry.overflow = true;
       }
-    }
-    if (entry.overflow) {
-      entry.record.state = "failed";
-      entry.record.recoveryDirectory = entry.directory;
-      entry.record.error ??=
-        "Video publication or private temporary cleanup failed; directory retained for recovery.";
-    } else {
-      entry.record.state = "complete";
-      entry.record.recoveryDirectory = undefined;
-      entry.record.error = undefined;
+      if (entry.overflow) {
+        entry.record.state = "failed";
+        entry.record.recoveryDirectory = entry.directory;
+        entry.record.error ??=
+          "Video publication or private temporary cleanup failed; directory retained for recovery.";
+      } else {
+        entry.record.state = "complete";
+        entry.record.recoveryDirectory = undefined;
+        entry.record.error = undefined;
+      }
+    } finally {
+      entry.pages.clear();
+      entry.native = [];
+      entry.context = undefined;
+      entry.listener = undefined;
+      if (entry.timer) clearTimeout(entry.timer);
+      entry.timer = undefined;
     }
   }
 }

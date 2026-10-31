@@ -38,6 +38,7 @@ test("registered semantic tools enforce ownership, navigation invalidation, pick
   let mode: "cancel" | "uncertain" | "selected" = "cancel";
   let disposed = 0;
   let clicks = 0;
+  let snapshotOptions: Record<string, unknown> | undefined;
   const sessions = new ManagedSessions({
     launch: async () => browser as never,
     makeSnapshots: (page) => {
@@ -47,7 +48,8 @@ test("registered semantic tools enforce ownership, navigation invalidation, pick
       };
       page.on("framenavigated", invalidate);
       return {
-        snapshot: async () => {
+        snapshot: async (options: Record<string, unknown>) => {
+          snapshotOptions = options;
           valid = true;
           return { records: [{ ref: "ref" }] };
         },
@@ -135,7 +137,33 @@ test("registered semantic tools enforce ownership, navigation invalidation, pick
     tools.get("browser_pick").description,
     /frames are unsupported/,
   );
-  await call("browser_snapshot", target);
+  await call("browser_snapshot", {
+    ...target,
+    maxNodes: 5000,
+    maxRecords: 1000,
+    maxChars: 64000,
+    maxFrames: 64,
+    maxScopeNodes: 50000,
+    identityNameChars: 2000,
+    identityTextChars: 3000,
+    identityNodes: 600,
+    identityAncestors: 300,
+    identityFrameDepth: 40,
+    identityMetadataChars: 2000,
+    identityLabels: 50,
+  });
+  assert.equal(snapshotOptions?.maxNodes, 5000);
+  assert.equal(snapshotOptions?.maxRecords, 1000);
+  assert.equal(snapshotOptions?.maxChars, 64000);
+  assert.equal(snapshotOptions?.maxFrames, 64);
+  assert.equal(snapshotOptions?.maxScopeNodes, 50000);
+  assert.equal(snapshotOptions?.identityNameChars, 2000);
+  assert.equal(snapshotOptions?.identityTextChars, 3000);
+  assert.equal(snapshotOptions?.identityNodes, 600);
+  assert.equal(snapshotOptions?.identityAncestors, 300);
+  assert.equal(snapshotOptions?.identityFrameDepth, 40);
+  assert.equal(snapshotOptions?.identityMetadataChars, 2000);
+  assert.equal(snapshotOptions?.identityLabels, 50);
   await assert.rejects(
     call("browser_snapshot_ref", { ...target, ref: "ref" }, "foreign"),
     /Session unavailable/,

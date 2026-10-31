@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
+import { isAbsolute, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import { sanitizeUrl } from "./redaction.ts";
 
@@ -35,7 +38,12 @@ export type BinaryArtifactSink = {
   putBinary(
     owner: string,
     data: AsyncIterable<Uint8Array>,
-    options: { maxBytes: number; signal: AbortSignal },
+    options: {
+      maxBytes: number;
+      signal: AbortSignal;
+      sourceTimeoutMs?: number;
+      lockWaitTimeoutMs?: number;
+    },
   ): Promise<DownloadArtifact>;
 };
 export type DownloadRecord = DownloadTarget & {
@@ -45,10 +53,13 @@ export type DownloadRecord = DownloadTarget & {
   state: "pending" | "saving" | "complete" | "failed" | "cancelled" | "unknown";
   failure?: string;
   cleanupWarning?: string;
+  nativeRecovery?:
+    "available_until_session_close" | "unknown" | "unknown_after_close";
+  nativeExport?: { path: string; bytes: number };
   artifact?: DownloadArtifact;
 };
 const LIMIT_NOTICE =
-  "The size limit applies to retained files, not browser/network temporary bytes. Admission is subject to per-owner and total record limits; rejectionReasons reports saturation. Closed-session reports expire from bounded history.";
+  "Configured limits apply to retained files, not browser/network temporary bytes. Rejection and eviction counters report configured admission and history limits. Artifact retention and disk capacity still apply.";
 const terminal = (state: DownloadRecord["state"]) =>
   state === "complete" ||
   state === "failed" ||
@@ -92,6 +103,28 @@ async function deadline<T>(
   } finally {
     if (timer) clearTimeout(timer);
     if (onAbort) signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+async function untilAbort<T>(
+  operation: () => Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => {
+        if (signal.aborted) throw new Error("Download cancelled.");
+        return operation();
+      }),
+      new Promise<never>((_, reject) => {
+        onAbort = () => reject(new Error("Download cancelled."));
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+      }),
+    ]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
   }
 }
 
@@ -157,6 +190,7 @@ export class DownloadManager {
   private readonly maxClosedSessions: number;
   private readonly maxWaiters: number;
   private readonly operationTimeoutMs: number;
+  private readonly transferTimeoutMs?: number;
   private readonly onOverflow?: (sessionId: string) => void;
   private readonly owners = new Map<string, string>();
   constructor(options: {
@@ -174,15 +208,17 @@ export class DownloadManager {
     onOverflow?: (sessionId: string) => void;
   }) {
     this.sink = options.sink;
-    this.maxBytes = options.maxBytes ?? 100 * 1024 * 1024;
-    this.maxActive = options.maxActive ?? 4;
-    this.maxRecords = options.maxRecords ?? 100;
-    this.maxTotalRecords = options.maxTotalRecords ?? 1000;
-    this.maxSessions = options.maxSessions ?? 256;
-    this.maxPages = options.maxPages ?? 1024;
-    this.maxClosedSessions = options.maxClosedSessions ?? 100;
-    this.maxWaiters = options.maxWaiters ?? 50;
+    this.maxBytes = options.maxBytes ?? Number.MAX_SAFE_INTEGER;
+    this.maxActive = options.maxActive ?? Number.MAX_SAFE_INTEGER;
+    this.maxRecords = options.maxRecords ?? Number.MAX_SAFE_INTEGER;
+    this.maxTotalRecords = options.maxTotalRecords ?? Number.MAX_SAFE_INTEGER;
+    this.maxSessions = options.maxSessions ?? Number.MAX_SAFE_INTEGER;
+    this.maxPages = options.maxPages ?? Number.MAX_SAFE_INTEGER;
+    this.maxClosedSessions =
+      options.maxClosedSessions ?? Number.MAX_SAFE_INTEGER;
+    this.maxWaiters = options.maxWaiters ?? Number.MAX_SAFE_INTEGER;
     this.operationTimeoutMs = options.operationTimeoutMs ?? 30000;
+    this.transferTimeoutMs = options.operationTimeoutMs;
     this.onOverflow = options.onOverflow;
     for (const value of [
       this.maxBytes,
@@ -451,7 +487,12 @@ export class DownloadManager {
   }
   private evictOne(owner: string) {
     for (const [id, entry] of this.entries) {
-      if (entry.owner === owner && entry.settled && entry.waiters.size === 0) {
+      if (
+        entry.owner === owner &&
+        entry.settled &&
+        entry.waiters.size === 0 &&
+        entry.record.nativeRecovery !== "available_until_session_close"
+      ) {
         this.entries.delete(id);
         const sessionId = entry.record.sessionId;
         this.evicted.set(
@@ -475,6 +516,9 @@ export class DownloadManager {
       this.rejectNative(target.sessionId, native);
       return;
     }
+    // Release expired closed-session artifacts before applying configured admission limits.
+    for (const sessionId of this.closeReports.keys())
+      this.pruneExpired(sessionId);
     // Limits are per owner and total. Never evict another owner's record.
     let ownerCount = [...this.entries.values()].filter(
       (entry) => entry.owner === owner,
@@ -539,15 +583,19 @@ export class DownloadManager {
   }
   private async save(entry: Entry) {
     const { record, native, controller } = entry;
+    let nativeComplete = false;
     try {
-      const failure = await deadline(
-        "Download completion",
-        () => native.failure(),
-        this.operationTimeoutMs,
-        controller.signal,
-      );
+      const failure = this.transferTimeoutMs
+        ? await deadline(
+            "Download completion",
+            () => native.failure(),
+            this.transferTimeoutMs,
+            controller.signal,
+          )
+        : await untilAbort(() => native.failure(), controller.signal);
       if (controller.signal.aborted) throw new Error("Download cancelled.");
       if (failure) throw new Error("Browser download failed.");
+      nativeComplete = true;
       const stream = await deadline(
         "Download stream",
         () =>
@@ -587,15 +635,16 @@ export class DownloadManager {
       };
       let artifact: DownloadArtifact;
       try {
-        artifact = await deadline(
-          "Artifact save",
-          () =>
-            this.sink.putBinary(entry.owner, bounded(), {
-              maxBytes: max,
-              signal: controller.signal,
-            }),
-          this.operationTimeoutMs,
-        );
+        const save = () =>
+          this.sink.putBinary(entry.owner, bounded(), {
+            maxBytes: max,
+            signal: controller.signal,
+            sourceTimeoutMs: 0,
+            lockWaitTimeoutMs: 0,
+          });
+        artifact = this.transferTimeoutMs
+          ? await deadline("Artifact save", save, this.transferTimeoutMs)
+          : await save();
       } finally {
         controller.signal.removeEventListener("abort", stopStream);
         stream.destroy();
@@ -623,14 +672,42 @@ export class DownloadManager {
           " Artifact publication may have occurred; do not retry without inspection.";
     } finally {
       if (entry.cancelling) await entry.cancelling;
-      const warning = await this.cleanupNative(native, record.sessionId, false);
-      if (warning)
-        record.cleanupWarning = [record.cleanupWarning, warning]
-          .filter(Boolean)
-          .join("; ");
+      if (
+        nativeComplete &&
+        (record.state === "failed" || record.state === "unknown")
+      ) {
+        record.nativeRecovery = controller.signal.aborted
+          ? "unknown"
+          : "available_until_session_close";
+        record.cleanupWarning = controller.signal.aborted
+          ? "Native download was not deleted, but cancellation makes its availability unknown."
+          : "Native download was retained for explicit export; browser closure may destroy it.";
+      } else {
+        const warning = await this.cleanupNative(
+          native,
+          record.sessionId,
+          false,
+        );
+        if (warning)
+          record.cleanupWarning = [record.cleanupWarning, warning]
+            .filter(Boolean)
+            .join("; ");
+      }
     }
   }
+  private pruneExpired(sessionId: string) {
+    if (!this.closeReports.has(sessionId)) return;
+    const now = Date.now();
+    for (const [id, entry] of this.entries)
+      if (
+        entry.record.sessionId === sessionId &&
+        entry.record.artifact &&
+        entry.record.artifact.expiresAt <= now
+      )
+        this.entries.delete(id);
+  }
   private get(sessionId: string, id: string) {
+    this.pruneExpired(sessionId);
     const entry = this.entries.get(id);
     if (!entry || entry.record.sessionId !== sessionId)
       throw new Error("Download unavailable or owned by another session.");
@@ -642,7 +719,30 @@ export class DownloadManager {
         this.closeReports.get(sessionId)?.owner) === owner
     );
   }
+  closeRisks(owner?: string, sessionId?: string) {
+    return [...this.entries.values()]
+      .filter(
+        (entry) =>
+          (!owner || entry.owner === owner) &&
+          (!sessionId || entry.record.sessionId === sessionId) &&
+          !this.closeReports.has(entry.record.sessionId),
+      )
+      .filter(
+        (entry) =>
+          !entry.settled ||
+          ((entry.record.nativeRecovery === "available_until_session_close" ||
+            entry.record.nativeRecovery === "unknown") &&
+            !entry.record.nativeExport),
+      )
+      .map((entry) => ({
+        sessionId: entry.record.sessionId,
+        id: entry.record.id,
+        state: entry.record.state,
+        nativeRecovery: entry.record.nativeRecovery ?? null,
+      }));
+  }
   list(sessionId: string): DownloadRecord[] {
+    this.pruneExpired(sessionId);
     return [...this.entries.values()]
       .filter((e) => e.record.sessionId === sessionId)
       .map((e) => structuredClone(e.record));
@@ -669,6 +769,114 @@ export class DownloadManager {
   inspect(sessionId: string, id: string): DownloadRecord {
     return structuredClone(this.get(sessionId, id).record);
   }
+  /** Explicitly copy retained native bytes to a new local file without overwriting. */
+  async exportNative(
+    sessionId: string,
+    id: string,
+    destination: string,
+    signal?: AbortSignal,
+  ) {
+    const entry = this.get(sessionId, id);
+    if (
+      entry.record.nativeRecovery !== "available_until_session_close" ||
+      this.endings.has(sessionId) ||
+      this.closeReports.has(sessionId)
+    )
+      throw new Error(
+        "Retained native download is unavailable or its state is unknown.",
+      );
+    if (!isAbsolute(destination) || destination.includes("\0"))
+      throw new Error(
+        "Native export destination must be an absolute file path.",
+      );
+    if (signal?.aborted)
+      throw new Error("Native export cancelled before creating a file.");
+    let abandoned = false;
+    let stream: Readable | null;
+    try {
+      stream = await deadline(
+        "Native download stream",
+        () =>
+          entry.native.createReadStream().then((value) => {
+            if (abandoned || signal?.aborted) value?.destroy();
+            return value;
+          }),
+        this.operationTimeoutMs,
+        signal,
+      );
+    } catch (error) {
+      abandoned = true;
+      throw error;
+    }
+    if (!stream)
+      throw new Error("Retained native download stream unavailable.");
+    const path = resolve(destination);
+    let output: Awaited<ReturnType<typeof open>> | undefined;
+    let bytes = 0;
+    const cancel = () => stream.destroy();
+    signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      if (signal?.aborted)
+        throw new Error("Native export cancelled before creating a file.");
+      if (this.endings.has(sessionId) || this.closeReports.has(sessionId))
+        throw new Error(
+          "Browser closure started; native download availability is unknown.",
+        );
+      output = await open(
+        path,
+        constants.O_WRONLY |
+          constants.O_CREAT |
+          constants.O_EXCL |
+          constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        for await (const chunk of stream) {
+          if (signal?.aborted) throw new Error("Native export cancelled.");
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          if (buffer.length > Number.MAX_SAFE_INTEGER - bytes)
+            throw new Error(
+              "Native export exceeds safe byte accounting range.",
+            );
+          let offset = 0;
+          while (offset < buffer.length) {
+            if (signal?.aborted) throw new Error("Native export cancelled.");
+            const result = await output.write(
+              buffer,
+              offset,
+              buffer.length - offset,
+            );
+            if (!result.bytesWritten)
+              throw new Error("Native export write failed.");
+            offset += result.bytesWritten;
+            bytes += result.bytesWritten;
+          }
+        }
+        await output.sync();
+        await output.close();
+        output = undefined;
+        entry.record.nativeExport = { path, bytes };
+        return {
+          status: "complete" as const,
+          path,
+          bytes,
+          note: "Native bytes copied; the retained native download remains available until session closure.",
+        };
+      } catch (error) {
+        return {
+          status: "incomplete" as const,
+          path,
+          bytes,
+          failure: errorText(error),
+          note: "A partial destination may remain. It was not deleted; inspect it before retrying with a different path.",
+        };
+      }
+    } finally {
+      signal?.removeEventListener("abort", cancel);
+      stream.destroy();
+      await output?.close().catch(() => {});
+    }
+  }
   async wait(
     sessionId: string,
     id: string,
@@ -676,7 +884,7 @@ export class DownloadManager {
   ): Promise<DownloadRecord> {
     const entry = this.get(sessionId, id);
     const timeout = options.timeoutMs ?? 30000;
-    if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > 300000)
+    if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > 2147483647)
       throw new Error("Invalid download wait timeout.");
     if (options.signal?.aborted) throw new Error("Download wait cancelled.");
     if (entry.settled) return structuredClone(entry.record);
@@ -761,7 +969,15 @@ export class DownloadManager {
         }),
       );
       await Promise.all([...(this.rejectedWork.get(sessionId) ?? [])]);
-      for (const entry of entries) this.entries.delete(entry.record.id);
+      for (const entry of entries)
+        if (
+          entry.record.nativeRecovery === "available_until_session_close" ||
+          entry.record.nativeRecovery === "unknown"
+        ) {
+          entry.record.nativeRecovery = "unknown_after_close";
+          entry.record.cleanupWarning =
+            "Browser closure may destroy the retained native download; availability is unknown.";
+        }
       const warnings = this.warnings.get(sessionId) ?? 0;
       const report = {
         cleanup: warnings ? ("unverified" as const) : ("complete" as const),

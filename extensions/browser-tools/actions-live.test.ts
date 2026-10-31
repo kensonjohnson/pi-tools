@@ -87,6 +87,18 @@ test(
         ).verification,
         "no_expectation",
       );
+      const largeValue = "long-value-".repeat(1500);
+      await action({
+        action: "fill",
+        target: { selector: "#input" },
+        value: largeValue,
+      });
+      assert.equal(
+        await sessions.withOwnedPage(page, undefined, "owner", (p) =>
+          p.locator("#input").inputValue(),
+        ),
+        largeValue,
+      );
       await action({
         action: "press",
         target: { selector: "#input" },

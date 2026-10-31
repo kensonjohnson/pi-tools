@@ -37,7 +37,11 @@ export async function discoverAttachmentEndpoint(
   if (base.pathname !== "/" || base.search)
     throw new Error("Discovery endpoint must be an origin");
   const timeoutMs = options.timeoutMs ?? 5000;
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30000)
+  if (
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > 2147483647
+  )
     throw new Error("Invalid discovery timeout");
   const signal = options.signal;
   if (signal?.aborted) throw new Error("Attachment discovery aborted");

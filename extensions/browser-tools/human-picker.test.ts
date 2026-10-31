@@ -22,7 +22,14 @@ function deferred<T>() {
 }
 
 test("picker rejects invalid selection bounds before acquiring a session", async () => {
-  for (const maxSelections of [0, 21, 1.5, NaN]) {
+  for (const maxSelections of [
+    0,
+    -1,
+    1.5,
+    NaN,
+    Infinity,
+    Number.MAX_SAFE_INTEGER + 1,
+  ]) {
     const { page, browser } = fixture(new Promise(() => {}));
     await assert.rejects(
       pickHumanElement({
@@ -48,6 +55,7 @@ test(
       page,
       browser,
       signal: abort.signal,
+      maxSelections: Number.MAX_SAFE_INTEGER,
       onUncertainFailure: () => {
         failures++;
       },

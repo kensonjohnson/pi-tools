@@ -99,13 +99,21 @@ test(
         (
           await call("browser_eval", {
             ...target,
-            code: "prompt('Question','start')",
+            code: "prompt('Q'.repeat(1100),'D'.repeat(1100))",
           })
         ).content[0].text,
       );
       assert.equal(pending.status, "awaiting_dialog");
       assert.ok(Date.now() - start < 2000);
       assert.equal(pending.dialog.type, "prompt");
+      assert.equal(pending.dialog.messageTruncated, true);
+      assert.equal(pending.dialog.defaultValueTruncated, true);
+      const inspected = JSON.parse(
+        (await call("browser_dialog", { ...target, action: "inspect" }))
+          .content[0].text,
+      );
+      assert.equal(inspected.messageTruncated, true);
+      assert.equal(inspected.defaultValueTruncated, true);
       await assert.rejects(
         call("browser_dialog", { ...target, action: "refresh" }, "foreign"),
         /Session unavailable/,
@@ -114,7 +122,7 @@ test(
         ...target,
         action: "accept",
         id: pending.dialog.id,
-        promptText: "answer",
+        promptText: "answer".repeat(200),
       });
       const operation = async (id: string) => {
         for (let i = 0; i < 200; i++) {
@@ -133,12 +141,17 @@ test(
         throw new Error("Eval did not settle");
       };
       const done = await operation(pending.operationId);
-      assert.equal(done.result.text, "answer");
+      assert.equal(done.result.text, "answer".repeat(200));
       const ordinary = await call("browser_eval", {
         ...target,
         code: "'regular'",
       });
       assert.match(ordinary.content[0].text, /regular/);
+      const longCode = await call("browser_eval", {
+        ...target,
+        code: " ".repeat(200001) + "'long-code'",
+      });
+      assert.match(longCode.content[0].text, /long-code/);
       const page = browser.contexts()[0].pages()[0];
       const cdp = await page.context().newCDPSession(page);
       await cdp.send("Page.enable");

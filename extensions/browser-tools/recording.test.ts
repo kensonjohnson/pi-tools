@@ -5,6 +5,57 @@ import { ArtifactStore } from "./artifacts.ts";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { TraceRecordings } from "./recording.ts";
+import { VideoRecordings } from "./video-recording.ts";
+import { resolveBrowserSettings } from "./settings.ts";
+
+test("recording duration accepts longer than one hour up to the Node timer maximum", () => {
+  assert.equal(
+    resolveBrowserSettings({ recordingDurationMs: 7200000 })
+      .recordingDurationMs,
+    7200000,
+  );
+  assert.equal(
+    resolveBrowserSettings({ recordingDurationMs: 2147483647 })
+      .recordingDurationMs,
+    2147483647,
+  );
+  const sink = {
+    putBinary: async () => ({
+      id: "a",
+      path: "private",
+      bytes: 0,
+      expiresAt: 1,
+    }),
+  };
+  assert.doesNotThrow(
+    () =>
+      new TraceRecordings({
+        sink,
+        durationMs: 7200000,
+        maxBytes: 100,
+        timeoutMs: 1000,
+      }),
+  );
+  assert.doesNotThrow(
+    () =>
+      new VideoRecordings({
+        sink,
+        durationMs: 2147483647,
+        maxBytes: 100,
+        timeoutMs: 1000,
+      }),
+  );
+  assert.throws(
+    () =>
+      new VideoRecordings({
+        sink,
+        durationMs: 2147483648,
+        maxBytes: 100,
+        timeoutMs: 1000,
+      }),
+    /timer range/,
+  );
+});
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 function fixture(
@@ -69,6 +120,22 @@ test("trace is creator scoped and published only after native stop", async () =>
     { owner: "alice", data: Buffer.from("trace bytes") },
   ]);
   assert.equal(done.artifact?.id, "artifact");
+  assert.equal((recordings as any).entries.get("s").context, undefined);
+});
+test("trace history retains more than one hundred completed sessions", async () => {
+  const { recordings, context } = fixture({ timeoutMs: 10000 });
+  for (let i = 0; i < 105; i++) {
+    await recordings.start(`s${i}`, "alice", context);
+    await recordings.stop(`s${i}`, "alice");
+  }
+  assert.equal(recordings.inspect("s0", "alice").state, "complete");
+  assert.equal(recordings.inspect("s104", "alice").state, "complete");
+  assert.ok(
+    [...((recordings as any).entries as Map<string, any>).values()].every(
+      (entry) => entry.context === undefined,
+    ),
+  );
+  assert.throws(() => recordings.inspect("s0", "other"), /unavailable/);
 });
 test("deadline finalizes and quota or native failures never claim publication", async () => {
   const a = fixture({ durationMs: 10 });
@@ -82,6 +149,7 @@ test("deadline finalizes and quota or native failures never claim publication", 
     assert.equal(record.state, "failed");
     assert.equal(record.artifact, undefined);
     assert.equal(f.published.length, 0);
+    assert.equal((f.recordings as any).entries.get("s").context, undefined);
     assert.ok(record.recoveryDirectory);
     await rm(record.recoveryDirectory, { recursive: true, force: true });
   }

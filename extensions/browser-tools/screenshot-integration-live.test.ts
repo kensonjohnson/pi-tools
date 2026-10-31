@@ -10,6 +10,36 @@ import { createManagedBrowserExtension } from "./registration.ts";
 import { ArtifactStore } from "./artifacts.ts";
 
 test(
+  "Chromium accepts a configured viewport wider than the former ceiling",
+  { skip: !existsSync(chromium.executablePath()), timeout: 30000 },
+  async () => {
+    const sessions = new ManagedSessions({
+      launch: ({ headless }) => chromium.launch({ headless }),
+    });
+    try {
+      const target = await sessions.start({
+        headless: true,
+        artifactOwner: "owner",
+      });
+      const result = await sessions.viewport(
+        target,
+        "owner",
+        { width: 40000, height: 1 },
+        {
+          maxDimension: 50000,
+          maxPixels: 100000,
+          maxBytes: 12000000,
+          timeoutMs: 10000,
+        },
+      );
+      assert.equal(result.width, 40000);
+    } finally {
+      await sessions.shutdown();
+    }
+  },
+);
+
+test(
   "registered screenshots return images and owned artifacts for viewport, page and frame refs",
   { skip: !existsSync(chromium.executablePath()), timeout: 30000 },
   async () => {

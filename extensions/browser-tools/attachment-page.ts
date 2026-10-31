@@ -10,6 +10,94 @@ import { createAttachmentBridge } from "./attachment-transport.ts";
 import { sanitizeUrl } from "./redaction.ts";
 
 type Options = { signal?: AbortSignal; timeoutMs?: number };
+type InspectOptions = Options & { maxNodes?: number; maxChars?: number };
+
+// Each CDP response stays below the bridge's message bound. The remote object
+// retains traversal state across calls; no page mutation or scrolling occurs.
+function inspectionState(maxNodes: number, maxChars: number) {
+  const initialDocument = document;
+  const initialElement = document.documentElement;
+  const root = document.body || initialElement;
+  if (!root) throw new Error("Document unavailable");
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_ALL);
+  const title = document.title;
+  let visited = 0,
+    emitted = 0,
+    pending = "",
+    offset = 0;
+  let done = false,
+    reason: "nodes" | "chars" | null = null;
+  return {
+    next() {
+      if (
+        document !== initialDocument ||
+        document.documentElement !== initialElement
+      )
+        throw new Error("Document changed during inspection");
+      let text = "",
+        steps = 0;
+      while (!done && steps < 5000 && text.length < 262144) {
+        if (offset < pending.length) {
+          const remaining = maxChars - emitted;
+          if (remaining <= 0) {
+            done = true;
+            reason = "chars";
+            break;
+          }
+          let take = Math.min(
+            remaining,
+            262144 - text.length,
+            pending.length - offset,
+          );
+          const end = offset + take;
+          if (
+            end < pending.length &&
+            end > offset &&
+            pending.charCodeAt(end - 1) >= 0xd800 &&
+            pending.charCodeAt(end - 1) <= 0xdbff &&
+            pending.charCodeAt(end) >= 0xdc00 &&
+            pending.charCodeAt(end) <= 0xdfff
+          )
+            take--;
+          if (!take) {
+            if (remaining < 2) {
+              done = true;
+              reason = "chars";
+            }
+            break;
+          }
+          text += pending.slice(offset, offset + take);
+          offset += take;
+          emitted += take;
+          continue;
+        }
+        const node = walker.nextNode();
+        if (!node) {
+          done = true;
+          break;
+        }
+        if (visited >= maxNodes) {
+          done = true;
+          reason = "nodes";
+          break;
+        }
+        visited++;
+        steps++;
+        pending = node.nodeType === Node.TEXT_NODE ? node.nodeValue || "" : "";
+        offset = 0;
+      }
+      return {
+        text,
+        done,
+        reason,
+        title: title.slice(0, 1024),
+        titleTruncated: title.length > 1024,
+        nodesVisited: visited,
+        charsReturned: emitted,
+      };
+    },
+  };
+}
 const TITLE_LIMIT = 1024;
 function safeTitle(
   value: string,
@@ -50,6 +138,7 @@ export class AttachedPage {
   private evidence: Evidence[] = [];
   private evidenceSequence = 0;
   private dropped = 0;
+  private navigationVersion = 0;
   private lifecycle: Array<{ frameId: string; loaderId: string }> = [];
   private lifecycleWaiters = new Set<() => void>();
   private pending = new Map<
@@ -107,7 +196,7 @@ export class AttachedPage {
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(targetId))
       throw new Error("Invalid page target ID");
     const timeout = options.timeoutMs ?? 5000;
-    if (!Number.isInteger(timeout) || timeout < 1 || timeout > 30000)
+    if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 2147483647)
       throw new Error("Invalid attachment timeout");
     if (options.signal?.aborted) throw new Error("Attachment cancelled");
     const deadline = new AbortController();
@@ -188,7 +277,7 @@ export class AttachedPage {
     work: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
     const timeout = options.timeoutMs ?? 5000;
-    if (!Number.isInteger(timeout) || timeout < 1 || timeout > 30000)
+    if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 2147483647)
       throw new Error("Invalid attachment timeout");
     if (this.closed || options.signal?.aborted || this.active)
       throw new Error("Page attachment unavailable or busy");
@@ -241,6 +330,14 @@ export class AttachedPage {
     });
   }
   private onEvent(method: string, params: any) {
+    if (
+      method === "Page.frameNavigated" ||
+      method === "Page.frameStartedNavigating" ||
+      method === "Page.navigatedWithinDocument" ||
+      method === "Page.frameAttached" ||
+      method === "Page.frameDetached"
+    )
+      this.navigationVersion++;
     if (
       method === "Page.lifecycleEvent" &&
       params?.name === "load" &&
@@ -298,69 +395,175 @@ export class AttachedPage {
       this.evidence.push(record);
     }
   }
-  /** Reads only the selected document title. */
+  /** Isolated selected-frame world with navigation identity checks. */
+  private async isolatedDocument(signal: AbortSignal) {
+    await this.send("Page.enable", {}, signal);
+    const initial = (await this.send("Page.getFrameTree", {}, signal))
+      ?.frameTree?.frame;
+    if (
+      typeof initial?.id !== "string" ||
+      typeof initial?.loaderId !== "string" ||
+      typeof initial?.url !== "string"
+    )
+      throw new Error("Selected document identity unavailable");
+    const navigationVersion = this.navigationVersion;
+    const changed = () => {
+      if (this.navigationVersion !== navigationVersion)
+        throw new Error(
+          "Document changed during observation; outcome uncertain",
+        );
+    };
+    const world = await this.send(
+      "Page.createIsolatedWorld",
+      { frameId: initial.id, worldName: "pi-attachment-inspection" },
+      signal,
+    );
+    if (!Number.isSafeInteger(world?.executionContextId))
+      throw new Error("Isolated observation world unavailable");
+    changed();
+    const verify = async () => {
+      const finalFrame = (await this.send("Page.getFrameTree", {}, signal))
+        ?.frameTree?.frame;
+      changed();
+      if (
+        finalFrame?.id !== initial.id ||
+        finalFrame?.loaderId !== initial.loaderId ||
+        finalFrame?.url !== initial.url ||
+        finalFrame?.urlFragment !== initial.urlFragment
+      )
+        throw new Error(
+          "Document changed during observation; outcome uncertain",
+        );
+    };
+    return { contextId: world.executionContextId, changed, verify };
+  }
+
+  /** Reads only the selected document title in the isolated world. */
   async title(
     options: { signal?: AbortSignal; timeoutMs?: number } = {},
   ): Promise<{ title: string; truncated: boolean }> {
-    const result = await this.operation(options, (signal) =>
-      this.send(
+    return this.operation(options, async (signal) => {
+      const world = await this.isolatedDocument(signal);
+      const result = await this.send(
         "Runtime.evaluate",
         {
+          contextId: world.contextId,
           expression:
             "(() => { const title = document.title; return { title: title.slice(0, 1024), truncated: title.length > 1024 }; })()",
           returnByValue: true,
         },
         signal,
-      ),
-    );
-    const value = result?.result?.value;
-    if (
-      result?.exceptionDetails ||
-      typeof value?.title !== "string" ||
-      typeof value?.truncated !== "boolean"
-    )
-      throw new Error("Page title unavailable");
-    return safeTitle(value.title, value.truncated);
+      );
+      world.changed();
+      const value = result?.result?.value;
+      if (
+        result?.exceptionDetails ||
+        typeof value?.title !== "string" ||
+        typeof value?.truncated !== "boolean"
+      )
+        throw new Error("Page title unavailable");
+      await world.verify();
+      return safeTitle(value.title, value.truncated);
+    });
   }
-  /** Main-document text only: capped traversal and output, no arbitrary evaluation. */
-  async inspect(options: Options = {}): Promise<{
+  /** Main-document text only: budgeted traversal and output, no arbitrary evaluation. */
+  async inspect(options: InspectOptions = {}): Promise<{
     title: string;
     titleTruncated: boolean;
     text: string;
     truncated: boolean;
+    truncationReason: "nodes" | "chars" | null;
+    nodesVisited: number;
+    charsReturned: number;
   }> {
-    const expression = `(() => { const w = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_ALL); let n = 0, text = '', x; while (n < 1000 && text.length < 16000 && (x = w.nextNode())) { n++; if (x.nodeType === Node.TEXT_NODE) text += (x.nodeValue || '').slice(0, Math.min(256, 16000 - text.length)); } const title = document.title; return { title: title.slice(0, 1024), titleTruncated: title.length > 1024, text, truncated: n >= 1000 || text.length >= 16000 }; })()`;
-    const result = await this.operation(options, (signal) =>
-      this.send(
-        "Runtime.evaluate",
-        { expression, returnByValue: true },
-        signal,
-      ),
-    );
-    const value = result?.result?.value;
+    const maxNodes = options.maxNodes ?? 1000;
+    const maxChars = options.maxChars ?? 16000;
     if (
-      result?.exceptionDetails ||
-      typeof value?.title !== "string" ||
-      typeof value?.titleTruncated !== "boolean" ||
-      typeof value?.text !== "string" ||
-      typeof value?.truncated !== "boolean"
+      ![maxNodes, maxChars].every(
+        (value) => Number.isSafeInteger(value) && value > 0,
+      )
     )
-      throw new Error("Page inspection unavailable");
-    const title = safeTitle(value.title, value.titleTruncated);
-    return {
-      title: title.title,
-      titleTruncated: title.truncated,
-      text: value.text.slice(0, 16000),
-      truncated: value.truncated || value.text.length > 16000,
-    };
+      throw new Error("Inspection budgets must be positive safe integers.");
+    return this.operation(options, async (signal) => {
+      const { contextId, changed, verify } =
+        await this.isolatedDocument(signal);
+      const start = await this.send(
+        "Runtime.evaluate",
+        {
+          contextId,
+          expression: `(${inspectionState.toString()})(${maxNodes},${maxChars})`,
+          returnByValue: false,
+        },
+        signal,
+      );
+      const objectId = start?.result?.objectId;
+      if (start?.exceptionDetails || typeof objectId !== "string")
+        throw new Error("Page inspection unavailable");
+      try {
+        changed();
+        const chunks: string[] = [];
+        let count = 0;
+        for (;;) {
+          changed();
+          const result = await this.send(
+            "Runtime.callFunctionOn",
+            {
+              objectId,
+              functionDeclaration: "function() { return this.next(); }",
+              returnByValue: true,
+            },
+            signal,
+          );
+          changed();
+          const value = result?.result?.value;
+          if (
+            result?.exceptionDetails ||
+            typeof value?.text !== "string" ||
+            value.text.length > 262144 ||
+            typeof value?.done !== "boolean" ||
+            typeof value?.title !== "string" ||
+            typeof value?.titleTruncated !== "boolean" ||
+            !Number.isSafeInteger(value?.nodesVisited) ||
+            value.nodesVisited < 0 ||
+            value.nodesVisited > maxNodes ||
+            !Number.isSafeInteger(value?.charsReturned) ||
+            value.charsReturned !== count + value.text.length ||
+            !(
+              value?.reason === null ||
+              value?.reason === "nodes" ||
+              value?.reason === "chars"
+            ) ||
+            (value.reason !== null && !value.done) ||
+            count + value.text.length > maxChars
+          )
+            throw new Error("Page inspection unavailable");
+          count += value.text.length;
+          chunks.push(value.text);
+          if (value.done) {
+            await verify();
+            const title = safeTitle(value.title, value.titleTruncated);
+            return {
+              title: title.title,
+              titleTruncated: title.truncated,
+              text: chunks.join(""),
+              truncated: value.reason !== null,
+              truncationReason: value.reason,
+              nodesVisited: value.nodesVisited,
+              charsReturned: value.charsReturned,
+            };
+          }
+        }
+      } finally {
+        if (!signal.aborted && !this.closed)
+          await this.send("Runtime.releaseObject", { objectId }, signal).catch(
+            () => {},
+          );
+      }
+    });
   }
   /** Waits for a matching selected-frame loader; same-document navigation is unsupported. */
   async navigate(url: string, options: Options = {}): Promise<void> {
-    if (
-      typeof url !== "string" ||
-      url.length > 8192 ||
-      !/^https?:\/\//i.test(url)
-    )
+    if (typeof url !== "string" || !/^https?:\/\//i.test(url))
       throw new Error("Only HTTP(S) navigation is supported");
     await this.operation(options, async (signal) => {
       await this.send("Page.enable", {}, signal);

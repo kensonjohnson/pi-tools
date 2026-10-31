@@ -101,10 +101,13 @@ async function nextChunk<T>(
     };
     const onAbort = () =>
       finish(() => reject(new Error("Artifact operation cancelled.")));
-    const timer = setTimeout(
-      () => finish(() => reject(new Error("Artifact source timed out."))),
-      timeoutMs,
-    );
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(
+            () => finish(() => reject(new Error("Artifact source timed out."))),
+            timeoutMs,
+          )
+        : undefined;
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted) {
       onAbort();
@@ -193,7 +196,7 @@ export class ArtifactStore {
     } = {},
   ) {
     this.root = resolve(options.root ?? defaultRoot());
-    this.quota = options.quota ?? 256 * 1024 * 1024;
+    this.quota = options.quota ?? Number.MAX_SAFE_INTEGER;
     this.ttl = options.ttl ?? 60 * 60 * 1000;
     this.now = options.now ?? Date.now;
     this.publication = {
@@ -239,11 +242,14 @@ export class ArtifactStore {
   private async locked<T extends object>(
     signal: AbortSignal | undefined,
     work: () => Promise<T>,
+    lockWaitTimeoutMs = 0,
   ): Promise<T & { lockWarning?: string }> {
     aborted(signal);
     await this.initialize();
     const lock = join(this.root, ".lock");
-    const deadline = Date.now() + 5000;
+    const deadline = lockWaitTimeoutMs
+      ? Date.now() + lockWaitTimeoutMs
+      : Infinity;
     for (;;) {
       aborted(signal);
       try {
@@ -302,8 +308,6 @@ export class ArtifactStore {
   }
   private async scan(now: number, signal?: AbortSignal) {
     const names = await readdir(this.root);
-    if (names.length > 10000)
-      throw new Error("Artifact store entry limit exceeded.");
     let bytes = 0;
     const entries: {
       id: string;
@@ -322,6 +326,11 @@ export class ArtifactStore {
       const path = join(this.root, name);
       const { file, st } = await safeFile(path);
       await file.close();
+      if (
+        !Number.isSafeInteger(st.size) ||
+        st.size > Number.MAX_SAFE_INTEGER - bytes
+      )
+        throw new Error("Artifact storage exceeds safe byte accounting range.");
       if (!match) {
         bytes += st.size;
         continue;
@@ -415,16 +424,25 @@ export class ArtifactStore {
       signal?: AbortSignal;
       sourceTimeoutMs?: number;
       cleanupTimeoutMs?: number;
+      lockWaitTimeoutMs?: number;
     },
   ) {
     if (!Number.isSafeInteger(options.maxBytes) || options.maxBytes < 0)
       throw new Error("Invalid binary artifact size limit.");
     const sourceTimeout = options.sourceTimeoutMs ?? 30000;
     const cleanupTimeout = options.cleanupTimeoutMs ?? 1000;
+    const lockWaitTimeout = options.lockWaitTimeoutMs ?? 0;
     if (
-      ![sourceTimeout, cleanupTimeout].every(
-        (value) => Number.isSafeInteger(value) && value > 0 && value <= 300000,
-      )
+      !Number.isSafeInteger(sourceTimeout) ||
+      sourceTimeout < 0 ||
+      sourceTimeout > 300000 ||
+      !Number.isSafeInteger(cleanupTimeout) ||
+      cleanupTimeout < 1 ||
+      cleanupTimeout > 300000 ||
+      !Number.isSafeInteger(lockWaitTimeout) ||
+      lockWaitTimeout < 0 ||
+      lockWaitTimeout > 300000 ||
+      (!sourceTimeout && !options.signal)
     )
       throw new Error("Invalid artifact source timeout.");
     return this.putStream(
@@ -435,6 +453,7 @@ export class ArtifactStore {
       options.signal,
       sourceTimeout,
       cleanupTimeout,
+      lockWaitTimeout,
     );
   }
 
@@ -446,103 +465,106 @@ export class ArtifactStore {
     signal?: AbortSignal,
     sourceTimeoutMs = 30000,
     cleanupTimeoutMs = 1000,
+    lockWaitTimeoutMs = 0,
   ) {
-    return this.locked(signal, async () => {
-      const now = this.now();
-      const expires = now + this.ttl;
-      if (!Number.isSafeInteger(expires) || String(expires).length !== 13)
-        throw new Error("Invalid artifact expiry.");
-      const { bytes } = await this.scan(now, signal);
-      const id = randomUUID();
-      const path = join(
-        this.root,
-        `${id}-${ownerKey(owner)}-${expires}.${kind}`,
-      );
-      const temp = join(this.root, `.tmp-${randomUUID()}`);
-      let handle;
-      let created = false;
-      let identity: Stats | undefined;
-      let linked = false;
-      try {
-        handle = await open(
-          temp,
-          constants.O_WRONLY |
-            constants.O_CREAT |
-            constants.O_EXCL |
-            constants.O_NOFOLLOW,
-          0o600,
-        );
-        created = true;
-        identity = await handle.stat();
-        let length = 0;
-        const iterator = data[Symbol.asyncIterator]();
-        let finished = false;
+    return this.locked(
+      signal,
+      async () => {
+        const { bytes } = await this.scan(this.now(), signal);
+        const id = randomUUID();
+        let path = "";
+        const temp = join(this.root, `.tmp-${randomUUID()}`);
+        let handle;
+        let created = false;
+        let identity: Stats | undefined;
+        let linked = false;
         try {
-          for (;;) {
-            const result = await nextChunk(iterator, signal, sourceTimeoutMs);
-            if (result.done) {
-              finished = true;
-              break;
-            }
-            const chunk = result.value;
-            aborted(signal);
-            if (!(chunk instanceof Uint8Array))
-              throw new Error("Invalid artifact stream chunk.");
-            length += chunk.byteLength;
-            if (!Number.isSafeInteger(length) || length > maxBytes)
-              throw new Error(
-                "Artifact size limit exceeded; full result was not saved.",
-              );
-            if (length > this.quota - bytes)
-              throw new Error(
-                "Artifact quota exceeded; full result was not saved.",
-              );
-            let offset = 0;
-            while (offset < chunk.byteLength) {
+          handle = await open(
+            temp,
+            constants.O_WRONLY |
+              constants.O_CREAT |
+              constants.O_EXCL |
+              constants.O_NOFOLLOW,
+            0o600,
+          );
+          created = true;
+          identity = await handle.stat();
+          let length = 0;
+          const iterator = data[Symbol.asyncIterator]();
+          let finished = false;
+          try {
+            for (;;) {
+              const result = await nextChunk(iterator, signal, sourceTimeoutMs);
+              if (result.done) {
+                finished = true;
+                break;
+              }
+              const chunk = result.value;
               aborted(signal);
-              const { bytesWritten } = await handle.write(
-                chunk,
-                offset,
-                chunk.byteLength - offset,
-              );
-              if (!bytesWritten) throw new Error("Artifact write failed.");
-              offset += bytesWritten;
+              if (!(chunk instanceof Uint8Array))
+                throw new Error("Invalid artifact stream chunk.");
+              length += chunk.byteLength;
+              if (!Number.isSafeInteger(length) || length > maxBytes)
+                throw new Error(
+                  "Artifact size limit exceeded; full result was not saved.",
+                );
+              if (length > this.quota - bytes)
+                throw new Error(
+                  "Artifact quota exceeded; full result was not saved.",
+                );
+              let offset = 0;
+              while (offset < chunk.byteLength) {
+                aborted(signal);
+                const { bytesWritten } = await handle.write(
+                  chunk,
+                  offset,
+                  chunk.byteLength - offset,
+                );
+                if (!bytesWritten) throw new Error("Artifact write failed.");
+                offset += bytesWritten;
+              }
             }
+          } catch (error) {
+            if (!finished && !(await closeIterator(iterator, cleanupTimeoutMs)))
+              throw new Error(
+                `${error instanceof Error ? error.message : String(error)} Source cleanup unverified; it may still be running. No artifact was published.`,
+                { cause: error },
+              );
+            throw error;
           }
+          aborted(signal);
+          await handle.sync();
+          await handle.close();
+          handle = undefined;
+          // Retention begins at publication, not when a potentially long stream started.
+          const expires = this.now() + this.ttl;
+          if (!Number.isSafeInteger(expires) || String(expires).length !== 13)
+            throw new Error("Invalid artifact expiry.");
+          path = join(this.root, `${id}-${ownerKey(owner)}-${expires}.${kind}`);
+          // link is no-clobber, unlike rename; the private staging name is removed before publication completes.
+          aborted(signal);
+          await this.publication.link(temp, path);
+          linked = true;
+          await this.publication.unlink(temp);
+          await this.syncDirectory(this.root);
+          return { id, path, bytes: length, expiresAt: expires };
         } catch (error) {
-          if (!finished && !(await closeIterator(iterator, cleanupTimeoutMs)))
-            throw new Error(
-              `${error instanceof Error ? error.message : String(error)} Source cleanup unverified; it may still be running. No artifact was published.`,
-              { cause: error },
-            );
+          try {
+            await handle?.close();
+            if (created) {
+              if (!identity)
+                throw new Error("Staging inode identity unavailable.");
+              await this.rollbackPublication(temp, path, identity, linked);
+              await this.syncDirectory(this.root);
+            }
+          } catch (recoveryError) {
+            throw new ArtifactRecoveryError(recoveryError);
+          }
           throw error;
         }
-        aborted(signal);
-        await handle.sync();
-        await handle.close();
-        handle = undefined;
-        // link is no-clobber, unlike rename; the private staging name is removed before publication completes.
-        aborted(signal);
-        await this.publication.link(temp, path);
-        linked = true;
-        await this.publication.unlink(temp);
-        await this.syncDirectory(this.root);
-        return { id, path, bytes: length, expiresAt: expires };
-      } catch (error) {
-        try {
-          await handle?.close();
-          if (created) {
-            if (!identity)
-              throw new Error("Staging inode identity unavailable.");
-            await this.rollbackPublication(temp, path, identity, linked);
-            await this.syncDirectory(this.root);
-          }
-        } catch (recoveryError) {
-          throw new ArtifactRecoveryError(recoveryError);
-        }
-        throw error;
-      }
-    });
+      },
+      lockWaitTimeoutMs,
+    );
   }
   private async lookup(owner: string, id: string, signal?: AbortSignal) {
     if (!ID.test(id)) throw new Error("Invalid artifact ID.");
@@ -796,6 +818,43 @@ export class ArtifactStore {
       } finally {
         await file.close().catch(() => {});
       }
+    });
+  }
+  /** Discover this owner's unexpired artifacts across runtime reloads. */
+  async list(
+    owner: string,
+    signal?: AbortSignal,
+    options: { afterId?: string; limit?: number } = {},
+  ) {
+    const limit = options.limit ?? 100;
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      (options.afterId !== undefined && !ID.test(options.afterId))
+    )
+      throw new Error("Invalid artifact list cursor or limit.");
+    return this.locked(signal, async () => {
+      const { entries } = await this.scan(this.now(), signal);
+      const key = ownerKey(owner);
+      const matches = entries
+        .filter(
+          (entry) =>
+            entry.owner === key &&
+            (options.afterId === undefined || entry.id > options.afterId),
+        )
+        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      const selected = matches.slice(0, limit);
+      return {
+        artifacts: selected.map((entry) => ({
+          id: entry.id,
+          kind: entry.kind,
+          bytes: entry.bytes,
+          expiresAt: entry.expires,
+        })),
+        nextAfterId:
+          selected.length < matches.length ? selected.at(-1)!.id : null,
+        note: "Artifact IDs persist across reloads until expiry; download names and original session IDs are not stored. Listing is not a snapshot: concurrent additions before the cursor may be missed.",
+      };
     });
   }
   async cleanup(signal?: AbortSignal) {

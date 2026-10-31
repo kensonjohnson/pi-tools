@@ -70,11 +70,16 @@ test("aborting stalled discovery closes the request", async () => {
   const server = createServer(() => {});
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   try {
-    const controller = new AbortController();
-    const pending = connectAttachment(
-      `http://127.0.0.1:${(server.address() as { port: number }).port}`,
-      { signal: controller.signal },
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    await assert.rejects(
+      connectAttachment(origin, { timeoutMs: 2147483648 }),
+      /Invalid attachment timeout/,
     );
+    const controller = new AbortController();
+    const pending = connectAttachment(origin, {
+      signal: controller.signal,
+      timeoutMs: 2147483647,
+    });
     setTimeout(() => controller.abort(), 10);
     await assert.rejects(pending, /abort/i);
   } finally {

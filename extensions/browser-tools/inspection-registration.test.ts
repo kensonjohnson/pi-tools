@@ -106,6 +106,32 @@ test("staged inspection tools return bounded private references and creator-scop
       /owned by another/,
     );
     await handlers.get("session_start")!({}, context("one"));
+    const index = JSON.parse(
+      (await tools.get("browser_artifact").execute("call", { action: "list" }))
+        .content[0].text,
+    );
+    assert.ok(
+      index.artifacts.some((entry: any) => entry.id === result.artifact.id),
+    );
+    const foreignIndex = JSON.parse(
+      (
+        await tools
+          .get("browser_artifact")
+          .execute(
+            "call",
+            { action: "list" },
+            undefined,
+            undefined,
+            context("two"),
+          )
+      ).content[0].text,
+    );
+    assert.equal(
+      foreignIndex.artifacts.some(
+        (entry: any) => entry.id === result.artifact.id,
+      ),
+      false,
+    );
     const restored = await tools
       .get("browser_artifact")
       .execute("call", { action: "read", id: result.artifact.id });
