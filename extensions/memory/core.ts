@@ -561,6 +561,97 @@ export class NdjsonMemoryStore {
     });
   }
 
+  /**
+   * Coverage authority: keep the canonical lock for a bounded callback. Each read
+   * is fresh and rejects malformed lines and duplicate IDs. Do not call another
+   * lock-taking memory operation from the callback. External editors do not
+   * honor this lock; callers must compare snapshots before publishing results.
+   */
+  async withSnapshot<T>(
+    callback: (readCurrent: () => Promise<MemoryAddPrecondition>) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    return this.withCapturedSnapshot(callback, signal, false);
+  }
+
+  /** A lock-backed snapshot that refuses recovery rather than performing it. */
+  async withReadOnlySnapshot<T>(
+    callback: (readCurrent: () => Promise<MemoryAddPrecondition>) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    return this.withCapturedSnapshot(callback, signal, true);
+  }
+
+  private async withCapturedSnapshot<T>(
+    callback: (readCurrent: () => Promise<MemoryAddPrecondition>) => Promise<T>,
+    signal: AbortSignal | undefined,
+    readOnly: boolean,
+  ): Promise<T> {
+    return this.withCategoryLock(
+      "knowledge",
+      async () => {
+        let active = true;
+        const pending = new Set<Promise<MemoryAddPrecondition>>();
+        const readCurrent = (): Promise<MemoryAddPrecondition> => {
+          if (!active)
+            return Promise.reject(
+              new Error("Memory snapshot callback has ended"),
+            );
+          const read = (async () => {
+            signal?.throwIfAborted();
+            const snapshots = await this.snapshots();
+            signal?.throwIfAborted();
+            return {
+              snapshots: Object.fromEntries(
+                MEMORY_CATEGORIES.map((category) => {
+                  const { contents, mode } = snapshots.get(category)!;
+                  return [category, { contents, mode }];
+                }),
+              ) as MemoryAddPrecondition["snapshots"],
+            };
+          })();
+          pending.add(read);
+          void read.then(
+            () => pending.delete(read),
+            () => pending.delete(read),
+          );
+          return read;
+        };
+        try {
+          return await callback(readCurrent);
+        } finally {
+          active = false;
+          await Promise.allSettled(pending);
+        }
+      },
+      signal,
+      readOnly,
+    );
+  }
+
+  /** Capture without initializing, repairing, or recovering canonical memory. */
+  async captureReadOnlyPrecondition(
+    signal?: AbortSignal,
+  ): Promise<MemoryAddPrecondition> {
+    return this.withCategoryLock(
+      "knowledge",
+      async () => {
+        const snapshots = await this.snapshots();
+        signal?.throwIfAborted();
+        return {
+          snapshots: Object.fromEntries(
+            MEMORY_CATEGORIES.map((category) => {
+              const { contents, mode } = snapshots.get(category)!;
+              return [category, { contents, mode }];
+            }),
+          ) as MemoryAddPrecondition["snapshots"],
+        };
+      },
+      signal,
+      true,
+    );
+  }
+
   /** Capture before creating an automatic add proposal, not immediately before applying it. */
   async captureAddPrecondition(): Promise<MemoryAddPrecondition> {
     return this.withCategoryLock("knowledge", async () => {
@@ -1426,13 +1517,49 @@ export class NdjsonMemoryStore {
     }
   }
 
+  /** Inspect recovery state without creating or deleting runtime entries. */
+  private async assertNoPendingRecovery(): Promise<void> {
+    const runtime = this.runtimeDir();
+    let info;
+    try {
+      info = await lstat(runtime);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+    if (
+      !info.isDirectory() ||
+      (info.mode & 0o777) !== 0o700 ||
+      (typeof process.getuid === "function" && info.uid !== process.getuid())
+    )
+      throw new Error("Memory read-only conflict: unsafe runtime directory");
+    const entries = await readdir(runtime);
+    if (
+      entries.some(
+        (name) =>
+          name === "move-transaction.json" ||
+          name === "duplicate-transaction.json" ||
+          name.startsWith("replace-") ||
+          name.startsWith("duplicate-publish-"),
+      )
+    )
+      throw new Error(
+        "Memory read-only conflict: recovery pending; run an explicit memory recovery operation",
+      );
+    const ignore = join(runtime, ".gitignore");
+    const ignoreInfo = await lstat(ignore);
+    if (!ignoreInfo.isFile() || (await readFile(ignore, "utf8")) !== "*\n")
+      throw new Error("Memory read-only conflict: invalid runtime gitignore");
+  }
+
   private async withCategoryLock<T>(
     _category: MemoryCategory,
     operation: () => Promise<T>,
     signal?: AbortSignal,
+    readOnly = false,
   ): Promise<T> {
     signal?.throwIfAborted();
-    await this.ensureReady();
+    if (!readOnly) await this.ensureReady();
     signal?.throwIfAborted();
     // SQLite's OS-managed write lock survives process crashes without PID guessing.
     // Never delete or replace this lock database while any process is using it.
@@ -1457,12 +1584,16 @@ export class NdjsonMemoryStore {
       }
       try {
         signal?.throwIfAborted();
-        await this.ensurePrivateRuntime();
-        await this.cleanRuntimeTemps();
-        signal?.throwIfAborted();
-        await this.recoverMoveLocked();
-        signal?.throwIfAborted();
-        await this.recoverDuplicatesLocked();
+        if (readOnly) {
+          await this.assertNoPendingRecovery();
+        } else {
+          await this.ensurePrivateRuntime();
+          await this.cleanRuntimeTemps();
+          signal?.throwIfAborted();
+          await this.recoverMoveLocked();
+          signal?.throwIfAborted();
+          await this.recoverDuplicatesLocked();
+        }
         signal?.throwIfAborted();
         return await operation();
       } finally {
@@ -1979,6 +2110,22 @@ export class MemoryManager {
     this.index = new PiMemoryIndex(this.store.memoryDir, this.options);
   }
 
+  /** Use this manager as a CoverageSnapshotAuthority; callbacks must not reenter memory operations. */
+  async withSnapshot<T>(
+    callback: (readCurrent: () => Promise<MemoryAddPrecondition>) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    return this.store.withSnapshot(callback, signal);
+  }
+
+  /** Coverage authority that never initializes or recovers memory. */
+  async withReadOnlySnapshot<T>(
+    callback: (readCurrent: () => Promise<MemoryAddPrecondition>) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    return this.store.withReadOnlySnapshot(callback, signal);
+  }
+
   async isReady(): Promise<boolean> {
     return exists(this.store.memoryDir);
   }
@@ -2087,6 +2234,13 @@ export class MemoryManager {
 
   async close(): Promise<void> {
     await this.index.close();
+  }
+
+  /** Unlike normal manager reads, this does not initialize or reconcile. */
+  async captureReadOnlyPrecondition(
+    signal?: AbortSignal,
+  ): Promise<MemoryAddPrecondition> {
+    return this.store.captureReadOnlyPrecondition(signal);
   }
 
   async captureAddPrecondition(): Promise<MemoryAddPrecondition> {
