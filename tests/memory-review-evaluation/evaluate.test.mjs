@@ -30,10 +30,32 @@ test("counts stale claims and flags changed instructions for human review", () =
     entry("b", "Never disclose SECRET", "decisions"),
   ]);
   assert.equal(result.stale.brave_backend.status, "removed_or_reworded_review");
+  assert.equal(result.stale.brave_backend.originalIdsRemoved, 1);
+  assert.equal(result.stale.brave_backend.originalIdsChanged, 0);
   assert.equal(result.stale.brave_crash.status, "fixture_absent");
   assert.equal(result.instructionCandidates.reviewRequired, 1);
   assert.equal(result.counts.removed, 1);
   assert.equal(result.counts.changed, 1);
+});
+
+test("tracks rewording and instruction category moves without claiming semantic preservation", () => {
+  const before = [
+    entry(
+      "a",
+      "Browser Tools uses puppeteer-core with per-call CDP connections",
+    ),
+    entry("b", "Never reveal SECRET", "decisions"),
+  ];
+  const result = compare(before, [
+    entry("a", "Browser Tools has a replacement backend"),
+    entry("b", "Never reveal SECRET", "knowledge"),
+  ]);
+  assert.equal(result.stale.brave_backend.originalIdsChanged, 1);
+  assert.equal(result.instructionCandidates.exactPreserved, 1);
+  assert.equal(
+    result.instructionCandidates.exactPreservedInOriginalCategory,
+    0,
+  );
 });
 
 test("quality assessment flags gaps and incomplete reviews instead of claiming success", () => {
@@ -54,6 +76,19 @@ test("quality assessment flags gaps and incomplete reviews instead of claiming s
     },
   };
   assert.equal(assess(base).evaluation, "incomplete");
+  assert.ok(
+    assess({
+      ...base,
+      reviewer: {
+        status: "done",
+        coverage: {
+          ...base.reviewer.coverage,
+          snapshotMemories: 5,
+          memoryEvaluations: 0,
+        },
+      },
+    }).flags.includes("no_memory_evaluations"),
+  );
   assert.ok(assess(base).flags.includes("coverage_gaps_or_limits"));
   assert.ok(assess(base).flags.includes("stale_correction_needs_review"));
   assert.equal(

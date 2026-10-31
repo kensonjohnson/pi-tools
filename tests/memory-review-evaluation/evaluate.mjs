@@ -71,6 +71,7 @@ export function compare(before, after) {
     instructionCandidates: {
       total: instructions.length,
       exactPreserved: 0,
+      exactPreservedInOriginalCategory: 0,
       reviewRequired: 0,
     },
   };
@@ -92,11 +93,17 @@ export function compare(before, after) {
       result.counts.distinctChanged++;
     }
   for (const [name, match] of Object.entries(checks)) {
-    const b = before.filter((x) => match.test(x.content)).length;
+    const matched = before.filter((x) => match.test(x.content));
+    const b = matched.length;
     const a = after.filter((x) => match.test(x.content)).length;
     result.stale[name] = {
       before: b,
       after: a,
+      originalIdsRemoved: matched.filter((x) => !current.has(x.id)).length,
+      originalIdsChanged: matched.filter((x) => {
+        const now = current.get(x.id);
+        return now && now.content !== x.content;
+      }).length,
       status: a
         ? "still_present"
         : b === 0
@@ -108,6 +115,8 @@ export function compare(before, after) {
     if (exactContents.has(x.content))
       result.instructionCandidates.exactPreserved++;
     else result.instructionCandidates.reviewRequired++;
+    if (after.some((y) => y.category === x.category && y.content === x.content))
+      result.instructionCandidates.exactPreservedInOriginalCategory++;
   }
   return result;
 }
@@ -221,6 +230,13 @@ export function assess(result) {
     )
   )
     flags.push("stale_correction_needs_review");
+  if (
+    result.reviewer?.status === "done" &&
+    natural(coverage?.snapshotMemories) &&
+    coverage.snapshotMemories > 0 &&
+    coverage.memoryEvaluations === 0
+  )
+    flags.push("no_memory_evaluations");
   if (result.instructionCandidates.reviewRequired)
     flags.push("instructions_need_review");
   const stale = Object.values(result.stale).some(
@@ -366,6 +382,11 @@ export async function run({
     } catch (e) {
       if (e.code !== "ENOENT") result.adapterFailed = true;
     }
+    result.progress = {
+      netChangedIds: result.counts.distinctChanged,
+      memoryEvaluations: result.reviewer?.coverage?.memoryEvaluations ?? null,
+      lastSnapshotMemories: result.reviewer?.coverage?.snapshotMemories ?? null,
+    };
     Object.assign(result, assess(result));
     if (showRaw) {
       result.rawBefore = before;
