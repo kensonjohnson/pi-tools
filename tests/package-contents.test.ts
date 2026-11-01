@@ -64,6 +64,10 @@ test("npm package contains runtime resources but excludes project memory and tes
       assert.ok(!path.startsWith(".pi/"), `project state packaged: ${path}`);
       assert.ok(!path.startsWith("tests/"), `test directory packaged: ${path}`);
       assert.ok(
+        !path.startsWith("extensions/code-search/"),
+        `removed code-search extension packaged: ${path}`,
+      );
+      assert.ok(
         !/(^|\/)(?:\.runtime|tmp|fixtures)(\/|$)/.test(path),
         `runtime or fixture packaged: ${path}`,
       );
@@ -75,7 +79,6 @@ test("npm package contains runtime resources but excludes project memory and tes
       "extensions/pi-tools-settings.ts",
       "extensions/memory/index.ts",
       "extensions/browser-tools/index.ts",
-      "extensions/code-search/worker.ts",
       "lib/pi-tools-config.ts",
       "skills/research/SKILL.md",
       "skills/planning/references/ticket-store.md",

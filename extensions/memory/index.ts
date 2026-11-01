@@ -508,14 +508,9 @@ export default function (pi: ExtensionAPI) {
       const manager = await getReadyManager(ctx);
       if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
 
-      if (
-        foregroundReview &&
-        (params.expectedContent === undefined ||
-          params.retainedId === undefined ||
-          params.expectedRetainedContent === undefined)
-      )
+      if (foregroundReview && params.expectedContent === undefined)
         throw new Error(
-          "Foreground memory review only removes duplicates with expectedContent, retainedId, and expectedRetainedContent; report other removals instead.",
+          "Foreground memory review requires expectedContent for removals; inspect the target first.",
         );
       const hasRetained =
         params.retainedId !== undefined ||
