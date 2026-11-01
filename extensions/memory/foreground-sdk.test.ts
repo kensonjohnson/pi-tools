@@ -147,7 +147,7 @@ test(
           result: async () => message,
         } as any;
       };
-      await session.prompt("/memory-review full");
+      await session.prompt("/memory-review");
       await settled;
       assert.equal(calls, 2);
       assert.ok(

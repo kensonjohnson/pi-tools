@@ -57,27 +57,22 @@ test("foreground triggers guard writes until settlement and failed dispatch disa
         /only removes duplicates/,
       );
     }
-    await commands.get("memory-review").handler("full", ctx);
+    await commands.get("memory-review").handler("", ctx);
     await guarded();
     hooks.get("agent_settled")();
     await call("memory_update", { id: "x", content: "new" });
     await call("memory_forget", { id: "x" });
-    for (const [name, params] of [
-      ["memory_review", { action: "full" }],
-      ["memory_consolidate", {}],
-    ] as const) {
-      await call(name, params);
-      await guarded();
-      hooks.get("agent_settled")();
-    }
+    await call("memory_consolidate", {});
+    await guarded();
+    hooks.get("agent_settled")();
     hooks.get("message_end")({
       message: {
         role: "assistant",
         content: [
           {
             type: "toolCall",
-            name: "memory_review",
-            arguments: { action: "full" },
+            name: "memory_consolidate",
+            arguments: {},
           },
         ],
       },
@@ -86,7 +81,7 @@ test("foreground triggers guard writes until settlement and failed dispatch disa
     hooks.get("agent_settled")();
     failDispatch = true;
     await assert.rejects(
-      commands.get("memory-review").handler("full", ctx),
+      commands.get("memory-review").handler("", ctx),
       /dispatch failed/,
     );
     await call("memory_update", { id: "x", content: "new" });

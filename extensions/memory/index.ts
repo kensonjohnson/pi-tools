@@ -27,9 +27,7 @@ const MEMORY_TOOL_NAMES = [
   "memory_forget",
   "memory_init",
   "memory_repair",
-  "memory_learn",
   "memory_consolidate",
-  "memory_review",
   "memory_list",
 ] as const;
 
@@ -247,10 +245,7 @@ export default function (pi: ExtensionAPI) {
     if (
       event.message.content.some(
         (part) =>
-          part.type === "toolCall" &&
-          (part.name === "memory_consolidate" ||
-            (part.name === "memory_review" &&
-              part.arguments?.action === "full")),
+          part.type === "toolCall" && part.name === "memory_consolidate",
       )
     )
       foregroundReview = true;
@@ -667,35 +662,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
-    name: "memory_learn",
-    label: "Memory Learn",
-    description:
-      "Review recent activity and suggest new memories without writing them.",
-    parameters: Type.Object({
-      since: Type.Optional(
-        Type.String({
-          description: "ISO timestamp lower bound for activity review",
-        }),
-      ),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const manager = await getReadyManager(ctx);
-      if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
-
-      const snippets = await manager.learn(params.since);
-      return textResult(
-        snippets.length > 0
-          ? `Recent conversations from ${snippets.filter((s) => s.startsWith("--- Session")).length} sessions:\n\n${snippets.join("\n")}`
-          : "No recent sessions found. Use `memory_remember` to add memories manually.",
-        {
-          sessionCount: snippets.filter((s) => s.startsWith("--- Session"))
-            .length,
-        },
-      );
-    },
-  });
-
   async function foregroundReviewReady(
     ctx: ExtensionContext,
   ): Promise<string | undefined> {
@@ -710,20 +676,8 @@ export default function (pi: ExtensionAPI) {
     label: "Memory Consolidate",
     description:
       "Start foreground memory consolidation only when the user explicitly requests it; continue the review in this agent session using normal tools.",
-    parameters: Type.Object({
-      since: Type.Optional(
-        Type.String({
-          description:
-            "Legacy option; date-limited reviews are not supported. Omit for a full review.",
-        }),
-      ),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (params.since)
-        return textResult(
-          "Date-limited consolidation is no longer supported; omit since to run a full review.",
-          { failed: true },
-        );
+    parameters: Type.Object({}, { additionalProperties: false }),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
       const error = await foregroundReviewReady(ctx);
       if (error) return textResult(error, { failed: true });
       foregroundReview = true;
@@ -731,102 +685,37 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  function foregroundReviewGuidance(
-    action: "status" | "resume" | "cancel",
-  ): string {
-    if (action === "cancel")
-      return "There is no background memory review to cancel. Stop an active foreground agent turn using Pi's normal controls.";
-    if (action === "resume")
-      return "Memory review cannot be resumed; no foreground progress is saved. Run /memory-review full to start a new review.";
-    return "Memory review runs only in the foreground when requested. Run /memory-review full to start a review; no background review status is tracked.";
-  }
-
   // The tool is also available in headless/RPC mode; the command is a direct
   // user-facing entry point and never opens a focus-stealing screen.
   pi.registerCommand?.("memory-review", {
-    description: "Start foreground consolidation or show review guidance",
+    description: "Start foreground memory review",
     handler: async (args, ctx) => {
-      const [actionText = "status", ...rest] = args
-        .trim()
-        .toLowerCase()
-        .split(/\s+/)
-        .filter(Boolean);
-      const action = actionText as "status" | "full" | "resume" | "cancel";
-      const restart =
-        action === "full" && rest.length === 1 && rest[0] === "--restart";
-      if (
-        !["status", "full", "resume", "cancel"].includes(action) ||
-        (rest.length > 0 && !restart)
-      ) {
+      if (args.trim()) {
+        if (ctx.hasUI) ctx.ui.notify("Usage: /memory-review", "warning");
+        return;
+      }
+      const error = await foregroundReviewReady(ctx);
+      if (error) {
+        if (ctx.hasUI) ctx.ui.notify(error, "warning");
+        return;
+      }
+      if (!ctx.isIdle()) {
         if (ctx.hasUI)
           ctx.ui.notify(
-            "Usage: /memory-review [status|full [--restart]|resume|cancel]",
+            "Agent is busy. Run /memory-review when idle.",
             "warning",
           );
         return;
       }
-      if (action === "full") {
-        const error = await foregroundReviewReady(ctx);
-        if (error) {
-          if (ctx.hasUI) ctx.ui.notify(error, "warning");
-          return;
-        }
-        if (!ctx.isIdle()) {
-          if (ctx.hasUI)
-            ctx.ui.notify(
-              "Agent is busy. Run /memory-review full when idle.",
-              "warning",
-            );
-          return;
-        }
-        foregroundReview = true;
-        pendingForegroundCommand = true;
-        try {
-          pi.sendUserMessage(FOREGROUND_REVIEW_PROMPT);
-        } catch (error) {
-          foregroundReview = false;
-          pendingForegroundCommand = false;
-          throw error;
-        }
-        return;
+      foregroundReview = true;
+      pendingForegroundCommand = true;
+      try {
+        pi.sendUserMessage(FOREGROUND_REVIEW_PROMPT);
+      } catch (error) {
+        foregroundReview = false;
+        pendingForegroundCommand = false;
+        throw error;
       }
-      if (ctx.hasUI) ctx.ui.notify(foregroundReviewGuidance(action), "info");
-    },
-  });
-
-  pi.registerTool({
-    name: "memory_review",
-    label: "Memory Review",
-    description:
-      "Show foreground review guidance or start a foreground review when explicitly requested by the user.",
-    parameters: Type.Object({
-      restart: Type.Optional(
-        Type.Boolean({
-          description:
-            "Legacy compatibility option; foreground review always starts a new review.",
-        }),
-      ),
-      action: Type.Union([
-        Type.Literal("status"),
-        Type.Literal("full"),
-        Type.Literal("resume"),
-        Type.Literal("cancel"),
-      ]),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (params.restart && params.action !== "full")
-        return textResult("restart is available only for a full review.", {
-          failed: true,
-        });
-      if (params.action === "full") {
-        const error = await foregroundReviewReady(ctx);
-        if (error) return textResult(error, { failed: true });
-        foregroundReview = true;
-        return textResult(FOREGROUND_REVIEW_PROMPT, { foreground: true });
-      }
-      return textResult(foregroundReviewGuidance(params.action), {
-        foreground: true,
-      });
     },
   });
 

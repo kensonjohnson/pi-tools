@@ -12,7 +12,6 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import * as sqliteVec from "sqlite-vec";
 
@@ -35,7 +34,7 @@ export interface StoredMemoryLine extends MemoryLine {
   category: MemoryCategory;
 }
 
-/** Capture before generating an automatic proposal; parsed list records are not preconditions. */
+/** Capture before proposing a change; parsed list records are not preconditions. */
 export interface MemoryWritePrecondition {
   category: MemoryCategory;
   id: string;
@@ -53,7 +52,7 @@ export interface MemoryMovePrecondition {
   snapshots: Record<MemoryCategory, CategorySnapshot>;
 }
 
-/** Capture all categories before generating an automatic add proposal. */
+/** Capture all categories before proposing an add. */
 export interface MemoryAddPrecondition {
   snapshots: Record<MemoryCategory, CategorySnapshot>;
 }
@@ -506,7 +505,7 @@ export class NdjsonMemoryStore {
     });
   }
 
-  /** Unconditional when expected is omitted; reviewers must pass a captured precondition. */
+  /** Unconditional when expected is omitted; guarded writes require a captured precondition. */
   async remember(
     category: MemoryCategory,
     content: string,
@@ -561,7 +560,7 @@ export class NdjsonMemoryStore {
     });
   }
 
-  /** Capture before creating an automatic add proposal, not immediately before applying it. */
+  /** Capture before proposing an add, not immediately before applying it. */
   async captureAddPrecondition(): Promise<MemoryAddPrecondition> {
     return this.withCategoryLock("knowledge", async () => {
       const snapshots = await this.snapshots();
@@ -606,7 +605,7 @@ export class NdjsonMemoryStore {
     return this.mutate(id, targetPrecondition, () => null, snapshot);
   }
 
-  /** Automatic reviewers must retain this exact raw-line snapshot with each proposal. */
+  /** Retain this exact raw-line snapshot with each proposed change. */
   async captureWritePrecondition(
     id: string,
   ): Promise<MemoryWritePrecondition | null> {
@@ -2136,8 +2135,7 @@ export class MemoryManager {
     }))!;
   }
 
-  // The interactive update/forget tools omit this precondition; automatic reviewers
-  // must capture it before proposing a change and pass it back unchanged.
+  // Capture the precondition before proposing a guarded change and pass it back unchanged.
   async captureWritePrecondition(
     id: string,
   ): Promise<MemoryWritePrecondition | null> {
@@ -2278,128 +2276,6 @@ export class MemoryManager {
     return this.store.buildPromptContext();
   }
 
-  async learn(_since?: string): Promise<string[]> {
-    await this.initialize();
-    const sessions = await this.scanRecentSessions(5);
-    if (sessions.length === 0) {
-      return [];
-    }
-
-    const snippets: string[] = [];
-    for (const session of sessions) {
-      snippets.push(`--- Session: ${session.file} ---`);
-      for (const entry of session.entries) {
-        if (entry.type !== "message" || !entry.message) {
-          continue;
-        }
-        const role = entry.message.role;
-        if (role !== "user" && role !== "assistant") {
-          continue;
-        }
-        const text = extractMessageText(entry.message);
-        if (text) {
-          snippets.push(`[${role}]: ${text.slice(0, 400)}`);
-        }
-      }
-    }
-
-    return snippets;
-  }
-
-  private async scanRecentSessions(
-    limit: number,
-  ): Promise<Array<{ file: string; entries: unknown[] }>> {
-    const home = homedir();
-    const resolvedCwd = this.cwd.replace(/^\/+/, "").replace(/[/\\:]/g, "-");
-    const sessionDir = join(
-      home,
-      ".pi",
-      "agent",
-      "sessions",
-      `--${resolvedCwd}--`,
-    );
-
-    try {
-      const files = await readdir(sessionDir);
-      const jsonlFiles = files
-        .filter((f) => f.endsWith(".jsonl"))
-        .map((f) => join(sessionDir, f));
-
-      const fileStats = await Promise.all(
-        jsonlFiles.map(async (path) => {
-          const s = await stat(path);
-          return { path, mtime: s.mtime.getTime() };
-        }),
-      );
-      fileStats.sort((a, b) => b.mtime - a.mtime);
-
-      const recent = fileStats.slice(0, limit).map((f) => f.path);
-      const results: Array<{ file: string; entries: unknown[] }> = [];
-
-      for (const file of recent) {
-        const content = await readFile(file, "utf8").catch(() => "");
-        if (!content) {
-          continue;
-        }
-        const lines = content.split(/\r?\n/).filter(Boolean);
-        const entries: unknown[] = [];
-        for (const line of lines) {
-          try {
-            entries.push(JSON.parse(line));
-          } catch {
-            // Skip malformed lines
-          }
-        }
-        results.push({ file: file.split("/").pop() ?? file, entries });
-      }
-
-      return results;
-    } catch {
-      return [];
-    }
-  }
-
-  async consolidate(since?: string): Promise<string[]> {
-    await this.initialize();
-    const memories = await this.store.list();
-    const filtered = since
-      ? memories.filter(
-          (memory) =>
-            memory.created >= since ||
-            (memory.updated !== undefined && memory.updated >= since),
-        )
-      : memories;
-
-    const suggestions: string[] = [];
-    const seen = new Set<string>();
-
-    for (let i = 0; i < filtered.length; i++) {
-      for (let j = i + 1; j < filtered.length; j++) {
-        const first = filtered[i];
-        const second = filtered[j];
-        const similarity = textSimilarity(first.content, second.content);
-        if (similarity < 0.72) {
-          continue;
-        }
-
-        const key = [first.id, second.id].sort().join(":");
-        if (seen.has(key)) {
-          continue;
-        }
-        seen.add(key);
-        suggestions.push(
-          `Possible duplicate (${first.category}/${second.category}): ${first.id.slice(0, 8)} "${truncate(first.content, 80)}" <-> ${second.id.slice(0, 8)} "${truncate(second.content, 80)}"`,
-        );
-      }
-    }
-
-    if (suggestions.length === 0) {
-      return ["No obvious duplicates or consolidation targets found."];
-    }
-
-    return suggestions.slice(0, 10);
-  }
-
   private async generateSeedMemories(): Promise<
     Array<{ category: MemoryCategory; content: string }>
   > {
@@ -2530,54 +2406,6 @@ async function collectFiles(
     }
   }
   return files;
-}
-
-function extractMessageText(message: {
-  content?: string | Array<{ type?: string; text?: string }>;
-}): string {
-  const content = message.content;
-  if (typeof content === "string") {
-    return content;
-  }
-  if (Array.isArray(content)) {
-    return content
-      .filter((c) => c.type === "text" && typeof c.text === "string")
-      .map((c) => c.text)
-      .join(" ");
-  }
-  return "";
-}
-
-function splitSentences(text: string): string[] {
-  return text
-    .split(/(?<=[.!?])\s+/)
-    .map((entry) => entry.trim())
-    .filter(Boolean);
-}
-
-function truncate(value: string, length: number): string {
-  if (value.length <= length) {
-    return value;
-  }
-  return `${value.slice(0, Math.max(0, length - 3))}...`;
-}
-
-function textSimilarity(left: string, right: string): number {
-  const a = new Set(tokenize(left));
-  const b = new Set(tokenize(right));
-  if (a.size === 0 || b.size === 0) {
-    return 0;
-  }
-
-  let intersection = 0;
-  for (const token of a) {
-    if (b.has(token)) {
-      intersection++;
-    }
-  }
-
-  const union = new Set([...a, ...b]).size;
-  return union === 0 ? 0 : intersection / union;
 }
 
 async function exists(path: string): Promise<boolean> {

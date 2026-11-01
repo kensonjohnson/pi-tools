@@ -30,7 +30,7 @@ On a new session, the extension injects all knowledge entries and guidance to us
 
 ## Foreground consolidation
 
-The operator can request a review with `/memory-review full` when the agent is idle. The `memory_consolidate` tool or `memory_review` with action `full` provides the same foreground instructions when the user explicitly requests consolidation. The project must be trusted and its memory store initialized and enabled. `memory_consolidate` rejects the legacy `since` option.
+The operator can request a review with `/memory-review` when the agent is idle. The `memory_consolidate` tool provides the same foreground instructions when the user explicitly requests consolidation. The project must be trusted and its memory store initialized and enabled.
 
 The current agent conducts the review visibly with its normal model and tools. It inspects the memory categories and available repository and relevant session-history evidence, considers stale facts and overlaps, and applies only supported changes. It reports changes, evidence gaps, conflicts, and uncertainty. Missing evidence is not proof that a memory is false. Explicit user instructions should not be silently overridden by conflicting repository evidence; a later explicit instruction may supersede an earlier one. Evidence and model judgments are not guarantees of correctness. Inspect the uncommitted NDJSON diff.
 
@@ -38,7 +38,7 @@ During foreground review, `memory_update` requires the exact reviewed `expectedC
 
 This guard is not an OS sandbox. The foreground agent remains trusted: bash and other tools can bypass it, and path checks can race filesystem changes. Review the Git diff before committing. Memory's locks coordinate cooperating writers, not concurrent manual editors; their changes can still race the final replacement.
 
-There is no automatic session-history review, background review model dispatch, activity queue, debounce, or cooldown. Old `historyReview.*` and `models.reviewer` settings do not enable automatic review. Foreground consolidation does not require a separate reviewer model: it uses the current session. Project session messages, memories, and repository excerpts inspected during a review can be sent to that session's model provider. They may contain sensitive data; check the provider's privacy and retention policy.
+There is no automatic session-history review, background review model dispatch, or activity queue. Foreground consolidation uses the current session. Project session messages, memories, and repository excerpts inspected during a review can be sent to that session's model provider. They may contain sensitive data; check the provider's privacy and retention policy.
 
 ## Tools
 
@@ -51,6 +51,4 @@ There is no automatic session-history review, background review model dispatch, 
 | `memory_update`      | Replace a memory's content by ID; optionally check `expectedContent`.               |
 | `memory_forget`      | Remove a memory by ID; optionally check `expectedContent`.                          |
 | `memory_repair`      | Explicitly remove malformed non-empty lines and resync the index.                   |
-| `memory_learn`       | Preview recent activity without writing memories.                                   |
-| `memory_review`      | Start a foreground review on explicit request, or show review guidance.             |
 | `memory_consolidate` | Start a foreground review on explicit request.                                      |
