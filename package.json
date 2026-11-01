@@ -3,6 +3,16 @@
   "version": "1.0.0",
   "description": "Personal pi extensions and skills",
   "type": "module",
+  "files": [
+    "extensions/**/*.ts",
+    "!extensions/**/*.test.ts",
+    "!extensions/**/fixtures/**",
+    "lib/**/*.ts",
+    "!lib/**/*.test.ts",
+    "skills/**/*.md",
+    "!**/.runtime/**",
+    "!**/tmp/**"
+  ],
   "keywords": [
     "pi-package"
   ],
@@ -17,7 +27,7 @@
     "test:lsp": "node --experimental-strip-types --test $(find extensions/lsp-inspection -name '*.test.ts' -print)",
     "test:subagents": "node --experimental-strip-types --test $(find extensions/subagents -name '*.test.ts' -print)",
     "test:working-spinner": "node --experimental-strip-types --test $(find extensions/main-working-spinner -name '*.test.ts' -print)",
-    "verify:package": "npm pack --dry-run"
+    "verify:package": "node --experimental-strip-types --test tests/package-contents.test.ts"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",

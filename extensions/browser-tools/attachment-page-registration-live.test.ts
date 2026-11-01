@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { chromium } from "playwright";
 import { ManagedSessions } from "./sessions.ts";
 import { createManagedBrowserExtension } from "./registration.ts";
+import { ArtifactStore } from "./artifacts.ts";
 
 async function cdp(url: string) {
   const ws = new WebSocket(url);
@@ -80,10 +81,20 @@ test(
         timeoutCount++;
         return;
       }
-      response.setHeader("content-type", "text/html");
+      response.setHeader("content-type", "text/html; charset=utf-8");
+      if (request.url === "/exact") {
+        response.end("<body>ABCD</body>");
+        return;
+      }
+      if (request.url?.startsWith("/large")) {
+        response.end(
+          `<title>large</title><script>window.walkerCalls=0;document.createTreeWalker=()=>{window.walkerCalls++;throw new Error('page override invoked')}</script><p>${"L".repeat(262143)}😀${"L".repeat(37857)}TAIL</p>${Array.from({ length: 1500 }, (_, i) => `<i>node${i}</i>`).join("")}`,
+        );
+        return;
+      }
       response.end(
         request.url?.startsWith("/selected")
-          ? `<title>selected</title><p>Page text</p><script>console.log('private-console');new Image().src='/asset?token=private'</script>`
+          ? `<title>selected</title><p>Page text</p><script>window.titleGetterCalls=0;Object.defineProperty(document,'title',{get(){window.titleGetterCalls++;return 'forged'}});console.log('private-console');new Image().src='/asset?token=private'</script>`
           : "ok",
       );
     });
@@ -135,6 +146,7 @@ test(
         .execute("id", args, signal, undefined, ctx(owner));
     let browser: Awaited<ReturnType<typeof cdp>> | undefined,
       other: Awaited<ReturnType<typeof cdp>> | undefined,
+      selectedProbe: Awaited<ReturnType<typeof cdp>> | undefined,
       added: Awaited<ReturnType<typeof cdp>> | undefined;
     try {
       const ws = await new Promise<string>((resolve, reject) => {
@@ -176,6 +188,11 @@ test(
       createManagedBrowserExtension(pi as never, {
         loadSettings: async () => ({ values: {} }) as never,
         createSessions: () => sessions,
+        createArtifacts: () =>
+          new ArtifactStore({
+            root: join(root, "artifacts"),
+            quota: 2_000_000,
+          }),
       });
       await handlers.get("session_start")!({}, ctx());
       await assert.rejects(
@@ -275,6 +292,12 @@ test(
         ).title,
         "selected",
       );
+      selectedProbe = await cdp(pageEndpoint(selected));
+      const titleSideEffects = await selectedProbe.send("Runtime.evaluate", {
+        expression: "window.titleGetterCalls",
+        returnByValue: true,
+      });
+      assert.equal(titleSideEffects.result.value, 0);
       assert.match(
         JSON.stringify(
           JSON.parse(
@@ -288,6 +311,159 @@ test(
           ),
         ),
         /Page text/,
+      );
+      await call({
+        action: "navigate",
+        attachmentId: attach,
+        targetId: selected,
+        url: `http://127.0.0.1:${(site.address() as any).port}/exact`,
+      });
+      const exact = JSON.parse(
+        (
+          await call({
+            action: "inspect",
+            attachmentId: attach,
+            targetId: selected,
+            maxChars: 4,
+          })
+        ).content[0].text,
+      );
+      assert.equal(exact.text, "ABCD");
+      assert.equal(exact.truncated, false);
+      assert.equal(exact.truncationReason, null);
+      const clipped = JSON.parse(
+        (
+          await call({
+            action: "inspect",
+            attachmentId: attach,
+            targetId: selected,
+            maxChars: 3,
+          })
+        ).content[0].text,
+      );
+      assert.equal(clipped.text, "ABC");
+      assert.equal(clipped.truncationReason, "chars");
+      const largeUrl = `http://127.0.0.1:${(site.address() as any).port}/large?value=${"x".repeat(9000)}`;
+      const navigation = JSON.parse(
+        (
+          await call({
+            action: "navigate",
+            attachmentId: attach,
+            targetId: selected,
+            url: largeUrl,
+          })
+        ).content[0].text,
+      );
+      assert.equal(navigation.status, "completed");
+      assert.equal(navigation.requestedUrlTruncated, true);
+      await assert.rejects(
+        call({
+          action: "inspect",
+          attachmentId: attach,
+          targetId: selected,
+          maxNodes: 0,
+        }),
+        /positive safe integers/,
+      );
+      const defaults = JSON.parse(
+        (
+          await call({
+            action: "inspect",
+            attachmentId: attach,
+            targetId: selected,
+          })
+        ).content[0].text,
+      );
+      assert.equal(defaults.kind, "attachment-inspection");
+      const defaultChunk = JSON.parse(
+        (
+          await tools
+            .get("browser_artifact")
+            .execute(
+              "id",
+              { action: "read", id: defaults.artifact.id },
+              undefined,
+              undefined,
+              ctx(),
+            )
+        ).content[0].text,
+      );
+      const defaultResult = JSON.parse(defaultChunk.text);
+      assert.equal(defaultResult.truncated, true);
+      assert.equal(defaultResult.truncationReason, "chars");
+      assert.equal(defaultResult.text.length, 16000);
+      assert.equal(defaultResult.charsReturned, 16000);
+      const smallNodes = JSON.parse(
+        (
+          await call({
+            action: "inspect",
+            attachmentId: attach,
+            targetId: selected,
+            maxNodes: 1,
+            maxChars: 500000,
+          })
+        ).content[0].text,
+      );
+      assert.equal(smallNodes.truncated, true);
+      assert.equal(smallNodes.truncationReason, "nodes");
+      const large = JSON.parse(
+        (
+          await call({
+            action: "inspect",
+            attachmentId: attach,
+            targetId: selected,
+            maxNodes: 4000,
+            maxChars: 500000,
+          })
+        ).content[0].text,
+      );
+      assert.equal(large.kind, "attachment-inspection");
+      let offset = 0,
+        content = "";
+      for (;;) {
+        const part = JSON.parse(
+          (
+            await tools
+              .get("browser_artifact")
+              .execute(
+                "id",
+                { action: "read", id: large.artifact.id, offset },
+                undefined,
+                undefined,
+                ctx(),
+              )
+          ).content[0].text,
+        );
+        content += part.text;
+        if (part.nextOffset === null) break;
+        offset = part.nextOffset;
+      }
+      const restored = JSON.parse(content);
+      assert.equal(restored.truncated, false);
+      assert.equal(restored.charsReturned, restored.text.length);
+      assert.ok(restored.nodesVisited > 1000);
+      assert.ok(
+        restored.text.includes(
+          "L".repeat(262143) + "😀" + "L".repeat(37857) + "TAIL",
+        ),
+      );
+      assert.match(restored.text, /node1499/);
+      const sideEffects = await selectedProbe.send("Runtime.evaluate", {
+        expression: "window.walkerCalls",
+        returnByValue: true,
+      });
+      assert.equal(sideEffects.result.value, 0);
+      await assert.rejects(
+        tools
+          .get("browser_artifact")
+          .execute(
+            "id",
+            { action: "read", id: large.artifact.id },
+            undefined,
+            undefined,
+            ctx("foreign"),
+          ),
+        /owned by another/,
       );
       assert.equal(await stillPending(preexisting), true);
       await other.send("Page.handleJavaScriptDialog", { accept: false });
@@ -394,6 +570,10 @@ test(
       );
       assert.equal(child.exitCode, null);
       assert.equal(timeoutCount, 1);
+      // Both navigation cancellations deliberately quarantine attachment leases.
+      // Shutdown therefore reports incomplete cleanup even with no upload staging.
+      assert.equal((sessions as any).attachmentCleanupUnverified, true);
+      assert.deepEqual(sessions.uploadRecovery("owner").entries, []);
       const idleId = JSON.parse(
         (await call({ action: "connect", endpoint })).content[0].text,
       ).attachmentId;
@@ -415,6 +595,7 @@ test(
     } finally {
       await handlers.get("session_shutdown")?.({}, ctx());
       other?.close();
+      selectedProbe?.close();
       added?.close();
       browser?.close();
       child.kill("SIGTERM");

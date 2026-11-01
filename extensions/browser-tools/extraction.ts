@@ -19,7 +19,30 @@ type RequestedUrl =
 
 // Fail closed rather than returning an apparently complete partial page. These limits
 // bound our own traversal and host processing, not browser layout/selector costs.
-const LIMITS = { nodes: 4000, chars: 256 * 1024, depth: 128, metadata: 8192 };
+const LIMITS = {
+  nodes: 4000,
+  chars: 256 * 1024,
+  depth: 128,
+  metadata: 8192,
+  derivedChars: 8 * 1024 * 1024,
+};
+type ExtractionBudget = Partial<typeof LIMITS>;
+function extractionLimits(budget: ExtractionBudget = {}): typeof LIMITS {
+  for (const key of [
+    "nodes",
+    "chars",
+    "depth",
+    "metadata",
+    "derivedChars",
+  ] as const) {
+    const value = budget[key];
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 1))
+      throw new Error(
+        `Extraction ${key} budget must be a positive safe integer.`,
+      );
+  }
+  return { ...LIMITS, ...budget };
+}
 type Item = {
   kind: "open" | "close" | "text";
   tag?: string;
@@ -251,12 +274,26 @@ function safeLink(value: string, base: string): string | null {
     return null;
   }
 }
-function render(snapshot: Snapshot, requestedUrl: string | null, scope: Scope) {
+function render(
+  snapshot: Snapshot,
+  requestedUrl: string | null,
+  scope: Scope,
+  derivedLimit: number,
+) {
   let text = "";
   const headings: { level: number; text: string }[] = [];
   const links: { text: string; url: string }[] = [];
   const openHeadings: { level: number; start: number }[] = [];
   const openLinks: { url: string | null; start: number }[] = [];
+  let derivedChars = 0;
+  const derivedText = (start: number) => {
+    derivedChars += text.length - start;
+    if (derivedChars > derivedLimit)
+      throw new Error(
+        "Extraction derived heading/link text limit exceeded; narrow the scope.",
+      );
+    return text.slice(start).replace(/\s+/g, " ").trim();
+  };
   const block = new Set([
     "p",
     "div",
@@ -295,14 +332,14 @@ function render(snapshot: Snapshot, requestedUrl: string | null, scope: Scope) {
     } else {
       if (/^h[1-6]$/.test(tag)) {
         const heading = openHeadings.pop()!;
-        const value = text.slice(heading.start).replace(/\s+/g, " ").trim();
+        const value = derivedText(heading.start);
         if (value) headings.push({ level: heading.level, text: value });
       }
       if (tag === "a") {
         const link = openLinks.pop()!;
         if (link.url)
           links.push({
-            text: text.slice(link.start).replace(/\s+/g, " ").trim(),
+            text: derivedText(link.start),
             url: link.url,
           });
       }
@@ -331,7 +368,9 @@ export async function extractPage(
   page: Page,
   scope: Scope = {},
   requestedUrl: RequestedUrl = null,
+  budget: ExtractionBudget = {},
 ) {
+  const limits = extractionLimits(budget);
   const cdp = await page.context().newCDPSession(page);
   let childCdp: CDPSession | undefined;
   try {
@@ -351,7 +390,7 @@ export async function extractPage(
       const selected = await evaluate(
         cdp,
         contextId,
-        `(${selectFrame.toString()})(${JSON.stringify(scope.frameSelector)},${LIMITS.nodes})`,
+        `(${selectFrame.toString()})(${JSON.stringify(scope.frameSelector)},${limits.nodes})`,
         false,
       );
       if (!selected.objectId) throw new Error("Selected frame is unavailable.");
@@ -390,14 +429,14 @@ export async function extractPage(
     const result = await evaluate(
       activeCdp,
       contextId,
-      `(${capture.toString()})(${JSON.stringify(scope.selector ?? null)} === null ? undefined : ${JSON.stringify(scope.selector ?? null)},${JSON.stringify(LIMITS)})`,
+      `(${capture.toString()})(${JSON.stringify(scope.selector ?? null)} === null ? undefined : ${JSON.stringify(scope.selector ?? null)},${JSON.stringify(limits)})`,
       true,
     );
     if (scope.frameSelector !== undefined) {
       const selected = await evaluate(
         cdp,
         parentContextId,
-        `(${selectFrame.toString()})(${JSON.stringify(scope.frameSelector)},${LIMITS.nodes})`,
+        `(${selectFrame.toString()})(${JSON.stringify(scope.frameSelector)},${limits.nodes})`,
         false,
       );
       if (!selected.objectId) throw new Error("Selected frame is unavailable.");
@@ -422,7 +461,7 @@ export async function extractPage(
           ? requestedUrl({ loaderId: finalFrame.loaderId, url: finalUrl })
           : null;
     }
-    return render(snapshot, requestedUrl, scope);
+    return render(snapshot, requestedUrl, scope, limits.derivedChars);
   } finally {
     await childCdp?.detach().catch(() => {});
     await cdp.detach().catch(() => {});
@@ -460,7 +499,7 @@ export function registerExtractionTools(
     name: "browser_extract",
     label: "Browser extract",
     description:
-      "Extract one current rendered document or explicitly scoped element as untrusted research content. No crawling. Bounded snapshot; oversize content fails. URL credentials are redacted; use DOM/eval for explicit raw access. Large complete records use private artifacts.",
+      "Extract one current rendered document or explicitly scoped element as untrusted research content. No crawling. Adjust maxNodes, maxChars, maxDepth, maxMetadataChars and maxDerivedChars for larger captures; oversize content fails. Large budgets may exhaust browser or host memory. URL credentials are redacted; use DOM/eval for explicit raw access. Large complete records use private artifacts.",
     parameters: Type.Object({
       sessionId: Type.Optional(Type.String({ maxLength: 256 })),
       tabId: Type.Optional(Type.String({ maxLength: 256 })),
@@ -468,6 +507,21 @@ export function registerExtractionTools(
         Type.String({ minLength: 1, maxLength: 2048 }),
       ),
       selector: Type.Optional(Type.String({ minLength: 1, maxLength: 2048 })),
+      maxNodes: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      maxChars: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      maxDepth: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      maxMetadataChars: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      maxDerivedChars: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
     }),
     async execute(_id, args, signal, _onUpdate, ctx) {
       const runtime = getRuntime(ctx, signal);
@@ -480,6 +534,17 @@ export function registerExtractionTools(
             page,
             { frameSelector: args.frameSelector, selector: args.selector },
             requestedUrl,
+            {
+              ...(args.maxNodes === undefined ? {} : { nodes: args.maxNodes }),
+              ...(args.maxChars === undefined ? {} : { chars: args.maxChars }),
+              ...(args.maxDepth === undefined ? {} : { depth: args.maxDepth }),
+              ...(args.maxMetadataChars === undefined
+                ? {}
+                : { metadata: args.maxMetadataChars }),
+              ...(args.maxDerivedChars === undefined
+                ? {}
+                : { derivedChars: args.maxDerivedChars }),
+            },
           ),
         }),
       );

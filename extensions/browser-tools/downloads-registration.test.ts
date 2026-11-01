@@ -136,6 +136,19 @@ test("staged download tools subscribe before navigation and scope artifacts to c
       await readFile(done.artifact.path),
       Buffer.from([0, 255, 1]),
     );
+    const afterClose = await call("browser_download", {
+      action: "list",
+      sessionId: target.sessionId,
+    });
+    assert.equal(afterClose.downloads[0].artifact.id, done.artifact.id);
+    await assert.rejects(
+      call(
+        "browser_download",
+        { action: "list", sessionId: target.sessionId },
+        "other",
+      ),
+      /owned by another/,
+    );
     await handlers.get("session_shutdown")!();
     assert.ok(!active.includes("browser_download"));
   } finally {

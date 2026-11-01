@@ -17,10 +17,7 @@ import { ManagedSessions } from "./sessions.ts";
 import { DownloadManager } from "./downloads.ts";
 import { TraceRecordings } from "./recording.ts";
 import { VideoRecordings } from "./video-recording.ts";
-import {
-  listRecordingRecovery,
-  RECORDING_RECOVERY_SCAN_LIMIT,
-} from "./recording-recovery.ts";
+import { listRecordingRecovery } from "./recording-recovery.ts";
 import { registerExtractionTools } from "./extraction.ts";
 import { BrowserDiagnostics } from "./diagnostics.ts";
 import {
@@ -129,10 +126,15 @@ export function createManagedBrowserExtension(
       } catch {
         diagnosticsFailed = true;
       }
-      let shutdown: Promise<{ complete: boolean }>;
+      let shutdown: Promise<{
+        complete: boolean;
+        uploadRecovery?: ReturnType<ManagedSessions["uploadRecovery"]>;
+        downloadRisk?: ReturnType<DownloadManager["closeRisks"]>;
+      }>;
       try {
         shutdown = current.sessions.shutdown(
           current.settings.shutdownTimeoutMs,
+          current.owner,
         );
       } catch (error) {
         shutdown = Promise.reject(error);
@@ -141,7 +143,7 @@ export function createManagedBrowserExtension(
         (result) => {
           if (diagnosticsFailed || !result.complete)
             console.warn(
-              "Browser cleanup did not complete or could not be verified; browser processes or other resources may remain.",
+              `Browser cleanup did not complete or could not be verified; browser processes or other resources may remain.${result.uploadRecovery ? ` Upload recovery for this owner: ${JSON.stringify(result.uploadRecovery)}` : ""}${result.downloadRisk?.length ? ` Browser shutdown may have destroyed unexported native downloads or interrupted active downloads for this owner; their availability is unknown: ${JSON.stringify(result.downloadRisk)}` : ""}`,
             );
         },
         () => {
@@ -164,6 +166,96 @@ export function createManagedBrowserExtension(
     details: undefined,
   });
   const result = (value: unknown) => textResult(formatResult(value));
+  const structuredResult = async (
+    current: NonNullable<typeof runtime>,
+    owner: string,
+    value: unknown,
+    kind: string,
+    signal?: AbortSignal,
+  ) => {
+    const json = JSON.stringify(value);
+    if (Buffer.byteLength(json, "utf8") <= 16000) return textResult(json);
+    return textResult(
+      await inspectionOutput(
+        current.artifacts,
+        owner,
+        json,
+        {
+          kind,
+          representation: "json",
+          ...(kind === "snapshot"
+            ? {
+                referenceLifetime:
+                  "Snapshot refs expire on navigation or the next snapshot.",
+              }
+            : {}),
+        },
+        signal,
+        { forceArtifact: true },
+      ),
+    );
+  };
+  // Keep dispatch state visible even when the full result needs an artifact or
+  // artifact publication fails after the browser operation has completed.
+  const actionResult = async (
+    current: NonNullable<typeof runtime>,
+    owner: string,
+    value: unknown,
+    kind: "action" | "dialog",
+    signal?: AbortSignal,
+  ) => {
+    const json = JSON.stringify(value);
+    if (Buffer.byteLength(json, "utf8") <= 16000) return textResult(json);
+    const object = (v: unknown): Record<string, unknown> =>
+      v && typeof v === "object" && !Array.isArray(v)
+        ? (v as Record<string, unknown>)
+        : {};
+    const summary = (v: unknown) => {
+      const source = object(v);
+      const output: Record<string, string> = {};
+      for (const key of ["status", "verification", "action", "operationId"]) {
+        const item = source[key];
+        if (typeof item === "string" && item.length <= 128) output[key] = item;
+      }
+      return output;
+    };
+    const source = object(value);
+    const metadata = {
+      kind,
+      representation: "json",
+      ...summary(value),
+      ...(source.result && typeof source.result === "object"
+        ? { result: summary(source.result) }
+        : {}),
+      dispatchWarning:
+        "The browser operation may have occurred; do not automatically retry.",
+    };
+    try {
+      return textResult(
+        await inspectionOutput(
+          current.artifacts,
+          owner,
+          json,
+          metadata,
+          signal,
+          { forceArtifact: true },
+        ),
+      );
+    } catch (error) {
+      const quota =
+        error instanceof Error && /quota exceeded/i.test(error.message);
+      return textResult(
+        JSON.stringify({
+          ...metadata,
+          complete: false,
+          artifactSaved: false,
+          artifactError: quota
+            ? "Artifact quota exceeded; full result was not saved."
+            : "Full result could not be saved to the owner-scoped artifact store.",
+        }),
+      );
+    }
+  };
   publishExtensionSettings(pi.events, BROWSER_SETTINGS);
   registerDiagnosticTools(
     pi,
@@ -194,11 +286,12 @@ export function createManagedBrowserExtension(
     name: "browser_session",
     label: "Browser session",
     description:
-      "Start and manage owned disposable Chromium sessions and explicitly selected tabs. Tool names registered later by other extensions follow Pi's registry load order.",
+      "Start and manage owned disposable Chromium sessions and explicitly selected tabs. Stop blocks for active downloads or unexported native recovery bytes; wait, export_native, or explicitly set abandonDownloads=true to accept loss. Use upload_recovery to inspect this owner's pending or retained upload staging after uncertain cleanup; verify browser exit before removing retained files. Tool names registered later by other extensions follow Pi's registry load order.",
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal("start"),
         Type.Literal("list"),
+        Type.Literal("upload_recovery"),
         Type.Literal("new_tab"),
         Type.Literal("select"),
         Type.Literal("close_tab"),
@@ -211,6 +304,12 @@ export function createManagedBrowserExtension(
       ),
       headless: Type.Optional(Type.Boolean()),
       profile: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+      abandonDownloads: Type.Optional(
+        Type.Boolean({
+          description:
+            "Explicitly accept losing active or unexported native downloads when stopping this browser session.",
+        }),
+      ),
       video: Type.Optional(
         Type.Boolean({
           description:
@@ -246,19 +345,37 @@ export function createManagedBrowserExtension(
               : "";
             throw new Error(`${installed.message.slice(0, 2048)}${guidance}`);
           }
+          const started = await current.sessions.start({
+            purpose: args.purpose,
+            headless: args.headless,
+            profile: args.profile,
+            video: args.video,
+            artifactOwner: owner,
+            signal: startupSignal,
+          });
           return result(
-            await current.sessions.start({
-              purpose: args.purpose,
-              headless: args.headless,
-              profile: args.profile,
-              video: args.video,
-              artifactOwner: owner,
-              signal: startupSignal,
-            }),
+            args.video
+              ? {
+                  ...started,
+                  videoDeadline: {
+                    durationMs: current.settings.recordingDurationMs,
+                    warning:
+                      "The recording deadline closes this browser even if downloads are active or native recovery bytes are unexported; those bytes may be lost. Export them before the deadline.",
+                  },
+                }
+              : started,
           );
         }
         case "list":
           return textResult(formatSessionList(current.sessions.list(owner)));
+        case "upload_recovery":
+          return structuredResult(
+            current,
+            owner,
+            current.sessions.uploadRecovery(owner),
+            "upload_recovery",
+            combined,
+          );
         case "select":
           if (!args.sessionId || !args.tabId)
             throw new Error("select requires sessionId and tabId.");
@@ -285,6 +402,7 @@ export function createManagedBrowserExtension(
             current.settings.shutdownTimeoutMs,
             combined,
             owner,
+            args.abandonDownloads === true,
           );
           return result({ stopped: true });
       }
@@ -294,7 +412,7 @@ export function createManagedBrowserExtension(
     name: "browser_attachment",
     label: "Local browser attachment",
     description:
-      "Experimental direct page-scoped CDP attachment, separate from managed Playwright sessions. Connect to a literal loopback endpoint, explicitly discover and lease one page, then use bounded title/text inspection, HTTP(S) navigation, or opt-in page diagnostics. Console arguments, headers and bodies are not captured; DOM text may include hidden or script content and secrets. Actions, screenshots, uploads, dialogs, recording and full Playwright facilities are unsupported. Disconnect never closes the external browser or tab. Timeouts and failures may quarantine ownership; no action is replayed.",
+      "Experimental direct page-scoped CDP attachment, separate from managed Playwright sessions. Connect to a literal loopback endpoint, explicitly discover and lease one page, then use budgeted title/text inspection, HTTP(S) navigation, or opt-in page diagnostics. Inspection maxNodes and maxChars default to 1,000 and 16,000; larger budgets can consume browser and host memory, and large results use owner-scoped artifacts. Console arguments, headers and bodies are not captured; DOM text may include hidden or script content and secrets. Actions, screenshots, uploads, dialogs, recording and full Playwright facilities are unsupported. Disconnect never closes the external browser or tab. Timeouts and failures may quarantine ownership; no action is replayed.",
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal("connect"),
@@ -313,8 +431,16 @@ export function createManagedBrowserExtension(
         Type.String({ minLength: 1, maxLength: 256 }),
       ),
       targetId: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
-      url: Type.Optional(Type.String({ minLength: 1, maxLength: 8192 })),
-      timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 30000 })),
+      url: Type.Optional(Type.String({ minLength: 1 })),
+      maxNodes: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      maxChars: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      timeoutMs: Type.Optional(
+        Type.Integer({ minimum: 100, maximum: 2147483647 }),
+      ),
     }),
     async execute(_id, args, signal, _onUpdate, ctx) {
       const current = requireRuntime();
@@ -349,6 +475,7 @@ export function createManagedBrowserExtension(
             args.attachmentId,
             owner,
             combined,
+            args.timeoutMs,
           ),
         );
       if (args.action === "disconnect") {
@@ -421,17 +548,30 @@ export function createManagedBrowserExtension(
         owner,
         args.targetId,
         args.action,
-        { url: args.url, timeoutMs: args.timeoutMs },
+        {
+          url: args.url,
+          timeoutMs: args.timeoutMs,
+          maxNodes: args.maxNodes,
+          maxChars: args.maxChars,
+        },
         combined,
       );
-      return result(value);
+      return args.action === "inspect"
+        ? structuredResult(
+            current,
+            owner,
+            value,
+            "attachment-inspection",
+            combined,
+          )
+        : result(value);
     },
   });
   pi.registerTool({
     name: "browser_recording",
     label: "Browser recording",
     description:
-      "Start or stop an owned context-wide native trace, inspect recording status, or list private recovery directories without deleting them. Recordings contain sensitive raw page data. Native temporary bytes are not quota-limited. Videos receive bounded structural checks, not a full decode. Request video when creating the session; the deadline closes the session.",
+      "Start or stop an owned context-wide native trace, inspect recording status, or list private recovery directories without deleting them. Recordings contain sensitive raw page data. Native temporary bytes are not quota-limited; long recordings and many pages consume disk and memory. Videos receive bounded structural checks, not a full decode. Request video when creating the session; the configured deadline closes the session. Recovery pages rescan the directory, are cancellable and may shift if entries change.",
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal("start_trace"),
@@ -443,9 +583,11 @@ export function createManagedBrowserExtension(
       ]),
       sessionId: Type.Optional(Type.String()),
       offset: Type.Optional(
-        Type.Integer({ minimum: 0, maximum: RECORDING_RECOVERY_SCAN_LIMIT }),
+        Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
       ),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+      limit: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
     }),
     async execute(_id, args, signal, _onUpdate, ctx) {
       const current = requireRuntime();
@@ -454,14 +596,24 @@ export function createManagedBrowserExtension(
         throw new Error(
           "Video requires a new recording-enabled session; enabling it on this session would lose state. No session was restarted.",
         );
-      if (args.action === "recovery")
-        return result(
+      if (args.action === "recovery") {
+        const combined = AbortSignal.any([
+          current.controller.signal,
+          ...(signal ? [signal] : []),
+        ]);
+        return structuredResult(
+          current,
+          owner,
           await listRecordingRecovery(
             owner,
             args.offset ?? 0,
             args.limit ?? 20,
+            combined,
           ),
+          "recording_recovery",
+          combined,
         );
+      }
       if (args.action === "inspect_video") {
         if (!args.sessionId)
           throw new Error("Video inspection requires sessionId.");
@@ -469,12 +621,22 @@ export function createManagedBrowserExtension(
         const offset = args.offset ?? 0;
         const limit = args.limit ?? 20;
         const totalVideos = record.videos.length;
-        return result({
-          ...record,
-          videos: record.videos.slice(offset, offset + limit),
-          totalVideos,
-          nextOffset: offset + limit < totalVideos ? offset + limit : null,
-        });
+        const combined = AbortSignal.any([
+          current.controller.signal,
+          ...(signal ? [signal] : []),
+        ]);
+        return structuredResult(
+          current,
+          owner,
+          {
+            ...record,
+            videos: record.videos.slice(offset, offset + limit),
+            totalVideos,
+            nextOffset: offset + limit < totalVideos ? offset + limit : null,
+          },
+          "recording_video",
+          combined,
+        );
       }
       if (args.action === "inspect" && args.sessionId)
         return result(current.recordings.inspect(args.sessionId, owner));
@@ -502,7 +664,7 @@ export function createManagedBrowserExtension(
     label: "Browser navigate",
     description: "Navigate an explicitly addressed or agent-selected tab.",
     parameters: Type.Object({
-      url: Type.String({ minLength: 1, maxLength: 8192 }),
+      url: Type.String({ minLength: 1 }),
       sessionId: Type.Optional(Type.String()),
       tabId: Type.Optional(Type.String()),
     }),
@@ -542,37 +704,91 @@ export function createManagedBrowserExtension(
     name: "browser_snapshot",
     label: "Browser snapshot",
     description:
-      "Capture a bounded semantic snapshot of the owned tab. To scope a child frame, provide a Playwright frameSelector matching one iframe element in the main document; selector then scopes within that frame. Without frameSelector, a selector scopes only the main frame. References expire on navigation or the next snapshot.",
+      "Capture a bounded semantic snapshot of the owned tab. Identity budgets control complete names, label traversal, metadata and ancestry; incomplete identities have no actionable reference. Larger budgets may exhaust memory or block the renderer. To scope a child frame, provide a Playwright frameSelector matching one iframe element in the main document; selector then scopes within that frame. Without frameSelector, a selector scopes only the main frame. References expire on navigation or the next snapshot.",
     parameters: Type.Object({
       ...targetParameters,
-      selector: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
+      selector: Type.Optional(Type.String({ minLength: 1 })),
       frameSelector: Type.Optional(
         Type.String({
           minLength: 1,
-          maxLength: 1024,
           description:
             "Unique iframe element selector in the main document; nested frames are not directly selectable.",
         }),
       ),
-      maxRecords: Type.Optional(Type.Integer({ minimum: 1, maximum: 300 })),
-      maxChars: Type.Optional(Type.Integer({ minimum: 512, maximum: 32000 })),
+      maxNodes: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      maxRecords: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      maxChars: Type.Optional(
+        Type.Integer({ minimum: 512, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      maxFrames: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      maxScopeNodes: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      identityNameChars: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      identityTextChars: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      identityNodes: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      identityAncestors: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      identityFrameDepth: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      identityMetadataChars: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
+      identityLabels: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
     }),
     async execute(_id, args, signal, _onUpdate, ctx) {
       const current = requireRuntime();
       const owner = ctx?.sessionManager?.getSessionId() ?? current.owner;
-      return result(
-        await current.sessions.snapshot(
-          args,
-          owner,
-          inspectionSignal(current, signal),
-          {
-            selector: args.selector,
-            frameSelector: args.frameSelector,
-            maxRecords: args.maxRecords,
-            maxChars: args.maxChars,
-          },
-        ),
-      );
+      const combined = inspectionSignal(current, signal);
+      const snapshot = await current.sessions.snapshot(args, owner, combined, {
+        selector: args.selector,
+        frameSelector: args.frameSelector,
+        maxNodes: args.maxNodes,
+        maxRecords: args.maxRecords,
+        maxChars: args.maxChars,
+        maxFrames: args.maxFrames,
+        ...(args.maxScopeNodes !== undefined
+          ? { maxScopeNodes: args.maxScopeNodes }
+          : {}),
+        ...(args.identityNameChars !== undefined
+          ? { identityNameChars: args.identityNameChars }
+          : {}),
+        ...(args.identityTextChars !== undefined
+          ? { identityTextChars: args.identityTextChars }
+          : {}),
+        ...(args.identityNodes !== undefined
+          ? { identityNodes: args.identityNodes }
+          : {}),
+        ...(args.identityAncestors !== undefined
+          ? { identityAncestors: args.identityAncestors }
+          : {}),
+        ...(args.identityFrameDepth !== undefined
+          ? { identityFrameDepth: args.identityFrameDepth }
+          : {}),
+        ...(args.identityMetadataChars !== undefined
+          ? { identityMetadataChars: args.identityMetadataChars }
+          : {}),
+        ...(args.identityLabels !== undefined
+          ? { identityLabels: args.identityLabels }
+          : {}),
+      });
+      return structuredResult(current, owner, snapshot, "snapshot", combined);
     },
   });
   pi.registerTool({
@@ -586,12 +802,20 @@ export function createManagedBrowserExtension(
       action: Type.Optional(
         Type.Union([Type.Literal("validate"), Type.Literal("click")]),
       ),
-      timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 30000 })),
+      timeoutMs: Type.Optional(
+        Type.Integer({ minimum: 100, maximum: 2147483647 }),
+      ),
     }),
     async execute(_id, args, signal, _onUpdate, ctx) {
       const current = requireRuntime();
       const owner = ctx?.sessionManager?.getSessionId() ?? current.owner;
-      const combined = inspectionSignal(current, signal);
+      const combined =
+        args.action === "click"
+          ? AbortSignal.any([
+              current.controller.signal,
+              ...(signal ? [signal] : []),
+            ])
+          : inspectionSignal(current, signal);
       return result(
         args.action === "click"
           ? await current.sessions.clickSnapshotRef(
@@ -614,7 +838,7 @@ export function createManagedBrowserExtension(
     name: "browser_action",
     label: "Browser action",
     description:
-      "Click, fill, select by option value, press a key, scroll an element into view, or wait until visible. Target an exact snapshot ref or a unique selector/role in an optional main-document iframe and section scope. Observers are armed before the action; text is sampled in the main document and may miss transient changes. A matching text, URL substring, or response URL substring proves only that condition, not application success. Input may have occurred on failure; never automatically retry.",
+      "Click, fill, select by option value, press a key, scroll an element into view, or wait until visible. Target an exact snapshot ref or a unique selector/role in an optional main-document iframe and section scope. Observers are armed before the action; text is sampled in the main document and may miss transient changes. A matching text, URL substring, or response URL substring proves only that condition, not application success. Large values consume browser and host memory and may exceed platform limits. Input may have occurred on failure; never automatically retry.",
     parameters: Type.Object({
       ...targetParameters,
       action: Type.Union([
@@ -632,32 +856,26 @@ export function createManagedBrowserExtension(
         ),
         Type.Object(
           {
-            selector: Type.String({ minLength: 1, maxLength: 1024 }),
-            frameSelector: Type.Optional(
-              Type.String({ minLength: 1, maxLength: 1024 }),
-            ),
-            scopeSelector: Type.Optional(
-              Type.String({ minLength: 1, maxLength: 1024 }),
-            ),
+            selector: Type.String({ minLength: 1 }),
+            frameSelector: Type.Optional(Type.String({ minLength: 1 })),
+            scopeSelector: Type.Optional(Type.String({ minLength: 1 })),
           },
           { additionalProperties: false },
         ),
         Type.Object(
           {
-            role: Type.String({ minLength: 1, maxLength: 64 }),
-            name: Type.String({ maxLength: 500 }),
-            frameSelector: Type.Optional(
-              Type.String({ minLength: 1, maxLength: 1024 }),
-            ),
-            scopeSelector: Type.Optional(
-              Type.String({ minLength: 1, maxLength: 1024 }),
-            ),
+            role: Type.String({ minLength: 1 }),
+            name: Type.String(),
+            frameSelector: Type.Optional(Type.String({ minLength: 1 })),
+            scopeSelector: Type.Optional(Type.String({ minLength: 1 })),
           },
           { additionalProperties: false },
         ),
       ]),
-      value: Type.Optional(Type.String({ maxLength: 10000 })),
-      timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 30000 })),
+      value: Type.Optional(Type.String()),
+      timeoutMs: Type.Optional(
+        Type.Integer({ minimum: 100, maximum: 2147483647 }),
+      ),
       expect: Type.Optional(
         Type.Object(
           {
@@ -666,7 +884,7 @@ export function createManagedBrowserExtension(
               Type.Literal("url"),
               Type.Literal("response"),
             ]),
-            value: Type.String({ minLength: 1, maxLength: 1000 }),
+            value: Type.String({ minLength: 1 }),
             status: Type.Optional(Type.Integer({ minimum: 100, maximum: 599 })),
           },
           { additionalProperties: false },
@@ -680,14 +898,20 @@ export function createManagedBrowserExtension(
         current.controller.signal,
         ...(signal ? [signal] : []),
       ]);
-      return result(await current.sessions.action(args, owner, args, combined));
+      return actionResult(
+        current,
+        owner,
+        await current.sessions.action(args, owner, args, combined),
+        "action",
+        combined,
+      );
     },
   });
   pi.registerTool({
     name: "browser_handoff",
     label: "Browser human handoff",
     description:
-      "Pause an owned visible session for human login or request a visible restart of a headless named-profile session. A restart requires separate explicit interactive or RPC user consent and may lose unsaved forms, open tabs, and in-memory state; old IDs expire and no actions are replayed. After restart, the new session awaits separate human login confirmation. Diagnostics and download capture are suspended during handoff.",
+      "Pause an owned visible session for human login or request a visible restart of a headless named-profile session. A restart requires separate explicit interactive or RPC user consent and may lose unsaved forms, open tabs, and in-memory state; old IDs expire and no actions are replayed. Active downloads and unexported native recovery bytes block restart; wait or export before retrying. After restart, the new session awaits separate human login confirmation. Diagnostics and download capture are suspended during handoff.",
     parameters: Type.Object({
       ...targetParameters,
       action: Type.Union([
@@ -728,38 +952,42 @@ export function createManagedBrowserExtension(
     name: "browser_upload",
     label: "Browser upload",
     description:
-      "Upload explicit local files to a snapshot-ref file input, or open a chooser by ref, unique selector, or exact role/name. Relative paths resolve from the Pi working directory; globs and directories are rejected. Final-component symlinks are rejected; parent-directory symlinks are followed. Files are read from opened descriptors before dispatch. MIME types are inferred from common extensions without content inspection, supplied explicitly, or default to application/octet-stream. No automatic retry.",
+      "Upload explicit local files to a snapshot-ref file input, or open a chooser by ref, unique selector, or exact role/name. Relative paths resolve from the Pi working directory; globs and directories are rejected. Final-component symlinks are rejected; parent-directory symlinks are followed. Files are copied from opened descriptors to private temporary staging before dispatch, using disk space proportional to file size; Chromium may retain its own temporary copy. Dispatched staging remains until verified browser closure and its recovery path is returned. Without MIME overrides, Chromium infers types from filenames. Explicit MIME overrides use in-memory payloads and require less than 52,428,800 bytes total. Configured upload byte limits still apply. No automatic retry.",
     parameters: Type.Object({
       ...targetParameters,
       ref: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
-      selector: Type.Optional(Type.String({ minLength: 1, maxLength: 1024 })),
-      role: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
-      name: Type.Optional(Type.String({ maxLength: 500 })),
-      frameSelector: Type.Optional(
-        Type.String({ minLength: 1, maxLength: 1024 }),
-      ),
-      scopeSelector: Type.Optional(
-        Type.String({ minLength: 1, maxLength: 1024 }),
-      ),
+      selector: Type.Optional(Type.String({ minLength: 1 })),
+      role: Type.Optional(Type.String({ minLength: 1 })),
+      name: Type.Optional(Type.String()),
+      frameSelector: Type.Optional(Type.String({ minLength: 1 })),
+      scopeSelector: Type.Optional(Type.String({ minLength: 1 })),
       mode: Type.Optional(
         Type.Union([Type.Literal("input"), Type.Literal("chooser")]),
       ),
       paths: Type.Array(Type.String({ minLength: 1, maxLength: 4096 }), {
         minItems: 1,
-        maxItems: 10,
       }),
       mimeTypes: Type.Optional(
         Type.Array(Type.String({ minLength: 3, maxLength: 255 }), {
           minItems: 1,
-          maxItems: 10,
         }),
       ),
-      timeoutMs: Type.Optional(Type.Integer({ minimum: 100, maximum: 30000 })),
+      timeoutMs: Type.Optional(
+        Type.Integer({ minimum: 100, maximum: 2147483647 }),
+      ),
     }),
     async execute(_id, args, signal, _onUpdate, ctx) {
       const current = requireRuntime();
       const owner = ctx?.sessionManager?.getSessionId() ?? current.owner;
-      const timeoutMs = args.timeoutMs ?? 30000;
+      const timeoutMs = args.timeoutMs ?? 300000;
+      if (
+        !Number.isSafeInteger(timeoutMs) ||
+        timeoutMs < 100 ||
+        timeoutMs > 2147483647
+      )
+        throw new Error(
+          "Upload deadline must be between 100 and 2147483647 ms (platform timer maximum).",
+        );
       const combined = AbortSignal.any([
         current.controller.signal,
         AbortSignal.timeout(timeoutMs),
@@ -804,7 +1032,7 @@ export function createManagedBrowserExtension(
       ]),
       id: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
       operationId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
-      promptText: Type.Optional(Type.String({ maxLength: 1000 })),
+      promptText: Type.Optional(Type.String()),
     }),
     async execute(_id, args, signal, _onUpdate, ctx) {
       const current = requireRuntime();
@@ -813,14 +1041,20 @@ export function createManagedBrowserExtension(
         current.controller.signal,
         ...(signal ? [signal] : []),
       ]);
-      return result(await current.sessions.dialog(args, owner, args, combined));
+      return actionResult(
+        current,
+        owner,
+        await current.sessions.dialog(args, owner, args, combined),
+        "dialog",
+        combined,
+      );
     },
   });
   pi.registerTool({
     name: "browser_screenshot",
     label: "Browser screenshot",
     description:
-      "Capture the owned tab viewport, full page, or an exact snapshot element. Returns the original PNG directly and a private owner-scoped artifact ID; use browser_artifact export to save it. Element capture may scroll. Oversized captures fail explicitly. Screenshots can contain sensitive page content.",
+      "Capture the owned tab viewport, full page, or an exact snapshot element. Returns the original PNG directly and a private owner-scoped artifact ID; images exceeding Node's string limit are artifact-only. Large captures and base64 responses can exhaust memory or exceed platform limits. Use browser_artifact export to save it. Element capture may scroll. Screenshot content may be sensitive.",
     parameters: Type.Object({
       ...targetParameters,
       scope: Type.Optional(
@@ -853,16 +1087,21 @@ export function createManagedBrowserExtension(
         combined,
       );
       const [metadataBlock, image] = captured.content;
-      if (metadataBlock?.type !== "text" || image?.type !== "image")
+      if (metadataBlock?.type !== "text")
         throw new Error("Invalid screenshot result.");
       const metadata = JSON.parse(metadataBlock.text);
+      if (
+        image?.type !== "image" &&
+        !(image === undefined && metadata.imageOmitted === true)
+      )
+        throw new Error("Invalid screenshot result.");
       return {
         content: [
           {
             type: "text" as const,
             text: JSON.stringify({ target: captured.target, ...metadata }),
           },
-          image,
+          ...(image?.type === "image" ? [image] : []),
         ],
         details: undefined,
       };
@@ -872,14 +1111,20 @@ export function createManagedBrowserExtension(
     name: "browser_viewport",
     label: "Browser viewport",
     description:
-      "Resize the owned tab viewport using custom CSS dimensions or phone/tablet presets. This does not emulate touch, user agent, or real devices.",
+      "Resize the owned tab viewport using custom CSS dimensions or phone/tablet presets. Configured screenshot geometry budgets apply; Chromium may reject large sizes. Large captures can exhaust browser or host memory. This does not emulate touch, user agent, or real devices.",
     parameters: Type.Object({
       ...targetParameters,
       choice: Type.Union([
         Type.Object(
           {
-            width: Type.Integer({ minimum: 1, maximum: 32768 }),
-            height: Type.Integer({ minimum: 1, maximum: 32768 }),
+            width: Type.Integer({
+              minimum: 1,
+              maximum: Number.MAX_SAFE_INTEGER,
+            }),
+            height: Type.Integer({
+              minimum: 1,
+              maximum: Number.MAX_SAFE_INTEGER,
+            }),
           },
           { additionalProperties: false },
         ),
@@ -913,18 +1158,22 @@ export function createManagedBrowserExtension(
     name: "browser_pick",
     label: "Human element picker",
     description:
-      "Ask the user to select up to 20 elements in an owned visible tab, including existing same-process and out-of-process child frames. Multi-selection finishes at its limit or through the user-facing finish instruction. Frame attachment, detachment, or navigation cancels the batch; Escape and abort also cancel it. Returns bounded non-actionable metadata including parent context and a synthetic element summary, not original HTML or an actionable selector. Form-control values are excluded, but arbitrary page text or attributes may contain secrets despite best-effort redaction. Input may reach the page during frame changes or if the input gate disconnects.",
+      "Ask the user to select elements in an owned visible tab, including existing same-process and out-of-process child frames. Multi-selection defaults to 20 and finishes at its requested limit or through the user-facing finish instruction. Large selection counts consume browser and host memory and may exceed platform limits. Frame attachment, detachment, or navigation cancels the batch; Escape and abort also cancel it. Returns bounded per-element non-actionable metadata including parent context and a synthetic element summary, not original HTML or an actionable selector. Large complete batches use a private owner-scoped artifact subject to quota. Form-control values are excluded, but arbitrary page text or attributes may contain secrets despite best-effort redaction. Input may reach the page during frame changes or if the input gate disconnects.",
     parameters: Type.Object({
       ...targetParameters,
       selectionMode: Type.Optional(
         Type.Union([Type.Literal("single"), Type.Literal("multiple")]),
       ),
-      maxSelections: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+      maxSelections: Type.Optional(
+        Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+      ),
     }),
     async execute(_id, args, signal, onUpdate, ctx) {
       const current = requireRuntime();
       const maxSelections =
         args.maxSelections ?? (args.selectionMode === "multiple" ? 20 : 1);
+      if (!Number.isSafeInteger(maxSelections) || maxSelections < 1)
+        throw new Error("maxSelections must be a positive safe integer.");
       if (args.selectionMode === "single" && maxSelections !== 1)
         throw new Error("Single selection requires maxSelections=1.");
       if (args.selectionMode === "multiple" && maxSelections < 2)
@@ -944,37 +1193,60 @@ export function createManagedBrowserExtension(
         current.controller.signal,
         ...(signal ? [signal] : []),
       ]);
-      return result(
-        await current.sessions.pick(
-          args,
-          ctx?.sessionManager?.getSessionId() ?? current.owner,
-          combined,
-          {
-            maxSelections,
-            onReady: ({ target, pickerId }) => {
-              const instructions =
-                maxSelections > 1
-                  ? `After selecting at least one element, send exactly: browser-pick-finish ${target.sessionId} ${pickerId}. Reaching the selection limit also finishes. Escape cancels the batch.`
-                  : "Select one element in the visible browser. Escape cancels.";
-              try {
-                onUpdate?.(
-                  result({
-                    target,
-                    status: "awaiting_user_selection",
-                    pickerId,
-                    maxSelections,
-                    instructions,
-                  }),
-                );
-              } catch {}
-              if (ctx?.hasUI && (ctx.mode === "tui" || ctx.mode === "rpc"))
-                try {
-                  ctx.ui.notify(instructions, "info");
-                } catch {}
+      const owner = ctx?.sessionManager?.getSessionId() ?? current.owner;
+      const picked = await current.sessions.pick(args, owner, combined, {
+        maxSelections,
+        onReady: ({ target, pickerId }) => {
+          const instructions =
+            maxSelections > 1
+              ? `After selecting at least one element, send exactly: browser-pick-finish ${target.sessionId} ${pickerId}. Reaching the selection limit also finishes. Escape cancels the batch.`
+              : "Select one element in the visible browser. Escape cancels.";
+          try {
+            onUpdate?.(
+              result({
+                target,
+                status: "awaiting_user_selection",
+                pickerId,
+                maxSelections,
+                instructions,
+              }),
+            );
+          } catch {}
+          if (ctx?.hasUI && (ctx.mode === "tui" || ctx.mode === "rpc"))
+            try {
+              ctx.ui.notify(instructions, "info");
+            } catch {}
+        },
+      });
+      const json = JSON.stringify(picked);
+      if (Buffer.byteLength(json, "utf8") <= 16000) return textResult(json);
+      if (picked.status !== "selected") return result(picked);
+      try {
+        return textResult(
+          await inspectionOutput(
+            current.artifacts,
+            owner,
+            json,
+            {
+              kind: "picker-selection",
+              representation: "json",
+              target: picked.target,
+              status: picked.status,
+              selectionCount: picked.selections.length,
+              actionable: false,
+              warning:
+                "Per-element summaries are bounded and may be truncated; inspect summaryTruncated and summaryOmissions. Full batch metadata is in the artifact. It may contain sensitive page content.",
             },
-          },
-        ),
-      );
+            combined,
+            { forceArtifact: true },
+          ),
+        );
+      } catch (error) {
+        throw new Error(
+          `Picker selection completed, but full metadata was not saved: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
+        );
+      }
     },
   });
   registerExtractionTools(pi, (ctx, signal) => {
@@ -1030,7 +1302,7 @@ export function createManagedBrowserExtension(
       "Evaluate and await a JavaScript expression in the main frame. Strings are returned as text, JSON-compatible plain values as JSON; unsupported values fail explicitly. Large results are saved as private artifacts.",
     parameters: Type.Object({
       ...targetParameters,
-      code: Type.String({ minLength: 1, maxLength: 200000 }),
+      code: Type.String({ minLength: 1 }),
     }),
     async execute(_id, args, signal, _onUpdate, ctx) {
       const current = requireRuntime();
@@ -1063,8 +1335,15 @@ export function createManagedBrowserExtension(
     name: "browser_artifact",
     label: "Browser artifact",
     description:
-      "Read a UTF-8 or binary artifact chunk or explicitly export the complete artifact to a new absolute path. IDs are scoped to the creating Pi session; export never overwrites.",
+      "List this Pi session's unexpired artifacts across reloads using afterId/nextAfterId pagination, read a UTF-8 or binary artifact chunk, or explicitly export a complete artifact to a new absolute path. The durable artifact list does not retain download filenames or source session IDs. IDs are scoped to the creating Pi session; export never overwrites.",
     parameters: Type.Union([
+      Type.Object({
+        action: Type.Literal("list"),
+        afterId: Type.Optional(Type.String()),
+        limit: Type.Optional(
+          Type.Integer({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }),
+        ),
+      }),
       Type.Object({
         action: Type.Literal("read"),
         id: Type.String(),
@@ -1088,6 +1367,17 @@ export function createManagedBrowserExtension(
       const current = requireRuntime();
       const owner = ctx?.sessionManager?.getSessionId() ?? current.owner;
       const combined = inspectionSignal(current, signal);
+      if (args.action === "list")
+        return structuredResult(
+          current,
+          owner,
+          await current.artifacts.list(owner, combined, {
+            afterId: args.afterId,
+            limit: args.limit,
+          }),
+          "artifact_list",
+          combined,
+        );
       if (args.action === "read")
         return textResult(
           await chunkOutput(
@@ -1125,20 +1415,24 @@ export function createManagedBrowserExtension(
     name: "browser_download",
     label: "Browser downloads",
     description:
-      "List, inspect, wait for, or cancel downloads from an owned browser session. Capture remains suspended after human handoff until the owner explicitly calls resume_capture with acknowledgeRisk=true. After re-enabling, delayed human downloads may be saved as agent artifacts. Completed files are private artifacts; they are never opened or executed. The retained-file limit does not bound browser/network temporary bytes.",
+      "List, inspect, wait for, or cancel downloads from an owned browser session. Export retained native bytes after publication failure with export_native before closing the browser; the absolute destination must not exist and a partial file may remain on failure. Large lists are available as private JSON artifacts. Capture remains suspended after human handoff until the owner explicitly calls resume_capture with acknowledgeRisk=true. After re-enabling, delayed human downloads may be saved as agent artifacts. Completed files are private artifacts; they are never opened or executed. Configured retained-file and artifact limits do not bound browser/network temporary bytes.",
     parameters: Type.Object({
       action: Type.Union([
         Type.Literal("list"),
         Type.Literal("inspect"),
         Type.Literal("wait"),
         Type.Literal("cancel"),
+        Type.Literal("export_native"),
         Type.Literal("capture_status"),
         Type.Literal("resume_capture"),
       ]),
       sessionId: Type.String({ minLength: 1, maxLength: 256 }),
       acknowledgeRisk: Type.Optional(Type.Boolean()),
+      path: Type.Optional(Type.String({ minLength: 1 })),
       id: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
-      timeoutMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 300000 })),
+      timeoutMs: Type.Optional(
+        Type.Integer({ minimum: 0, maximum: 2147483647 }),
+      ),
     }),
     async execute(_id, args, signal, _onUpdate, ctx) {
       const current = requireRuntime();
@@ -1173,18 +1467,25 @@ export function createManagedBrowserExtension(
           capture: current.downloads.captureStatus(args.sessionId, owner),
           notice: current.downloads.notice,
         };
-        while (
-          Buffer.byteLength(JSON.stringify(output)) > 16000 &&
-          records.length
-        ) {
-          records.shift();
-          output.omitted++;
-        }
-        return result(output);
+        return structuredResult(current, owner, output, "downloads", combined);
       }
       if (!args.id) throw new Error("Download id is required.");
       if (args.action === "inspect")
         return result(current.downloads.inspect(args.sessionId, args.id));
+      if (args.action === "export_native") {
+        if (!args.path)
+          throw new Error(
+            "Native export requires an absolute destination path.",
+          );
+        return result(
+          await current.downloads.exportNative(
+            args.sessionId,
+            args.id,
+            args.path,
+            combined,
+          ),
+        );
+      }
       if (args.action === "wait")
         return result(
           await current.downloads.wait(args.sessionId, args.id, {
@@ -1360,8 +1661,11 @@ export function createManagedBrowserExtension(
       timeoutMs: settings.shutdownTimeoutMs,
     });
     let sessions: ManagedSessions;
+    const runtimeOwner = ctx.sessionManager?.getSessionId() ?? randomUUID();
     const downloads = new DownloadManager({
       sink: artifacts,
+      maxBytes: settings.downloadMaxFileBytes,
+      maxActive: settings.downloadMaxActive,
       onOverflow: (sessionId) => sessions?.failClosed(sessionId),
     });
     sessions =
@@ -1381,6 +1685,16 @@ export function createManagedBrowserExtension(
         recordings,
         videos,
         downloadCloseTimeoutMs: settings.shutdownTimeoutMs,
+        onVideoDeadlineRisk: (owner, sessionId, count) => {
+          if (owner !== runtimeOwner) return;
+          const warning = `Video recording is closing browser session ${sessionId} at its configured deadline or after video failure. ${count < 0 ? "Download risk could not be determined" : `${count} active or unexported native download(s) may be lost`}; availability is unknown. Inspect browser_recording inspect_video and browser_download list.`;
+          try {
+            if (ctx.hasUI) ctx.ui.notify(warning, "warning");
+            else console.warn(warning);
+          } catch {
+            /* owner-scoped recording status retains the warning */
+          }
+        },
       });
     runtime = {
       diagnostics,
@@ -1391,7 +1705,7 @@ export function createManagedBrowserExtension(
       installer: options.createInstaller?.() ?? new ChromiumInstaller(),
       controller: new AbortController(),
       trusted: ctx.isProjectTrusted(),
-      owner: ctx.sessionManager?.getSessionId() ?? randomUUID(),
+      owner: runtimeOwner,
       artifacts,
       settings,
       screenshotLimits,

@@ -80,23 +80,23 @@ export const BROWSER_SETTINGS: ExtensionSettingsDefinition = {
       type: "number",
       default: 30000,
       minimum: 1000,
-      maximum: 180000,
+      maximum: 2147483647,
       integer: true,
       label: "Navigation deadline (ms)",
     },
     uploadMaxFileBytes: {
       type: "number",
-      default: 10000000,
+      default: Number.MAX_SAFE_INTEGER,
       minimum: 1,
-      maximum: 25000000,
+      maximum: Number.MAX_SAFE_INTEGER,
       integer: true,
       label: "Upload maximum bytes per file",
     },
     uploadMaxTotalBytes: {
       type: "number",
-      default: 25000000,
+      default: Number.MAX_SAFE_INTEGER,
       minimum: 1,
-      maximum: 50000000,
+      maximum: Number.MAX_SAFE_INTEGER,
       integer: true,
       label: "Upload maximum bytes per operation",
     },
@@ -104,7 +104,7 @@ export const BROWSER_SETTINGS: ExtensionSettingsDefinition = {
       type: "number",
       default: 8192,
       minimum: 100,
-      maximum: 32768,
+      maximum: Number.MAX_SAFE_INTEGER,
       integer: true,
       label: "Screenshot maximum dimension (px)",
     },
@@ -112,7 +112,7 @@ export const BROWSER_SETTINGS: ExtensionSettingsDefinition = {
       type: "number",
       default: 16000000,
       minimum: 10000,
-      maximum: 32000000,
+      maximum: Number.MAX_SAFE_INTEGER,
       integer: true,
       label: "Screenshot maximum pixels",
     },
@@ -120,7 +120,7 @@ export const BROWSER_SETTINGS: ExtensionSettingsDefinition = {
       type: "number",
       default: 12000000,
       minimum: 1024,
-      maximum: 12000000,
+      maximum: Number.MAX_SAFE_INTEGER,
       integer: true,
       label: "Screenshot maximum PNG bytes",
     },
@@ -128,15 +128,31 @@ export const BROWSER_SETTINGS: ExtensionSettingsDefinition = {
       type: "number",
       default: 10000,
       minimum: 100,
-      maximum: 30000,
+      maximum: 2147483647,
       integer: true,
       label: "Screenshot and viewport deadline (ms)",
     },
+    downloadMaxFileBytes: {
+      type: "number",
+      default: Number.MAX_SAFE_INTEGER,
+      minimum: 1,
+      maximum: Number.MAX_SAFE_INTEGER,
+      integer: true,
+      label: "Download maximum retained bytes per file",
+    },
+    downloadMaxActive: {
+      type: "number",
+      default: Number.MAX_SAFE_INTEGER,
+      minimum: 1,
+      maximum: Number.MAX_SAFE_INTEGER,
+      integer: true,
+      label: "Maximum concurrent captured downloads",
+    },
     artifactQuotaBytes: {
       type: "number",
-      default: 268435456,
+      default: Number.MAX_SAFE_INTEGER,
       minimum: 1024,
-      maximum: 1073741824,
+      maximum: Number.MAX_SAFE_INTEGER,
       integer: true,
       label: "Managed artifact quota (bytes)",
     },
@@ -152,11 +168,11 @@ export const BROWSER_SETTINGS: ExtensionSettingsDefinition = {
       type: "number",
       default: 300000,
       minimum: 1000,
-      maximum: 3600000,
+      maximum: 2147483647,
       integer: true,
       label: "Recording deadline (ms)",
       description:
-        "Stops traces and closes video-enabled sessions at the deadline; native transient files are not size-capped.",
+        "Stops traces and closes video-enabled sessions at the deadline; native transient files are not size-capped and longer recordings use more disk. The maximum is the Node timer limit.",
     },
     shutdownTimeoutMs: {
       type: "number",
@@ -182,6 +198,8 @@ export type BrowserSettings = {
   recordingDurationMs: number;
   artifactQuotaBytes: number;
   artifactTtlMs: number;
+  downloadMaxFileBytes: number;
+  downloadMaxActive: number;
 };
 export function resolveUploadLimits(input: unknown) {
   const value =
@@ -196,8 +214,16 @@ export function resolveUploadLimits(input: unknown) {
       ? (value[key] as number)
       : fallback;
   return {
-    maxFileBytes: bounded("uploadMaxFileBytes", 10000000, 25000000),
-    maxTotalBytes: bounded("uploadMaxTotalBytes", 25000000, 50000000),
+    maxFileBytes: bounded(
+      "uploadMaxFileBytes",
+      Number.MAX_SAFE_INTEGER,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    maxTotalBytes: bounded(
+      "uploadMaxTotalBytes",
+      Number.MAX_SAFE_INTEGER,
+      Number.MAX_SAFE_INTEGER,
+    ),
   };
 }
 export function resolveScreenshotLimits(input: unknown) {
@@ -213,10 +239,25 @@ export function resolveScreenshotLimits(input: unknown) {
       ? (value[key] as number)
       : fallback;
   return {
-    maxDimension: number("screenshotMaxDimension", 8192, 100, 32768),
-    maxPixels: number("screenshotMaxPixels", 16000000, 10000, 32000000),
-    maxBytes: number("screenshotMaxBytes", 12000000, 1024, 12000000),
-    timeoutMs: number("screenshotTimeoutMs", 10000, 100, 30000),
+    maxDimension: number(
+      "screenshotMaxDimension",
+      8192,
+      100,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    maxPixels: number(
+      "screenshotMaxPixels",
+      16000000,
+      10000,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    maxBytes: number(
+      "screenshotMaxBytes",
+      12000000,
+      1024,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    timeoutMs: number("screenshotTimeoutMs", 10000, 100, 2147483647),
   };
 }
 export function resolveBrowserSettings(input: unknown): BrowserSettings {
@@ -241,14 +282,31 @@ export function resolveBrowserSettings(input: unknown): BrowserSettings {
     diagnosticsMaxBytes: number("diagnosticsMaxBytes", 1048576, 512, 16777216),
     startupTimeoutMs: number("startupTimeoutMs", 180000, 1000, 600000),
     profileWaitTimeoutMs: number("profileWaitTimeoutMs", 30000, 100, 600000),
-    navigationTimeoutMs: number("navigationTimeoutMs", 30000, 1000, 180000),
+    navigationTimeoutMs: number("navigationTimeoutMs", 30000, 1000, 2147483647),
     shutdownTimeoutMs: number("shutdownTimeoutMs", 5000, 100, 30000),
-    recordingDurationMs: number("recordingDurationMs", 300000, 1000, 3600000),
+    recordingDurationMs: number(
+      "recordingDurationMs",
+      300000,
+      1000,
+      2147483647,
+    ),
+    downloadMaxFileBytes: number(
+      "downloadMaxFileBytes",
+      Number.MAX_SAFE_INTEGER,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    ),
+    downloadMaxActive: number(
+      "downloadMaxActive",
+      Number.MAX_SAFE_INTEGER,
+      1,
+      Number.MAX_SAFE_INTEGER,
+    ),
     artifactQuotaBytes: number(
       "artifactQuotaBytes",
-      268435456,
+      Number.MAX_SAFE_INTEGER,
       1024,
-      1073741824,
+      Number.MAX_SAFE_INTEGER,
     ),
     artifactTtlMs: number("artifactTtlMs", 3600000, 1000, 604800000),
   };

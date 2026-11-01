@@ -64,7 +64,32 @@ test("screenshot limits resolve configured bounds and reject invalid settings", 
   });
   assert.equal(limits.maxPixels, 20000);
   assert.equal(limits.timeoutMs, 100);
-  assert.equal(limits.maxBytes, 12000000);
+  assert.equal(
+    resolveScreenshotLimits({ screenshotTimeoutMs: 30001 }).timeoutMs,
+    30001,
+  );
+  assert.equal(
+    resolveScreenshotLimits({ screenshotTimeoutMs: 2147483647 }).timeoutMs,
+    2147483647,
+  );
+  assert.equal(
+    resolveScreenshotLimits({ screenshotTimeoutMs: 2147483648 }).timeoutMs,
+    10000,
+  );
+  assert.equal(limits.maxBytes, 999999999);
+  const high = resolveScreenshotLimits({
+    screenshotMaxDimension: Number.MAX_SAFE_INTEGER,
+    screenshotMaxPixels: Number.MAX_SAFE_INTEGER,
+    screenshotMaxBytes: Number.MAX_SAFE_INTEGER,
+  });
+  assert.equal(high.maxDimension, Number.MAX_SAFE_INTEGER);
+  assert.equal(high.maxPixels, Number.MAX_SAFE_INTEGER);
+  assert.equal(high.maxBytes, Number.MAX_SAFE_INTEGER);
+  assert.equal(
+    resolveScreenshotLimits({ screenshotMaxBytes: Number.MAX_SAFE_INTEGER + 1 })
+      .maxBytes,
+    12000000,
+  );
 });
 
 test("aborted screenshot synchronously quarantines its owned session", async () => {

@@ -40,8 +40,13 @@ test("staged action tool forwards owner, target and cancellation and is removed 
   await handlers.get("session_start")!({}, ctx);
   assert.ok(active.includes("browser_action"));
   const abort = new AbortController();
+  assert.equal(
+    tools.get("browser_action").parameters.properties.value.maxLength,
+    undefined,
+  );
   const input = {
-    action: "click",
+    value: "x".repeat(10001),
+    action: "fill",
     target: { selector: "#button" },
     sessionId: "session",
     tabId: "tab",

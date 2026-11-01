@@ -53,16 +53,21 @@ test("staged upload and dialog tools forward owner, cwd, limits and exact dialog
   assert.ok(
     active.includes("browser_upload") && active.includes("browser_dialog"),
   );
-  await tools
-    .get("browser_upload")
-    .execute(
-      "id",
-      { ref: "ref", paths: ["file"], mode: "chooser" },
-      undefined,
-      undefined,
-      ctx,
-    );
+  await tools.get("browser_upload").execute(
+    "id",
+    {
+      selector: "#" + "x".repeat(1100),
+      paths: ["file"],
+      mode: "chooser",
+      timeoutMs: 3600001,
+    },
+    undefined,
+    undefined,
+    ctx,
+  );
   assert.equal(upload![1], "owner");
+  assert.equal(upload![2].selector.length, 1101);
+  assert.equal(upload![2].timeoutMs, 3600001);
   assert.deepEqual(
     {
       cwd: upload![2].cwd,

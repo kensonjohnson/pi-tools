@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ArtifactStore } from "./artifacts.ts";
 import { ManagedSessions } from "./sessions.ts";
 import { createManagedBrowserExtension } from "./registration.ts";
 
@@ -359,12 +363,19 @@ test("all selected handles are disposed when validation or cleanup fails", async
   }
 });
 
-test("picker tool bounds twenty large metadata records and reports omissions", async () => {
+test("large picker batches preserve all metadata in owner-scoped artifacts", async () => {
+  const root = await realpath(
+    await mkdtemp(join(tmpdir(), "picker-artifact-")),
+  );
+  const store = new ArtifactStore({
+    root: join(root, "artifacts"),
+    quota: 10_000_000,
+  });
   let disposed = 0;
   const sessions = new ManagedSessions({
     launch: async () => new Browser() as never,
     picker: async () => {
-      const items = Array.from({ length: 20 }, () => ({
+      const items = Array.from({ length: 1100 }, (_, index) => ({
         handle: {
           isConnected: async () => true,
           dispose: async () => {
@@ -373,7 +384,7 @@ test("picker tool bounds twenty large metadata records and reports omissions", a
         } as never,
         metadata: {
           tag: "button",
-          id: "x".repeat(100),
+          id: `id-${index}`,
           classes: Array(10).fill("a".repeat(50)),
           text: "\\u0001".repeat(300),
           parent: {
@@ -428,8 +439,25 @@ test("picker tool bounds twenty large metadata records and reports omissions", a
     createManagedBrowserExtension(pi as never, {
       loadSettings: async () => ({ values: {} }) as never,
       createSessions: () => sessions,
+      createArtifacts: () => store,
     });
     await handlers.get("session_start")!({}, ctx);
+    assert.equal(
+      tools.get("browser_pick").parameters.properties.maxSelections.maximum,
+      Number.MAX_SAFE_INTEGER,
+    );
+    await assert.rejects(
+      tools
+        .get("browser_pick")
+        .execute(
+          "id",
+          { maxSelections: Number.MAX_SAFE_INTEGER + 1 },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      /positive safe integer/,
+    );
     const target = await sessions.start({
       headless: false,
       artifactOwner: "owner",
@@ -439,7 +467,7 @@ test("picker tool bounds twenty large metadata records and reports omissions", a
         .get("browser_pick")
         .execute(
           "id",
-          { ...target, maxSelections: 20 },
+          { ...target, maxSelections: 1100 },
           undefined,
           undefined,
           ctx,
@@ -448,15 +476,69 @@ test("picker tool bounds twenty large metadata records and reports omissions", a
     const result = JSON.parse(raw);
     assert.ok(Buffer.byteLength(raw) <= 16000);
     assert.equal(result.status, "selected");
-    assert.equal(result.selections.length, 20);
-    assert.ok(result.omittedSelectionMetadata > 0);
-    assert.equal(
-      result.omittedSelectionMetadata,
-      result.selections.filter((item: any) => item.metadataOmitted).length,
+    assert.equal(result.selectionCount, 1100);
+    assert.ok(result.artifact.id);
+    assert.equal(disposed, 1100);
+    let offset = 0,
+      text = "";
+    for (;;) {
+      const chunk = JSON.parse(
+        (
+          await tools
+            .get("browser_artifact")
+            .execute(
+              "id",
+              { action: "read", id: result.artifact.id, offset },
+              undefined,
+              undefined,
+              ctx,
+            )
+        ).content[0].text,
+      );
+      text += chunk.text;
+      if (chunk.nextOffset === null) break;
+      offset = chunk.nextOffset;
+    }
+    const full = JSON.parse(text);
+    assert.equal(full.selections.length, 1100);
+    assert.equal(full.omittedSelectionMetadata, 0);
+    assert.equal(full.selections[1099].id, "id-1099");
+    assert.equal(full.selections[0].summaryTruncated, true);
+    assert.ok(
+      full.selections.every((selection: any) => !selection.metadataOmitted),
     );
-    assert.equal(result.selections[0].summaryTruncated, true);
-    assert.equal(disposed, 20);
+    const foreign = {
+      ...ctx,
+      sessionManager: { getSessionId: () => "foreign" },
+    };
+    await assert.rejects(
+      tools
+        .get("browser_artifact")
+        .execute(
+          "id",
+          { action: "read", id: result.artifact.id },
+          undefined,
+          undefined,
+          foreign,
+        ),
+      /owned by another/,
+    );
+    await store.put("owner", "x".repeat(store.quota - result.bytes));
+    await assert.rejects(
+      tools
+        .get("browser_pick")
+        .execute(
+          "id",
+          { ...target, maxSelections: 1100 },
+          undefined,
+          undefined,
+          ctx,
+        ),
+      /Picker selection completed, but full metadata was not saved: Artifact quota exceeded/,
+    );
+    assert.equal(disposed, 2200);
   } finally {
     await handlers.get("session_shutdown")?.({}, ctx);
+    await rm(root, { recursive: true, force: true });
   }
 });

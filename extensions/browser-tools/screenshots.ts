@@ -1,3 +1,4 @@
+import { constants as bufferConstants } from "node:buffer";
 import type { ElementHandle, Page } from "playwright";
 import type { ArtifactStore } from "./artifacts.ts";
 
@@ -81,10 +82,7 @@ async function bounded<T>(
 function limitsValid(limits: ScreenshotLimits) {
   if (
     !Object.values(limits).every((v) => Number.isSafeInteger(v) && v > 0) ||
-    limits.maxDimension > 32768 ||
-    limits.maxPixels > 100_000_000 ||
-    limits.maxBytes > 100_000_000 ||
-    limits.timeoutMs > 30000
+    limits.timeoutMs > 2147483647
   )
     throw new Error("Invalid screenshot limits.");
 }
@@ -98,15 +96,26 @@ function geometry(width: number, height: number, limits: ScreenshotLimits) {
     throw new Error("Screenshot geometry is unavailable or empty.");
   width = Math.ceil(width);
   height = Math.ceil(height);
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height))
+    throw new Error("Screenshot geometry exceeds safe integer precision.");
   if (
     width > limits.maxDimension ||
     height > limits.maxDimension ||
-    width * height > limits.maxPixels
+    BigInt(width) * BigInt(height) > BigInt(limits.maxPixels)
   )
     throw new Error(
       "Screenshot capture limit exceeded; reduce the viewport, page, or element size.",
     );
   return { width, height };
+}
+
+/** Whether Node can represent the base64 image as one string. */
+export function screenshotImageFitsString(byteLength: number): boolean {
+  return (
+    Number.isSafeInteger(byteLength) &&
+    byteLength >= 0 &&
+    Math.ceil(byteLength / 3) * 4 <= bufferConstants.MAX_STRING_LENGTH
+  );
 }
 
 /** Viewport sizing only. This does not emulate touch, user agent, or a real device. */
@@ -264,6 +273,21 @@ async function capture(
     );
   }
   check(signal);
+  let imageData: string | undefined;
+  let imageOmissionReason: string | undefined;
+  if (!screenshotImageFitsString(bytes.length)) {
+    imageOmissionReason =
+      "Base64 image exceeds Node's maximum string length; retrieve the complete binary artifact in chunks or export it.";
+  } else {
+    try {
+      imageData = bytes.toString("base64");
+    } catch {
+      // The binary artifact is already published. Never include conversion
+      // error details, which may contain private data or filesystem paths.
+      imageOmissionReason =
+        "Base64 image conversion failed; retrieve the complete binary artifact in chunks or export it.";
+    }
+  }
   return {
     content: [
       {
@@ -286,13 +310,20 @@ async function capture(
               : {}),
           },
           note: "Screenshot may contain sensitive page content. Full-page capture does not intentionally scroll to load lazy content.",
+          ...(imageOmissionReason
+            ? { imageOmitted: true, imageOmissionReason }
+            : {}),
         }),
       },
-      {
-        type: "image" as const,
-        data: bytes.toString("base64"),
-        mimeType: "image/png",
-      },
+      ...(imageData !== undefined
+        ? [
+            {
+              type: "image" as const,
+              data: imageData,
+              mimeType: "image/png",
+            },
+          ]
+        : []),
     ],
   };
 }

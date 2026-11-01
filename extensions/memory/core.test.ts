@@ -49,7 +49,7 @@ test("repair retains valid NDJSON records and removes malformed lines", async ()
   });
 });
 
-test("manager repair reports malformed lines removed during initialization", async () => {
+test("manager repair explicitly removes malformed lines", async () => {
   await withStore(async (store, cwd) => {
     const file = join(cwd, ".pi/memory/practices.ndjson");
     await writeFile(
@@ -74,7 +74,7 @@ test("manager repair reports malformed lines removed during initialization", asy
   });
 });
 
-test("memory_init repairs corruption added after manager initialization", async () => {
+test("memory_init preserves corruption added after manager initialization", async () => {
   await withStore(async (store, cwd) => {
     const manager = new MemoryManager(cwd, { semanticEnabled: false });
     try {
@@ -84,11 +84,43 @@ test("memory_init repairs corruption added after manager initialization", async 
 
       const result = await manager.init();
 
-      assert.equal(result.recoveredLines, 1);
-      assert.equal(await readFile(file, "utf8"), "");
+      assert.equal(result.recoveredLines, 0);
+      assert.equal(await readFile(file, "utf8"), "malformed tail\n");
+      assert.equal((await manager.repair()).totalRemovedLines, 1);
     } finally {
       await manager.close();
     }
+  });
+});
+
+test("prompt context contains all knowledge and only guidance for other categories", async () => {
+  await withStore(async (store) => {
+    const longKnowledge = `Important guidance: ${"x".repeat(180)}`;
+    await store.remember("knowledge", longKnowledge);
+    for (let i = 0; i < 25; i++) {
+      await store.remember("knowledge", `Knowledge entry ${i}.`);
+    }
+    await store.remember("practices", "Private practice detail.");
+    await store.remember("decisions", "Private decision detail.");
+
+    const context = await store.buildPromptContext();
+    assert.match(context, /Knowledge:/);
+    assert.ok(context.includes(longKnowledge));
+    assert.ok(context.includes("Knowledge entry 24."));
+    assert.match(context, /memory_recall.*practices and decisions/);
+    assert.doesNotMatch(
+      context,
+      /Private practice detail|Private decision detail/,
+    );
+    assert.doesNotMatch(context, /Practices index|Decisions index/);
+  });
+});
+
+test("empty knowledge does not inject practice or decision content", async () => {
+  await withStore(async (store) => {
+    await store.remember("practices", "A specialized practice.");
+    await store.remember("decisions", "A specialized decision.");
+    assert.equal(await store.buildPromptContext(), "");
   });
 });
 

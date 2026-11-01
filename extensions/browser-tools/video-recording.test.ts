@@ -72,7 +72,39 @@ test("private video publication is owner scoped and happens only after close", a
     assert.throws(() => f.videos.inspect("s", "bob"), /unavailable/);
     assert.equal(await f.videos.closed("s", "alice"), true);
     assert.equal(f.videos.inspect("s", "alice").videos[0].state, "complete");
+    const retained = (f.videos as any).entries.get("s");
+    assert.equal(retained.context, undefined);
+    assert.equal(retained.listener, undefined);
+    assert.equal(retained.native.length, 0);
+    assert.equal(retained.pages.size, 0);
     await assert.rejects(lstat(dir), /ENOENT/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+test("video captures and publishes more than one hundred pages without closing early", async () => {
+  const f = fixture({ timeoutMs: 10000 });
+  const dir = await f.videos.prepare("many", "alice");
+  let deadlines = 0;
+  try {
+    f.videos.attach("many", "alice", f.context as never, () => {
+      deadlines++;
+    });
+    for (let i = 0; i < 105; i++) {
+      const path = join(dir, `${i}.webm`);
+      await writeFile(path, WEBM_FIXTURE);
+      f.context.emit("page", { video: () => ({ path: async () => path }) });
+    }
+    assert.equal(deadlines, 0);
+    assert.equal(f.videos.inspect("many", "alice").videos.length, 105);
+    assert.throws(() => f.videos.inspect("many", "other"), /unavailable/);
+    assert.equal(await f.videos.closed("many", "alice"), true);
+    assert.equal(
+      f.videos
+        .inspect("many", "alice")
+        .videos.filter((entry) => entry.state === "complete").length,
+      105,
+    );
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -91,6 +123,10 @@ test("quota and unexpected files preserve recovery directory", async () => {
       const record = f.videos.inspect("s", "alice");
       assert.equal(record.state, "failed");
       assert.equal(record.recoveryDirectory, dir);
+      const retained = (f.videos as any).entries.get("s");
+      assert.equal(retained.context, undefined);
+      assert.equal(retained.native.length, 0);
+      assert.equal(retained.pages.size, 0);
       assert.ok((await readdir(dir)).length);
     } finally {
       await chmod(dir, 0o700);
@@ -242,6 +278,27 @@ test("sink rejection before reading video cannot leave an unhandled stream error
     await rm(dir, { recursive: true, force: true });
   }
 });
+test("unverified browser closure releases native graphs while retaining recovery metadata", async () => {
+  const f = fixture();
+  const dir = await f.videos.prepare("s", "alice");
+  try {
+    f.videos.attach("s", "alice", f.context as never, () => {});
+    f.context.emit("page", {
+      video: () => ({ path: async () => join(dir, "native.webm") }),
+    });
+    f.videos.markUnverified("s", "alice", "Browser closure unverified.");
+    f.videos.releaseUnverified("s", "alice");
+    const retained = (f.videos as any).entries.get("s");
+    assert.equal(retained.context, undefined);
+    assert.equal(retained.pages.size, 0);
+    assert.equal(retained.native.length, 0);
+    assert.equal(f.context.listenerCount("page"), 0);
+    assert.equal(f.videos.inspect("s", "alice").recoveryDirectory, dir);
+    assert.equal(f.videos.inspect("s", "alice").state, "unknown");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 test("deadline requests closure and hung publication stays unknown until settled", async () => {
   const f = fixture({ durationMs: 10, timeoutMs: 20, hang: true });
   const dir = await f.videos.prepare("s", "alice");
@@ -257,9 +314,11 @@ test("deadline requests closure and hung publication stays unknown until settled
     assert.equal(requested, 1);
     assert.equal(await f.videos.closed("s", "alice"), false);
     assert.equal(f.videos.inspect("s", "alice").state, "unknown");
+    assert.equal((f.videos as any).entries.get("s").context, f.context);
     f.release();
     await new Promise((resolve) => setTimeout(resolve, 30));
     assert.equal(f.videos.inspect("s", "alice").state, "complete");
+    assert.equal((f.videos as any).entries.get("s").context, undefined);
   } finally {
     f.release();
     await rm(dir, { recursive: true, force: true });

@@ -120,7 +120,7 @@ test("active downloads prevent a restart request without cancellation or close",
   const downloads = {
     attach: () => {},
     detach: () => {},
-    list: () => [{ state: "saving" }],
+    closeRisks: () => [{ state: "saving" }],
     endSession: async () => ({ cleanup: "complete" }),
   };
   const sessions = new ManagedSessions({
@@ -139,7 +139,7 @@ test("active downloads prevent a restart request without cancellation or close",
     });
     assert.throws(
       () => sessions.requestVisibleRestart(target, "owner"),
-      /download is still active/,
+      /downloads are active/,
     );
     assert.equal(context.page.closed, false);
     assert.equal(released, 0);

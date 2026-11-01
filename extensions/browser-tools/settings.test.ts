@@ -14,6 +14,17 @@ import {
   resolveBrowserSettings,
 } from "./settings.ts";
 
+test("download and artifact limits accept caller configuration beyond one GiB", () => {
+  const settings = resolveBrowserSettings({
+    artifactQuotaBytes: 5 * 1024 ** 3,
+    downloadMaxFileBytes: 2 * 1024 ** 3,
+    downloadMaxActive: 7,
+  });
+  assert.equal(settings.artifactQuotaBytes, 5 * 1024 ** 3);
+  assert.equal(settings.downloadMaxFileBytes, 2 * 1024 ** 3);
+  assert.equal(settings.downloadMaxActive, 7);
+});
+
 test("browser settings apply defaults, global settings and trusted project overrides", async () => {
   const root = await mkdtemp(join(tmpdir(), "browser-settings-"));
   try {
@@ -67,8 +78,10 @@ test("browser settings apply defaults, global settings and trusted project overr
       startupTimeoutMs: 180000,
       shutdownTimeoutMs: 5000,
       recordingDurationMs: 300000,
-      artifactQuotaBytes: 268435456,
+      artifactQuotaBytes: Number.MAX_SAFE_INTEGER,
       artifactTtlMs: 3600000,
+      downloadMaxFileBytes: Number.MAX_SAFE_INTEGER,
+      downloadMaxActive: Number.MAX_SAFE_INTEGER,
     });
     assert.deepEqual(await get(true), {
       enabled: false,
@@ -81,8 +94,10 @@ test("browser settings apply defaults, global settings and trusted project overr
       startupTimeoutMs: 180000,
       shutdownTimeoutMs: 5000,
       recordingDurationMs: 300000,
-      artifactQuotaBytes: 268435456,
+      artifactQuotaBytes: Number.MAX_SAFE_INTEGER,
       artifactTtlMs: 3600000,
+      downloadMaxFileBytes: Number.MAX_SAFE_INTEGER,
+      downloadMaxActive: Number.MAX_SAFE_INTEGER,
     });
   } finally {
     await rm(root, { recursive: true, force: true });

@@ -8,9 +8,12 @@ import { Text } from "@earendil-works/pi-tui";
 import {
   MEMORY_CATEGORIES,
   type MemoryCategory,
+  type DuplicateIdWarning,
   MemoryManager,
 } from "./core.ts";
 import { publishExtensionSettings } from "../../lib/pi-tools-config.ts";
+import { FOREGROUND_REVIEW_PROMPT } from "./foreground-review.ts";
+import { blocksForegroundMemoryWrite } from "./foreground-path-guard.ts";
 import {
   isExtensionEnabled,
   removeDisabledTools,
@@ -24,12 +27,9 @@ const MEMORY_TOOL_NAMES = [
   "memory_forget",
   "memory_init",
   "memory_repair",
-  "memory_learn",
   "memory_consolidate",
   "memory_list",
 ] as const;
-
-const managers = new Map<string, Promise<MemoryManager>>();
 
 function isMemoryCategory(value: string | undefined): value is MemoryCategory {
   return (
@@ -37,39 +37,38 @@ function isMemoryCategory(value: string | undefined): value is MemoryCategory {
   );
 }
 
-async function getManager(cwd: string): Promise<MemoryManager> {
-  const existing = managers.get(cwd);
-  if (existing) {
-    return existing;
-  }
-
-  const created = Promise.resolve(new MemoryManager(cwd));
-  managers.set(cwd, created);
-  return created;
-}
-
 const NOT_ENABLED_MESSAGE =
   "Memory tracking is not enabled for this project. Run `memory_init` to create the memory store and enable it.";
 
-async function getReadyManager(
-  ctx: ExtensionContext,
-): Promise<MemoryManager | undefined> {
-  if (!(await isExtensionEnabled(ctx, CONFIG_DIR_NAME, MEMORY_EXTENSION_ID))) {
-    return undefined;
-  }
+const DUPLICATE_REVIEW_GUIDANCE =
+  "Inspect the memory files and resolve duplicate IDs explicitly before writing.";
 
-  const manager = await getManager(ctx.cwd);
-  return (await manager.isReady()) ? manager : undefined;
+function formatDuplicateWarning(warning: DuplicateIdWarning): string {
+  return `Duplicate memory id ${warning.id}. ${DUPLICATE_REVIEW_GUIDANCE}`;
 }
 
 function formatRecall(
   result: Awaited<ReturnType<MemoryManager["recall"]>>,
 ): string {
+  const warnings = result.warnings?.map(formatDuplicateWarning).join("\n");
+  const fallback =
+    result.searchMode === "grep" && result.warnings?.length
+      ? "Duplicate IDs prevent indexing. Search uses case-insensitive literal substring matching and may miss relevant memories."
+      : undefined;
   if (result.memories.length === 0) {
-    return `No memory matches found.`;
+    return [
+      `Search mode: ${result.searchMode}`,
+      fallback,
+      "No memory matches found.",
+      warnings,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
   }
 
   const sections: string[] = [`Search mode: ${result.searchMode}`];
+  if (fallback) sections.push(fallback);
+  if (warnings) sections.push(`Memory warnings:\n${warnings}`);
 
   sections.push(
     `Memories:\n${result.memories
@@ -112,27 +111,105 @@ function textResult(text: string, details?: unknown) {
   };
 }
 
-const injectedSessions = new Set<string>();
-
-async function injectMemoryMessage(ctx: ExtensionContext) {
-  const manager = await getReadyManager(ctx);
-  if (!manager) return;
-
-  const promptContext = await manager.buildPromptContext();
-  if (!promptContext) {
-    return;
+export default function (pi: ExtensionAPI) {
+  const managers = new Map<string, Promise<MemoryManager>>();
+  const injectedSessions = new Set<string>();
+  const warnedConflicts = new Map<string, string>();
+  // Factory state belongs to one extension runtime/session, not the module.
+  let foregroundReview = false;
+  let pendingForegroundCommand = false;
+  function warnDiagnostics(
+    ctx: ExtensionContext,
+    warnings: DuplicateIdWarning[],
+  ): boolean {
+    if (!warnings.length) {
+      warnedConflicts.delete(ctx.cwd);
+      return false;
+    }
+    const signature = JSON.stringify(
+      warnings
+        .map((warning) => [
+          warning.id,
+          warning.locations
+            .map(({ category, line }) => `${category}:${line}`)
+            .sort(),
+        ])
+        .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+    );
+    if (warnedConflicts.get(ctx.cwd) !== signature) {
+      warnedConflicts.set(ctx.cwd, signature);
+      const details = warnings
+        .map(
+          (warning) =>
+            `${warning.id} (${warning.locations.map(({ category, line }) => `.pi/memory/${category}.ndjson:${line}`).join(", ")})`,
+        )
+        .join("; ");
+      const message = `Duplicate memory IDs: ${details}. ${DUPLICATE_REVIEW_GUIDANCE} Memory was not changed by this warning.`;
+      try {
+        if (ctx.hasUI && typeof ctx.ui.notify === "function")
+          ctx.ui.notify(message, "warning");
+        else console.error(message);
+      } catch {
+        console.error(message);
+      }
+    }
+    return true;
+  }
+  function warnConflict(ctx: ExtensionContext, error: unknown): boolean {
+    if (
+      !(error instanceof Error) ||
+      !error.message.startsWith("Memory conflict: duplicate id ")
+    )
+      return false;
+    if (warnedConflicts.get(ctx.cwd) !== error.message) {
+      warnedConflicts.set(ctx.cwd, error.message);
+      const message = `${error.message}. ${DUPLICATE_REVIEW_GUIDANCE} Memory was not changed by this operation.`;
+      try {
+        if (ctx.hasUI && typeof ctx.ui.notify === "function")
+          ctx.ui.notify(message, "warning");
+        else console.error(message);
+      } catch {
+        console.error(message);
+      }
+    }
+    return true;
+  }
+  function getManager(cwd: string): Promise<MemoryManager> {
+    let manager = managers.get(cwd);
+    if (!manager) {
+      manager = Promise.resolve(new MemoryManager(cwd));
+      managers.set(cwd, manager);
+    }
+    return manager;
   }
 
-  return {
-    message: {
-      customType: "project_memory",
-      content: `Project memory:\n${promptContext}`,
-      display: false,
-    },
-  };
-}
+  async function getReadyManager(
+    ctx: ExtensionContext,
+  ): Promise<MemoryManager | undefined> {
+    if (
+      !(await isExtensionEnabled(ctx, CONFIG_DIR_NAME, MEMORY_EXTENSION_ID))
+    ) {
+      return undefined;
+    }
+    const ready = await getManager(ctx.cwd);
+    return (await ready.isReady()) ? ready : undefined;
+  }
 
-export default function (pi: ExtensionAPI) {
+  async function injectMemoryMessage(ctx: ExtensionContext) {
+    const manager = await getReadyManager(ctx);
+    if (!manager) return;
+    const promptContext = await manager.buildPromptContext();
+    warnDiagnostics(ctx, manager.getWarnings());
+    if (!promptContext) return null;
+    return {
+      message: {
+        customType: "project_memory",
+        content: `Project memory:\n${promptContext}`,
+        display: false,
+      },
+    };
+  }
+
   publishExtensionSettings(pi.events, {
     id: MEMORY_EXTENSION_ID,
     label: "Project Memory",
@@ -156,31 +233,77 @@ export default function (pi: ExtensionAPI) {
     );
   });
 
+  pi.on("agent_settled", () => {
+    foregroundReview = false;
+    pendingForegroundCommand = false;
+  });
+
+  // Tool calls in an assistant message may execute in parallel. Arm before any
+  // sibling call can write, even if the review tool later fails validation.
+  pi.on("message_end", (event) => {
+    if (event.message.role !== "assistant") return;
+    if (
+      event.message.content.some(
+        (part) =>
+          part.type === "toolCall" && part.name === "memory_consolidate",
+      )
+    )
+      foregroundReview = true;
+  });
+
+  pi.on("tool_call", async (event, ctx) => {
+    if (
+      !foregroundReview ||
+      (event.toolName !== "write" && event.toolName !== "edit")
+    )
+      return;
+    if (await blocksForegroundMemoryWrite(ctx.cwd, event.input.path))
+      return {
+        block: true,
+        reason:
+          "Foreground memory review cannot write memory files directly; use guarded memory tools.",
+      };
+  });
+
   pi.on("session_shutdown", async () => {
-    for (const entry of managers.values()) {
+    foregroundReview = false;
+    pendingForegroundCommand = false;
+    const entries = [...managers.values()];
+    managers.clear();
+    for (const entry of entries) {
       const manager = await entry;
       await manager.close();
     }
-    managers.clear();
   });
 
-  pi.on("before_agent_start", async (_event, ctx) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    // A dispatched command can fail before a run starts. Do not retain its
+    // guard when the next accepted prompt is unrelated.
+    if (pendingForegroundCommand) {
+      foregroundReview = event.prompt === FOREGROUND_REVIEW_PROMPT;
+      pendingForegroundCommand = false;
+    }
     const sessionId = ctx.sessionManager.getSessionId();
     if (injectedSessions.has(sessionId)) {
       return;
     }
 
-    const result = await injectMemoryMessage(ctx);
-    if (result) {
+    let result: Awaited<ReturnType<typeof injectMemoryMessage>>;
+    try {
+      result = await injectMemoryMessage(ctx);
+    } catch (error) {
+      if (!warnConflict(ctx, error)) throw error;
+      return;
+    }
+    if (result !== undefined) {
       injectedSessions.add(sessionId);
     }
-    return result;
+    return result ?? undefined;
   });
 
-  pi.on("session_compact", async () => {
-    // After compaction, the injected message may have been summarized away.
-    // Clear tracking so the next before_agent_start re-injects.
-    injectedSessions.clear();
+  pi.on("session_compact", async (_event, ctx) => {
+    // The message may have been summarized away; reinject for this session.
+    injectedSessions.delete(ctx.sessionManager.getSessionId());
   });
 
   pi.registerTool({
@@ -280,9 +403,14 @@ export default function (pi: ExtensionAPI) {
         category: params.category,
         limit: params.limit,
       });
+      warnDiagnostics(ctx, result.warnings ?? []);
       return textResult(formatRecall(result), {
         searchMode: result.searchMode,
         memoryCount: result.memories.length,
+        warnings: (result.warnings ?? []).map((warning) => ({
+          ...warning,
+          message: formatDuplicateWarning(warning),
+        })),
       });
     },
   });
@@ -295,12 +423,48 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       id: Type.String({ description: "Memory id to update" }),
       content: Type.String({ description: "New memory content" }),
+      expectedContent: Type.Optional(
+        Type.String({
+          description:
+            "Exact previously reviewed content; reject changes if the target differs.",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (foregroundReview && params.expectedContent === undefined)
+        throw new Error(
+          "Foreground memory review requires expectedContent for updates; inspect the target first.",
+        );
       const manager = await getReadyManager(ctx);
       if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
 
-      const updated = await manager.update(params.id, params.content);
+      const expected =
+        params.expectedContent === undefined
+          ? undefined
+          : await manager.captureWritePrecondition(params.id);
+      if (params.expectedContent !== undefined) {
+        if (!expected)
+          throw new Error(
+            "Memory update conflict: target not found; review again.",
+          );
+        let current: unknown;
+        try {
+          current = JSON.parse(expected.rawLine)?.content;
+        } catch {
+          throw new Error(
+            "Memory update conflict: target is unreadable; review again.",
+          );
+        }
+        if (current !== params.expectedContent)
+          throw new Error(
+            "Memory update conflict: content changed; review again.",
+          );
+      }
+      const updated = await manager.update(
+        params.id,
+        params.content,
+        expected ?? undefined,
+      );
       if (!updated) {
         return textResult(`No memory found with id ${params.id}.`, {
           updated: false,
@@ -321,12 +485,103 @@ export default function (pi: ExtensionAPI) {
       "Remove a memory from the NDJSON source of truth and local search index.",
     parameters: Type.Object({
       id: Type.String({ description: "Memory id to remove" }),
+      expectedContent: Type.Optional(
+        Type.String({
+          description:
+            "Exact previously reviewed content; reject changes if the target differs.",
+        }),
+      ),
+      retainedId: Type.Optional(
+        Type.String({
+          description:
+            "For duplicate removal, the complete ID of the memory to retain.",
+        }),
+      ),
+      expectedRetainedContent: Type.Optional(
+        Type.String({
+          description:
+            "Exact reviewed content of the retained memory; requires retainedId and expectedContent.",
+        }),
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const manager = await getReadyManager(ctx);
       if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
 
-      const removed = await manager.forget(params.id);
+      if (
+        foregroundReview &&
+        (params.expectedContent === undefined ||
+          params.retainedId === undefined ||
+          params.expectedRetainedContent === undefined)
+      )
+        throw new Error(
+          "Foreground memory review only removes duplicates with expectedContent, retainedId, and expectedRetainedContent; report other removals instead.",
+        );
+      const hasRetained =
+        params.retainedId !== undefined ||
+        params.expectedRetainedContent !== undefined;
+      if (
+        hasRetained &&
+        (params.retainedId === undefined ||
+          params.expectedRetainedContent === undefined ||
+          params.expectedContent === undefined ||
+          params.retainedId === params.id)
+      )
+        throw new Error(
+          "Memory removal conflict: duplicate removal requires a distinct retainedId, expectedRetainedContent, and expectedContent.",
+        );
+      const snapshot = hasRetained
+        ? await manager.captureAddPrecondition()
+        : undefined;
+      if (snapshot) {
+        const matches: unknown[] = [];
+        for (const category of MEMORY_CATEGORIES) {
+          for (const line of snapshot.snapshots[category].contents.split(
+            "\n",
+          )) {
+            try {
+              const entry = JSON.parse(line);
+              if (entry && entry.id === params.retainedId)
+                matches.push(entry.content);
+            } catch {
+              /* Preserve malformed lines; they are not retained records. */
+            }
+          }
+        }
+        if (
+          matches.length !== 1 ||
+          matches[0] !== params.expectedRetainedContent
+        )
+          throw new Error(
+            "Memory removal conflict: retained memory missing, ambiguous, or changed; review again.",
+          );
+      }
+      const expected =
+        params.expectedContent === undefined
+          ? undefined
+          : await manager.captureWritePrecondition(params.id);
+      if (params.expectedContent !== undefined) {
+        if (!expected)
+          throw new Error(
+            "Memory removal conflict: target not found; review again.",
+          );
+        let current: unknown;
+        try {
+          current = JSON.parse(expected.rawLine)?.content;
+        } catch {
+          throw new Error(
+            "Memory removal conflict: target is unreadable; review again.",
+          );
+        }
+        if (current !== params.expectedContent)
+          throw new Error(
+            "Memory removal conflict: content changed; review again.",
+          );
+      }
+      const removed =
+        snapshot && expected
+          ? await manager.forgetWithSnapshot(params.id, expected, snapshot)
+          : await manager.forget(params.id, expected ?? undefined);
       if (!removed) {
         return textResult(`No memory found with id ${params.id}.`, {
           removed: false,
@@ -348,7 +603,7 @@ export default function (pi: ExtensionAPI) {
     name: "memory_init",
     label: "Memory Init",
     description:
-      "Bootstrap .pi/memory NDJSON files, then build the local search index. Optionally seed initial knowledge/practices, or force-rebuild the index from the NDJSON source of truth.",
+      "Bootstrap .pi/memory NDJSON files, then build the local search index. Malformed lines are preserved; use memory_repair to remove them. Optionally seed initial knowledge/practices, or force-rebuild the index from the NDJSON source of truth.",
     parameters: Type.Object({
       seed: Type.Optional(
         Type.Boolean({
@@ -377,12 +632,8 @@ export default function (pi: ExtensionAPI) {
         ? ` created ${result.createdMemories}, skipped ${result.skippedMemories},`
         : "";
       const forceText = params.force ? " (rebuilt index)" : "";
-      const recoveryText =
-        result.recoveredLines > 0
-          ? ` Removed ${result.recoveredLines} malformed NDJSON line${result.recoveredLines === 1 ? "" : "s"}.`
-          : "";
       return textResult(
-        `Initialized memory${forceText}.${seedText}${recoveryText} Semantic ${result.semanticEnabled ? "enabled" : "fallback-only"}.`,
+        `Initialized memory${forceText}.${seedText} Semantic ${result.semanticEnabled ? "enabled" : "fallback-only"}.`,
         result,
       );
     },
@@ -411,56 +662,60 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool({
-    name: "memory_learn",
-    label: "Memory Learn",
-    description:
-      "Review recent activity and suggest new memories without writing them.",
-    parameters: Type.Object({
-      since: Type.Optional(
-        Type.String({
-          description: "ISO timestamp lower bound for activity review",
-        }),
-      ),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const manager = await getReadyManager(ctx);
-      if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
-
-      const snippets = await manager.learn(params.since);
-      return textResult(
-        snippets.length > 0
-          ? `Recent conversations from ${snippets.filter((s) => s.startsWith("--- Session")).length} sessions:\n\n${snippets.join("\n")}`
-          : "No recent sessions found. Use `memory_remember` to add memories manually.",
-        {
-          sessionCount: snippets.filter((s) => s.startsWith("--- Session"))
-            .length,
-        },
-      );
-    },
-  });
+  async function foregroundReviewReady(
+    ctx: ExtensionContext,
+  ): Promise<string | undefined> {
+    if (!ctx.isProjectTrusted())
+      return "Project trust is required for memory review.";
+    if (!(await getReadyManager(ctx))) return NOT_ENABLED_MESSAGE;
+    return undefined;
+  }
 
   pi.registerTool({
     name: "memory_consolidate",
     label: "Memory Consolidate",
     description:
-      "Review stored memories and suggest duplicate or merge candidates without mutating files.",
-    parameters: Type.Object({
-      since: Type.Optional(
-        Type.String({
-          description:
-            "Only review memories created or updated after this ISO timestamp",
-        }),
-      ),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const manager = await getReadyManager(ctx);
-      if (!manager) return textResult(NOT_ENABLED_MESSAGE, { enabled: false });
+      "Start foreground memory consolidation only when the user explicitly requests it; continue the review in this agent session using normal tools.",
+    parameters: Type.Object({}, { additionalProperties: false }),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      const error = await foregroundReviewReady(ctx);
+      if (error) return textResult(error, { failed: true });
+      foregroundReview = true;
+      return textResult(FOREGROUND_REVIEW_PROMPT, { foreground: true });
+    },
+  });
 
-      const suggestions = await manager.consolidate(params.since);
-      return textResult(suggestions.map((entry) => `- ${entry}`).join("\n"), {
-        count: suggestions.length,
-      });
+  // The tool is also available in headless/RPC mode; the command is a direct
+  // user-facing entry point and never opens a focus-stealing screen.
+  pi.registerCommand?.("memory-review", {
+    description: "Start foreground memory review",
+    handler: async (args, ctx) => {
+      if (args.trim()) {
+        if (ctx.hasUI) ctx.ui.notify("Usage: /memory-review", "warning");
+        return;
+      }
+      const error = await foregroundReviewReady(ctx);
+      if (error) {
+        if (ctx.hasUI) ctx.ui.notify(error, "warning");
+        return;
+      }
+      if (!ctx.isIdle()) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            "Agent is busy. Run /memory-review when idle.",
+            "warning",
+          );
+        return;
+      }
+      foregroundReview = true;
+      pendingForegroundCommand = true;
+      try {
+        pi.sendUserMessage(FOREGROUND_REVIEW_PROMPT);
+      } catch (error) {
+        foregroundReview = false;
+        pendingForegroundCommand = false;
+        throw error;
+      }
     },
   });
 

@@ -4,7 +4,6 @@ import { lstat, mkdtemp, opendir, realpath } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-export const RECORDING_RECOVERY_SCAN_LIMIT = 10000;
 const ownerKey = (owner: string) =>
   createHash("sha256").update(owner).digest("hex");
 const prefix = (kind: "trace" | "video", owner: string) =>
@@ -34,7 +33,16 @@ export async function listRecordingRecovery(
   owner: string,
   offset = 0,
   limit = 20,
+  signal?: AbortSignal,
 ) {
+  if (
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    !Number.isSafeInteger(limit) ||
+    limit < 1
+  )
+    throw new Error("Invalid recording recovery offset or limit.");
+  if (signal?.aborted) throw new Error("Recording recovery scan cancelled.");
   const root = await realpath(tmpdir());
   const directory = await opendir(root);
   const prefixes = [prefix("trace", owner), prefix("video", owner)];
@@ -43,13 +51,10 @@ export async function listRecordingRecovery(
   let scanned = 0,
     matches = 0,
     unsafe = 0,
-    truncated = false,
     more = false;
   for await (const item of directory) {
-    if (++scanned > RECORDING_RECOVERY_SCAN_LIMIT) {
-      truncated = true;
-      break;
-    }
+    if (signal?.aborted) throw new Error("Recording recovery scan cancelled.");
+    scanned++;
     const kindIndex = prefixes.findIndex((value) =>
       item.name.startsWith(value),
     );
@@ -92,10 +97,9 @@ export async function listRecordingRecovery(
     items,
     nextOffset: more ? offset + items.length : null,
     scanned,
-    scanLimit: RECORDING_RECOVERY_SCAN_LIMIT,
-    truncated,
+    truncated: more,
     unsafeEntries: unsafe,
     notice:
-      "Read-only discovery, not proof of an orphan. A browser or native finalization may still be using these directories. Do not delete until ownership and process exit are verified. Other Pi owners and older unscoped pi-browser-trace-* and pi-browser-video-* directories require manual local inspection of the OS temporary directory. Native transient bytes are not quota-limited.",
+      "Read-only discovery, not proof of an orphan. A browser or native finalization may still be using these directories. Do not delete until ownership and process exit are verified. Other Pi owners and older unscoped pi-browser-trace-* and pi-browser-video-* directories require manual local inspection of the OS temporary directory. Native transient bytes are not quota-limited. Offset pages rescan the directory and are not a snapshot; concurrent changes may shift results.",
   };
 }

@@ -56,6 +56,12 @@ Use `browser_handoff` with `action: "pause"` for a human login or MFA step. Auto
 | `browser_download`, `browser_recording`, `browser_artifact`                    | Manage captured downloads, traces and video, and read, export or clean managed artifacts.                                                                                                                                          |
 | `browser_attachment`                                                           | Experimental, limited direct CDP access to an explicitly selected external page.                                                                                                                                                   |
 
+`browser_upload` stages files in private temporary storage in chunks, so ordinary uploads are not limited by a fixed file size or buffered entirely in the Pi process. Staging uses disk space proportional to the files and may remain until the browser closes. `browser_session` with `action: "upload_recovery"` lists retained staging for the owning session. Explicit MIME overrides use Playwright's in-memory payload API and must total less than 50 MiB; omit overrides for larger files. Sites and browsers can impose their own limits.
+
+`browser_download` streams files into private artifacts without a small default file-size cap. Large uploads, downloads, snapshots, and recordings can consume substantial disk or memory. If download publication fails, export the retained native file before closing the browser; an explicit stop blocks while recoverable files or active downloads remain unless `abandonDownloads` is set.
+
+`browser_snapshot`, `browser_extract`, and external attachment inspection accept per-call traversal and output budgets. Omitted snapshot content is reported and an incomplete extraction fails explicitly. See `extensions/browser-tools/limits.md` for remaining bounds and recovery details.
+
 `browser_start`, `browser_stop`, `browser_cookies`, and `browser_logs` are removed. Use `browser_session` and `browser_diagnostics` instead where applicable. `browser_navigate` no longer accepts the old `newTab` or `reload` parameters; create or select a tab through `browser_session`. `browser_screenshot` now returns PNG image content rather than a temporary filename.
 
 Diagnostics capture bounded console and network metadata by default. Console text, page content, URLs and explicitly revealed headers can contain secrets. With diagnostics enabled, body capture is on by default for `development` sessions, the default purpose, and off by default for `research` sessions. Use `browser_diagnostic_body` with `action: "configure"` to enable or disable capture for future requests. Captured bodies may contain secrets. Response bodies are best effort for completed, declared-small uncompressed responses. Retained bytes are bounded, but transient browser, transport and Node memory are not strictly bounded. Requests are never replayed for capture. History is cleared when its tab or session is invalidated.
@@ -89,6 +95,18 @@ Replaces Pi's default footer with context usage and last/average response tokens
 If you happen to be using a codex subscription, enable **Custom Stats Footer → codexQuota.enabled** in `/pi-tools` to see your remaining weekly quota. This uses your existing `openai-codex` ChatGPT subscription login, refreshes every five minutes, and stores its settings in the shared `~/.pi/agent/pi-tools.json` file.
 
 The quota source is an undocumented ChatGPT endpoint, so the feature is best-effort. Access tokens and account identifiers are used only in memory and are never written or displayed by the extension.
+
+### `memory`
+
+Project Memory keeps project-scoped knowledge, practices, and decisions as NDJSON files under `.pi/memory/`. Initialize a project with the `memory_init` tool; the agent can use `memory_remember`, `memory_recall`, `memory_update`, `memory_forget`, and `memory_list` to maintain and search it. `memory_repair` explicitly removes malformed lines; initialization does not silently remove them. The SQLite search index is derived from the NDJSON files and can be rebuilt.
+
+At the start of a session, the extension injects the full knowledge category and guidance to recall practices and decisions when needed. It refreshes that briefing on the first turn after compaction, not on ordinary turns. There is no fixed knowledge token limit, so review the knowledge file if it becomes too large.
+
+Use `/memory-review` to request foreground consolidation in a trusted, initialized project. The agent can also use `memory_consolidate` when the user explicitly requests a review. The review runs visibly in the current agent session with its normal model and tools. It inspects memories and available evidence, applies supported changes, and reports gaps and conflicts. Review the uncommitted NDJSON diff; a completed review does not prove every memory is current.
+
+There is no automatic session-history review or background review model. Foreground review may inspect project session history and repository files, and their contents can be sent to the current model provider. Check that provider's privacy and retention policy.
+
+For review-driven updates and removals, the agent supplies `expectedContent` with the exact content it inspected. If the content changed, the write fails and the agent must inspect it again. Cooperating memory writers use a project-wide lock and checked snapshots, but manual filesystem edits can still race the final replacement. Review preserves malformed records and ambiguous duplicate IDs rather than silently repairing them. Inspect the files and resolve duplicate IDs explicitly; use `memory_repair` only when you intend to remove malformed lines.
 
 ### `subagents`
 

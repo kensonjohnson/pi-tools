@@ -12,6 +12,7 @@ import type {
   Request,
 } from "playwright";
 import { acquireProfile, type ProfileLease } from "./profiles.ts";
+import { stageUploadFiles } from "./upload-files.ts";
 import {
   DiagnosticCleanupError,
   type BrowserDiagnostics,
@@ -128,6 +129,9 @@ type Session = {
   artifactOwner: string;
   video: boolean;
   disposing?: Promise<void>;
+  uploadCleanup?: Map<string, () => Promise<void>>;
+  uploadAbort?: AbortController;
+  uploadPreparing?: Set<Promise<void>>;
   picker?: {
     id: string;
     target: SessionTarget;
@@ -182,11 +186,12 @@ type AttachedSession = {
 async function listLocalPageTargets(
   origin: string,
   signal: AbortSignal,
+  timeoutMs: number,
 ): Promise<{ ids: string[]; omitted: number }> {
   const base = validateAttachmentEndpoint(origin, "http:");
   if (base.pathname !== "/" || base.search)
     throw new Error("Attachment endpoint must be an origin.");
-  await discoverAttachmentEndpoint(origin, { signal, timeoutMs: 5000 });
+  await discoverAttachmentEndpoint(origin, { signal, timeoutMs });
   if (signal.aborted) throw new Error("Attachment discovery cancelled.");
   const body = await new Promise<string>((resolve, reject) => {
     let settled = false;
@@ -344,8 +349,35 @@ export class ManagedSessions {
   >();
   private disposals = new Map<Browser, Promise<void>>();
   private cleanupFailed = false;
+  private uploadRecoveryEntries = new Map<
+    string,
+    {
+      owner: string;
+      sessionId: string;
+      status:
+        "preparing" | "pending_close" | "closure_unknown" | "cleanup_failed";
+    }
+  >();
+  private uploadPreparations = new Map<Promise<void>, string>();
+
+  uploadRecovery(owner: string) {
+    return {
+      entries: [...this.uploadRecoveryEntries]
+        .filter(([, item]) => item.owner === owner)
+        .map(([path, item]) => ({
+          path,
+          sessionId: item.sessionId,
+          status: item.status,
+        })),
+      pendingPreparations: [...this.uploadPreparations.values()].filter(
+        (value) => value === owner,
+      ).length,
+      note: "Preparation cleanup may still be pending. Retained paths may be in use; verify browser exit before manual removal.",
+    };
+  }
   private attachmentCleanupUnverified = false;
   private launchCleanupUnverified = false;
+  private readonly stageUpload: typeof stageUploadFiles;
   private readonly launch: BrowserLauncher;
   private readonly id: () => string;
   private readonly launchPersistent?: (
@@ -358,11 +390,17 @@ export class ManagedSessions {
   private readonly diagnostics?: BrowserDiagnostics;
   private readonly downloads?: DownloadManager;
   private readonly downloadCloseTimeoutMs: number;
+  private readonly onVideoDeadlineRisk?: (
+    owner: string,
+    sessionId: string,
+    count: number,
+  ) => void;
   private readonly recordings?: TraceRecordings;
   private readonly videos?: VideoRecordings;
 
   constructor(options: {
     launch: BrowserLauncher;
+    stageUpload?: typeof stageUploadFiles;
     id?: () => string;
     launchPersistent?: (
       path: string,
@@ -374,6 +412,11 @@ export class ManagedSessions {
     diagnostics?: BrowserDiagnostics;
     downloads?: DownloadManager;
     downloadCloseTimeoutMs?: number;
+    onVideoDeadlineRisk?: (
+      owner: string,
+      sessionId: string,
+      count: number,
+    ) => void;
     recordings?: TraceRecordings;
     videos?: VideoRecordings;
     makeSnapshots?: (page: Page) => SemanticSnapshots;
@@ -382,6 +425,8 @@ export class ManagedSessions {
     attachmentLockRoot?: string;
   }) {
     this.attachmentLockRoot = options.attachmentLockRoot;
+    this.stageUpload = options.stageUpload ?? stageUploadFiles;
+    this.onVideoDeadlineRisk = options.onVideoDeadlineRisk;
     this.makeSnapshots =
       options.makeSnapshots ?? ((page) => new SemanticSnapshots(page));
     this.picker = options.picker ?? pickHumanElement;
@@ -412,6 +457,7 @@ export class ManagedSessions {
 
   private invalidate(session: Session): boolean {
     session.closed = true;
+    session.uploadAbort?.abort();
     session.picker?.cancel.abort();
     if (session.dialog) clearTimeout(session.dialog.timer);
     session.dialog = undefined;
@@ -680,14 +726,35 @@ export class ManagedSessions {
       try {
         await this.closeBrowser(session.browser);
       } catch (error) {
-        if (session.video)
+        await Promise.all(session.uploadPreparing ?? []);
+        if (session.video) {
           this.videos?.markUnverified(
             session.id,
             session.artifactOwner,
             "Browser closure failed; native video files were retained for recovery.",
           );
+          this.videos?.releaseUnverified?.(session.id, session.artifactOwner);
+        }
+        const paths = [...this.uploadRecoveryEntries]
+          .filter(
+            ([, item]) =>
+              item.sessionId === session.id &&
+              item.owner === session.artifactOwner,
+          )
+          .map(([path]) => path);
+        for (const path of paths) {
+          const record = this.uploadRecoveryEntries.get(path);
+          if (record && record.status === "pending_close")
+            record.status = "closure_unknown";
+        }
+        if (paths.length)
+          throw new Error(
+            `Browser closure failed; upload staging may still be in use and was retained at: ${paths.join(", ")}. ${String(error)}`,
+            { cause: error },
+          );
         throw error;
       }
+      await Promise.all(session.uploadPreparing ?? []);
       if (session.video && this.videos) {
         if (!browserOwnership || browserOwnership.poisoned) {
           this.videos.markUnverified(
@@ -695,8 +762,9 @@ export class ManagedSessions {
             session.artifactOwner,
             "Browser ownership or closure was unverified; native video directory retained.",
           );
+          this.videos.releaseUnverified?.(session.id, session.artifactOwner);
           unverified = true;
-        } else
+        } else {
           try {
             const saved = await this.videos.closed(
               session.id,
@@ -706,7 +774,47 @@ export class ManagedSessions {
           } catch {
             unverified = true;
           }
+        }
         if (unverified) this.cleanupFailed = true;
+      }
+      if (
+        (!browserOwnership || browserOwnership.poisoned) &&
+        session.uploadCleanup?.size
+      ) {
+        for (const path of session.uploadCleanup.keys()) {
+          const record = this.uploadRecoveryEntries.get(path);
+          if (record) record.status = "closure_unknown";
+        }
+        throw new Error(
+          `Browser closure ownership is unverified; upload staging may still be in use and was retained at: ${[...session.uploadCleanup.keys()].join(", ")}.`,
+        );
+      }
+      const failedUploadCleanup: string[] = [];
+      for (const [path, cleanup] of session.uploadCleanup ?? []) {
+        try {
+          await cleanup();
+          session.uploadCleanup?.delete(path);
+          this.uploadRecoveryEntries.delete(path);
+        } catch {
+          const record = this.uploadRecoveryEntries.get(path);
+          if (record) record.status = "cleanup_failed";
+          failedUploadCleanup.push(path);
+          unverified = true;
+        }
+      }
+      for (const [path, item] of this.uploadRecoveryEntries)
+        if (
+          item.owner === session.artifactOwner &&
+          item.sessionId === session.id &&
+          item.status === "cleanup_failed" &&
+          !failedUploadCleanup.includes(path)
+        )
+          failedUploadCleanup.push(path);
+      if (failedUploadCleanup.length) {
+        this.cleanupFailed = true;
+        throw new Error(
+          `Browser closed but upload staging cleanup failed; retained at: ${failedUploadCleanup.join(", ")}.`,
+        );
       }
       if (unverified || this.cleanupFailed)
         throw new Error(
@@ -751,9 +859,9 @@ export class ManagedSessions {
         if (parsed.pathname !== "/" || parsed.search)
           throw new Error("Attachment endpoint must be an origin.");
         if (
-          !Number.isInteger(timeoutMs) ||
+          !Number.isSafeInteger(timeoutMs) ||
           timeoutMs < 100 ||
-          timeoutMs > 30000
+          timeoutMs > 2147483647
         )
           throw new Error("Invalid attachment timeout.");
         await discoverAttachmentEndpoint(origin, {
@@ -806,8 +914,19 @@ export class ManagedSessions {
       }));
   }
 
-  async attachmentTargets(id: string, owner: string, signal?: AbortSignal) {
+  async attachmentTargets(
+    id: string,
+    owner: string,
+    signal?: AbortSignal,
+    timeoutMs = 5000,
+  ) {
     const attachment = this.getAttachment(id, owner);
+    if (
+      !Number.isSafeInteger(timeoutMs) ||
+      timeoutMs < 100 ||
+      timeoutMs > 2147483647
+    )
+      throw new Error("Invalid attachment discovery timeout.");
     if (attachment.busy)
       throw new Error(
         "Attachment is busy; retry after its current operation settles.",
@@ -817,10 +936,14 @@ export class ManagedSessions {
       const combined = AbortSignal.any([
         this.attachmentStop.signal,
         attachment.stop.signal,
-        AbortSignal.timeout(5000),
+        AbortSignal.timeout(timeoutMs),
         ...(signal ? [signal] : []),
       ]);
-      const targets = await listLocalPageTargets(attachment.origin, combined);
+      const targets = await listLocalPageTargets(
+        attachment.origin,
+        combined,
+        timeoutMs,
+      );
       if (combined.aborted || this.attachments.get(id) !== attachment)
         throw new Error("Target discovery cancelled.");
       attachment.discovered = new Set(targets.ids);
@@ -846,7 +969,11 @@ export class ManagedSessions {
     timeoutMs = 5000,
   ) {
     const attachment = this.getAttachment(id, owner);
-    if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30000)
+    if (
+      !Number.isSafeInteger(timeoutMs) ||
+      timeoutMs < 100 ||
+      timeoutMs > 2147483647
+    )
       throw new Error("Invalid attachment selection timeout.");
     if (attachment.busy)
       throw new Error(
@@ -936,7 +1063,12 @@ export class ManagedSessions {
     owner: string,
     targetId: string,
     action: "navigate" | "inspect" | "title" | "start_diagnostics",
-    options: { url?: string; timeoutMs?: number } = {},
+    options: {
+      url?: string;
+      timeoutMs?: number;
+      maxNodes?: number;
+      maxChars?: number;
+    } = {},
     signal?: AbortSignal,
   ) {
     const attachment = this.getAttachment(id, owner);
@@ -946,10 +1078,21 @@ export class ManagedSessions {
       );
     if (!targetId || targetId !== attachment.targetId)
       throw new Error("Explicit selected attachment target required.");
-    if (action === "navigate" && (!options.url || options.url.length > 8192))
-      throw new Error("A bounded navigation URL is required.");
+    if (action === "navigate" && !options.url)
+      throw new Error("A navigation URL is required.");
+    if (
+      [options.maxNodes, options.maxChars].some(
+        (value) =>
+          value !== undefined && (!Number.isSafeInteger(value) || value < 1),
+      )
+    )
+      throw new Error("Inspection budgets must be positive safe integers.");
     const timeoutMs = options.timeoutMs ?? 5000;
-    if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30000)
+    if (
+      !Number.isSafeInteger(timeoutMs) ||
+      timeoutMs < 100 ||
+      timeoutMs > 2147483647
+    )
       throw new Error("Invalid attachment operation timeout.");
     if (attachment.busy)
       throw new Error(
@@ -968,12 +1111,14 @@ export class ManagedSessions {
       const operation = { signal: combined, timeoutMs };
       if (action === "navigate") {
         await page.navigate(options.url!, operation);
+        const requestedUrl = sanitizeUrl(options.url!);
         return {
           attachmentId: id,
           targetId,
           action,
           status: "completed",
-          requestedUrl: sanitizeUrl(options.url!).slice(0, 2000),
+          requestedUrl: requestedUrl.slice(0, 2000),
+          requestedUrlTruncated: requestedUrl.length > 2000,
           note: "Selected-frame load was observed; redirects and application success are not independently verified.",
         };
       }
@@ -995,7 +1140,11 @@ export class ManagedSessions {
           action,
           ...(await page.title(operation)),
         };
-      const inspected = await page.inspect(operation);
+      const inspected = await page.inspect({
+        ...operation,
+        maxNodes: options.maxNodes,
+        maxChars: options.maxChars,
+      });
       const output = {
         attachmentId: id,
         targetId,
@@ -1005,18 +1154,19 @@ export class ManagedSessions {
           "bounded main-document DOM text; includes hidden and script text; excludes child-frame documents",
         note: "Text may contain sensitive page content.",
       };
-      while (output.text && Buffer.byteLength(JSON.stringify(output)) > 12000) {
-        const points = Array.from(output.text);
-        output.text = points.slice(0, Math.floor(points.length * 0.7)).join("");
-        output.truncated = true;
-      }
       return output;
     } catch (error) {
       this.attachmentCleanupUnverified = true;
       if (this.attachments.get(id) === attachment)
         void this.disconnectAttachment(id, owner).catch(() => {});
+      const changed =
+        error instanceof Error &&
+        error.message ===
+          "Document changed during observation; outcome uncertain";
       throw new Error(
-        "Attached-page operation failed or was interrupted; its outcome may be uncertain and ownership may be quarantined. The external browser was not closed; do not retry automatically.",
+        changed
+          ? "Attached-page document changed during observation; the result is unavailable, outcome is uncertain, and ownership may be quarantined. The external browser was not closed; do not retry automatically."
+          : "Attached-page operation failed or was interrupted; its outcome may be uncertain and ownership may be quarantined. The external browser was not closed; do not retry automatically.",
         { cause: error },
       );
     } finally {
@@ -1166,7 +1316,9 @@ export class ManagedSessions {
           id,
           type: dialog.type(),
           message: dialog.message().slice(0, 1000),
+          messageTruncated: dialog.message().length > 1000,
           defaultValue: dialog.defaultValue().slice(0, 1000),
+          defaultValueTruncated: dialog.defaultValue().length > 1000,
         },
         note: "Origin operation may have been dispatched. Resolve explicitly; do not replay.",
       });
@@ -1394,18 +1546,9 @@ export class ManagedSessions {
       throw new Error(
         "Video-enabled sessions cannot be restarted for a human handoff.",
       );
-    if (
-      this.downloads
-        ?.list(session.id)
-        .some(
-          (item) =>
-            item.state === "pending" ||
-            item.state === "saving" ||
-            item.state === "unknown",
-        )
-    )
+    if (this.downloads?.closeRisks?.(owner, session.id).length)
       throw new Error(
-        "An existing download is still active or uncertain. Settle it before requesting a visible restart.",
+        "Visible restart blocked: downloads are active or native recovery bytes are unexported. Wait or export_native first; no restart was requested.",
       );
     if (this.recordings) {
       let recording: ReturnType<TraceRecordings["inspect"]> | undefined;
@@ -1475,6 +1618,10 @@ export class ManagedSessions {
     const request = session.restartRequest;
     if (!request || request.id !== restartId)
       throw new Error("Restart request unavailable or consent does not match.");
+    if (this.downloads?.closeRisks?.(owner, session.id).length)
+      throw new Error(
+        "Visible restart blocked: downloads are active or native recovery bytes are unexported. Cancel the restart request, then wait or export_native. No close was started.",
+      );
     const page = session.pages.get(request.target.tabId);
     if (!page || page.isClosed())
       throw new Error(
@@ -2008,7 +2155,36 @@ export class ManagedSessions {
             };
           }
           if (videoId && videoOwner)
-            this.videos!.attach(videoId, videoOwner, context, () => {
+            this.videos!.attach(videoId, videoOwner, context, (reason) => {
+              let risks: ReturnType<DownloadManager["closeRisks"]> = [];
+              let riskUnknown = false;
+              try {
+                risks = this.downloads?.closeRisks?.(videoOwner, videoId) ?? [];
+              } catch {
+                riskUnknown = true;
+              }
+              try {
+                this.videos?.noteDeadlineClosure?.(
+                  videoId,
+                  videoOwner,
+                  reason,
+                  risks,
+                  riskUnknown,
+                );
+              } catch {
+                riskUnknown = true;
+              }
+              if (risks.length || riskUnknown) {
+                try {
+                  this.onVideoDeadlineRisk?.(
+                    videoOwner,
+                    videoId,
+                    riskUnknown ? -1 : risks.length,
+                  );
+                } catch {
+                  /* owner-scoped status remains available when recording status works */
+                }
+              }
               if (session) void this.dispose(session).catch(() => {});
               else {
                 cancelled = true;
@@ -2074,22 +2250,25 @@ export class ManagedSessions {
               const owner = this.owned.get(browser);
               await this.closeBrowser(browser);
               if (videoId && videoOwner) {
-                if (!owner || owner.poisoned)
+                if (!owner || owner.poisoned) {
                   this.videos!.markUnverified(
                     videoId,
                     videoOwner,
                     "Browser ownership was unverified; native video directory retained.",
                   );
-                else await this.videos!.closed(videoId, videoOwner);
+                  this.videos!.releaseUnverified?.(videoId, videoOwner);
+                } else await this.videos!.closed(videoId, videoOwner);
               }
             }
           } catch {
-            if (videoId && videoOwner)
+            if (videoId && videoOwner) {
               this.videos!.markUnverified(
                 videoId,
                 videoOwner,
                 "Startup cleanup failed; video directory retained.",
               );
+              this.videos!.releaseUnverified?.(videoId, videoOwner);
+            }
             throw new Error(
               `Browser startup failed and owned browser cleanup failed.${videoId ? ` Video recovery record sessionId: ${videoId}.` : ""} ${String(error).slice(0, 500)}`,
             );
@@ -2301,6 +2480,7 @@ export class ManagedSessions {
         operation.result = {
           status: "failed",
           error: String(error).slice(0, 500),
+          errorTruncated: String(error).length > 500,
           note: "Navigation may have started; no retry was made.",
         };
         operation.settled = true;
@@ -2346,8 +2526,18 @@ export class ManagedSessions {
     options: {
       selector?: string;
       frameSelector?: string;
+      maxNodes?: number;
       maxRecords?: number;
       maxChars?: number;
+      maxFrames?: number;
+      maxScopeNodes?: number;
+      identityNameChars?: number;
+      identityTextChars?: number;
+      identityNodes?: number;
+      identityAncestors?: number;
+      identityFrameDepth?: number;
+      identityMetadataChars?: number;
+      identityLabels?: number;
     } = {},
   ) {
     return this.withOwnedPage(target, signal, owner, async (page, resolved) => {
@@ -2377,8 +2567,34 @@ export class ManagedSessions {
         snapshot: await snapshots.snapshot({
           selector: options.selector,
           frame,
+          maxNodes: options.maxNodes,
           maxRecords: options.maxRecords,
           maxChars: options.maxChars,
+          maxFrames: options.maxFrames,
+          ...(options.maxScopeNodes !== undefined
+            ? { maxScopeNodes: options.maxScopeNodes }
+            : {}),
+          ...(options.identityNameChars !== undefined
+            ? { identityNameChars: options.identityNameChars }
+            : {}),
+          ...(options.identityTextChars !== undefined
+            ? { identityTextChars: options.identityTextChars }
+            : {}),
+          ...(options.identityNodes !== undefined
+            ? { identityNodes: options.identityNodes }
+            : {}),
+          ...(options.identityAncestors !== undefined
+            ? { identityAncestors: options.identityAncestors }
+            : {}),
+          ...(options.identityFrameDepth !== undefined
+            ? { identityFrameDepth: options.identityFrameDepth }
+            : {}),
+          ...(options.identityMetadataChars !== undefined
+            ? { identityMetadataChars: options.identityMetadataChars }
+            : {}),
+          ...(options.identityLabels !== undefined
+            ? { identityLabels: options.identityLabels }
+            : {}),
         }),
       };
     });
@@ -2410,8 +2626,10 @@ export class ManagedSessions {
     signal?: AbortSignal,
     timeout = 5000,
   ) {
-    if (!Number.isInteger(timeout) || timeout < 100 || timeout > 30000)
-      throw new Error("Click timeout must be between 100 and 30000 ms.");
+    if (!Number.isSafeInteger(timeout) || timeout < 100 || timeout > 2147483647)
+      throw new Error(
+        "Click timeout must be between 100 and 2147483647 ms (platform timer maximum).",
+      );
     this.check(signal);
     const session = this.getPage(target, owner).session;
     let notify!: (value: unknown) => void;
@@ -2442,7 +2660,7 @@ export class ManagedSessions {
           await handle.click({ timeout });
         } catch (error) {
           throw new Error(
-            `Browser click failed; dispatch may have started and the page may have changed. No automatic retry was attempted. ${String(error).slice(0, 500)}`,
+            `Browser click failed; dispatch may have started and the page may have changed. No automatic retry was attempted. ${String(error).slice(0, 500)}${String(error).length > 500 ? " [error detail truncated]" : ""}`,
             { cause: error },
           );
         }
@@ -2464,6 +2682,7 @@ export class ManagedSessions {
         operation.result = {
           status: "failed",
           error: String(error).slice(0, 500),
+          errorTruncated: String(error).length > 500,
           note: "Click may have occurred; no retry was made.",
         };
         operation.settled = true;
@@ -2491,8 +2710,10 @@ export class ManagedSessions {
     signal?: AbortSignal,
   ) {
     const timeout = args.timeoutMs ?? 5000;
-    if (!Number.isInteger(timeout) || timeout < 100 || timeout > 30000)
-      throw new Error("Action timeout must be between 100 and 30000 ms.");
+    if (!Number.isSafeInteger(timeout) || timeout < 100 || timeout > 2147483647)
+      throw new Error(
+        "Action timeout must be between 100 and 2147483647 ms (platform timer maximum).",
+      );
     if (
       ["fill", "select", "press"].includes(args.action) &&
       typeof args.value !== "string"
@@ -2564,7 +2785,7 @@ export class ManagedSessions {
                 { cause: error },
               );
             throw new Error(
-              `Could not resolve unique ${label} within the action deadline: ${message.slice(0, 600)}`,
+              `Could not resolve unique ${label} within the action deadline: ${message.slice(0, 600)}${message.length > 600 ? " [error detail truncated]" : ""}`,
               { cause: error },
             );
           }
@@ -2699,6 +2920,7 @@ export class ManagedSessions {
             throw new Error("Action deadline expired before dispatch.");
           let status: "completed" | "possibly_dispatched" = "completed";
           let failure: string | undefined;
+          let failureTruncated = false;
           try {
             session.operation = operation;
             actionStarted = true;
@@ -2730,9 +2952,11 @@ export class ManagedSessions {
             status =
               args.action === "wait" ? "completed" : "possibly_dispatched";
             failure = String(error).slice(0, 500);
+            failureTruncated = String(error).length > 500;
             stopObserver();
           }
           const matched = verification ? await verification : false;
+          const resultUrl = presentedPageUrl(page.url());
           return {
             target: resolved,
             element: args.target,
@@ -2744,10 +2968,12 @@ export class ManagedSessions {
                 ? "verified_condition"
                 : "unconfirmed",
             ...(args.expect ? { condition: args.expect.kind } : {}),
-            url: presentedPageUrl(page.url()).slice(0, 1000),
+            url: resultUrl.slice(0, 1000),
+            urlTruncated: resultUrl.length > 1000,
             ...(failure
               ? {
                   failure,
+                  failureTruncated,
                   note:
                     args.action === "wait"
                       ? "Readiness was not confirmed."
@@ -2777,6 +3003,7 @@ export class ManagedSessions {
         operation.result = {
           status: "failed",
           error: String(error).slice(0, 500),
+          errorTruncated: String(error).length > 500,
           note: "The action may have occurred; do not replay automatically.",
         };
         operation.settled = true;
@@ -2807,8 +3034,8 @@ export class ManagedSessions {
   ) {
     this.check(signal);
     const session = this.getPage(target, owner).session;
-    if (!args.paths.length || args.paths.length > 10)
-      throw new Error("Upload requires 1 to 10 explicit files.");
+    if (!args.paths.length)
+      throw new Error("Upload requires at least one explicit file.");
     const targetCount =
       Number(!!args.ref) + Number(!!args.selector) + Number(!!args.role);
     if (
@@ -2834,13 +3061,13 @@ export class ManagedSessions {
     if (
       !Number.isSafeInteger(args.maxFileBytes) ||
       args.maxFileBytes < 1 ||
-      args.maxFileBytes > 25000000 ||
+      args.maxFileBytes > Number.MAX_SAFE_INTEGER ||
       !Number.isSafeInteger(args.maxTotalBytes) ||
       args.maxTotalBytes < 1 ||
-      args.maxTotalBytes > 50000000 ||
-      !Number.isInteger(args.timeoutMs) ||
+      args.maxTotalBytes > Number.MAX_SAFE_INTEGER ||
+      !Number.isSafeInteger(args.timeoutMs) ||
       args.timeoutMs < 100 ||
-      args.timeoutMs > 30000
+      args.timeoutMs > 2147483647
     )
       throw new Error("Invalid upload limits or deadline.");
     let notify!: (value: unknown) => void;
@@ -2960,183 +3187,320 @@ export class ManagedSessions {
               );
           };
           if (args.mode !== "chooser") await checkInput(element);
-          const files: { name: string; mimeType: string; buffer: Buffer }[] =
+          let files:
+            string[] | { name: string; mimeType: string; buffer: Buffer }[] =
             [];
           let total = 0;
-          for (const [index, path] of args.paths.entries()) {
-            if (!path || path.length > 4096 || /[\u0000*?\[\]]/.test(path))
-              throw new Error(
-                `Invalid explicit upload path at index ${index}.`,
-              );
-            let file: Awaited<ReturnType<typeof open>> | undefined;
-            try {
-              if (signal?.aborted || Date.now() >= expires)
-                throw new Error(
-                  "Upload cancelled or deadline exceeded before dispatch.",
-                );
-              file = await open(
-                resolve(args.cwd, path),
-                fsConstants.O_RDONLY |
-                  fsConstants.O_NOFOLLOW |
-                  fsConstants.O_NONBLOCK,
-              );
-              const stat = await file.stat();
-              if (
-                !stat.isFile() ||
-                stat.size > args.maxFileBytes ||
-                total + stat.size > args.maxTotalBytes
-              )
-                throw new Error(
-                  "File is not a regular file or exceeds upload limits.",
-                );
-              const buffer = Buffer.alloc(stat.size);
-              let offset = 0;
-              while (offset < buffer.length) {
-                if (signal?.aborted || Date.now() >= expires)
-                  throw new Error(
-                    "Upload cancelled or deadline exceeded before dispatch.",
-                  );
-                const read = await file.read(
-                  buffer,
-                  offset,
-                  buffer.length - offset,
-                  offset,
-                );
-                if (!read.bytesRead)
-                  throw new Error("File changed during read.");
-                offset += read.bytesRead;
-              }
-              const after = await file.stat();
-              if (after.size !== stat.size || after.mtimeMs !== stat.mtimeMs)
-                throw new Error("File changed during read.");
-              total += buffer.length;
-              const name = basename(path);
-              if (!name || Buffer.byteLength(name) > 255)
-                throw new Error("Invalid filename.");
-              const types: Record<string, string> = {
-                ".png": "image/png",
-                ".jpg": "image/jpeg",
-                ".jpeg": "image/jpeg",
-                ".gif": "image/gif",
-                ".webp": "image/webp",
-                ".svg": "image/svg+xml",
-                ".pdf": "application/pdf",
-                ".txt": "text/plain",
-                ".csv": "text/csv",
-                ".html": "text/html",
-                ".htm": "text/html",
-                ".json": "application/json",
-                ".xml": "application/xml",
-                ".zip": "application/zip",
-                ".mp4": "video/mp4",
-                ".mp3": "audio/mpeg",
-              };
-              files.push({
-                name,
-                mimeType:
-                  args.mimeTypes?.[index]?.toLowerCase() ??
-                  types[extname(name).toLowerCase()] ??
-                  "application/octet-stream",
-                buffer,
-              });
-            } catch (error) {
-              throw new Error(
-                `Upload file ${index + 1} could not be read as an allowed bounded regular file.`,
-                { cause: error },
-              );
-            } finally {
-              await file?.close().catch(() => {});
-            }
+          let staged: Awaited<ReturnType<typeof stageUploadFiles>> | undefined;
+          let dispatched = false;
+          let preparingPath: string | undefined;
+          let finishPreparation: (() => void) | undefined;
+          if (!args.mimeTypes) {
+            let resolvePreparation!: () => void;
+            const preparation = new Promise<void>((resolve) => {
+              resolvePreparation = resolve;
+            });
+            (session.uploadPreparing ??= new Set()).add(preparation);
+            this.uploadPreparations.set(preparation, owner);
+            finishPreparation = () => {
+              session.uploadPreparing?.delete(preparation);
+              this.uploadPreparations.delete(preparation);
+              resolvePreparation();
+            };
           }
-          if (args.ref) await snapshots!.resolve(args.ref);
-          if (args.mode !== "chooser") await checkInput(element);
-          if (signal?.aborted || Date.now() >= expires)
-            throw new Error(
-              "Upload cancelled or deadline exceeded before dispatch.",
-            );
-          session.operation = operation;
-          try {
-            if (args.mode === "chooser") {
-              let timer: ReturnType<typeof setTimeout> | undefined;
-              let onChooser!: (
-                chooser: import("playwright").FileChooser,
-              ) => void;
-              let onAbort: (() => void) | undefined;
-              const chooser = new Promise<import("playwright").FileChooser>(
-                (resolve, reject) => {
-                  onChooser = resolve;
-                  page.on("filechooser", onChooser);
-                  onAbort = () =>
-                    reject(new Error("File chooser operation cancelled."));
-                  signal?.addEventListener("abort", onAbort, { once: true });
-                  timer = setTimeout(
-                    () =>
-                      reject(
-                        new Error(
-                          "File chooser did not appear before the deadline.",
-                        ),
-                      ),
-                    Math.max(1, expires - Date.now()),
-                  );
-                },
+          const uploadSignal = AbortSignal.any([
+            (session.uploadAbort ??= new AbortController()).signal,
+            ...(signal ? [signal] : []),
+          ]);
+          const markDispatch = () => {
+            if (session.closed || uploadSignal.aborted || Date.now() >= expires)
+              throw new Error(
+                "Upload cancelled or session closed before file dispatch.",
               );
+            if (staged) {
+              (session.uploadCleanup ??= new Map()).set(
+                staged.root,
+                staged.cleanup,
+              );
+              this.uploadRecoveryEntries.set(staged.root, {
+                owner,
+                sessionId: session.id,
+                status: "pending_close",
+              });
+            }
+            dispatched = true;
+            finishPreparation?.();
+          };
+          try {
+            if (!args.mimeTypes) {
               try {
-                if (signal?.aborted)
+                staged = await this.stageUpload(
+                  args.paths,
+                  args.cwd,
+                  args,
+                  expires,
+                  uploadSignal,
+                  (path) => {
+                    preparingPath = path;
+                    this.uploadRecoveryEntries.set(path, {
+                      owner,
+                      sessionId: session.id,
+                      status: "preparing",
+                    });
+                  },
+                );
+              } catch (error) {
+                if (preparingPath) {
+                  if (
+                    (error as { uploadCleanupFailed?: boolean })
+                      ?.uploadCleanupFailed
+                  )
+                    this.uploadRecoveryEntries.set(preparingPath, {
+                      owner,
+                      sessionId: session.id,
+                      status: "cleanup_failed",
+                    });
+                  else this.uploadRecoveryEntries.delete(preparingPath);
+                }
+                throw error;
+              }
+              if (session.closed || signal?.aborted || Date.now() >= expires) {
+                throw new Error(
+                  "Upload cancelled or session closed before dispatch.",
+                );
+              }
+              files = staged.files;
+              total = staged.total;
+            } else {
+              const payloads: {
+                name: string;
+                mimeType: string;
+                buffer: Buffer;
+              }[] = [];
+              for (const [index, path] of args.paths.entries()) {
+                if (!path || path.length > 4096 || /[\u0000*?\[\]]/.test(path))
                   throw new Error(
-                    "File chooser operation cancelled before dispatch.",
+                    `Invalid explicit upload path at index ${index}.`,
                   );
-                const click = element.click({
-                  timeout: Math.max(1, expires - Date.now()),
-                });
-                const selected = await Promise.race([
-                  chooser,
-                  click.then(
-                    () => new Promise<never>(() => {}),
-                    (error) => Promise.reject(error),
-                  ),
-                ]);
-                const input = selected.element();
+                let file: Awaited<ReturnType<typeof open>> | undefined;
                 try {
-                  await checkInput(input);
                   if (signal?.aborted || Date.now() >= expires)
                     throw new Error(
-                      "File chooser operation cancelled or deadline exceeded.",
+                      "Upload cancelled or deadline exceeded before dispatch.",
                     );
-                  await selected.setFiles(files, {
+                  file = await open(
+                    resolve(args.cwd, path),
+                    fsConstants.O_RDONLY |
+                      fsConstants.O_NOFOLLOW |
+                      fsConstants.O_NONBLOCK,
+                  );
+                  const stat = await file.stat();
+                  if (
+                    !stat.isFile() ||
+                    stat.size > args.maxFileBytes ||
+                    total + stat.size > args.maxTotalBytes ||
+                    total + stat.size >= 50 * 1024 * 1024
+                  )
+                    throw new Error(
+                      "File is not a regular file or exceeds upload limits.",
+                    );
+                  const buffer = Buffer.alloc(stat.size);
+                  let offset = 0;
+                  while (offset < buffer.length) {
+                    if (signal?.aborted || Date.now() >= expires)
+                      throw new Error(
+                        "Upload cancelled or deadline exceeded before dispatch.",
+                      );
+                    const read = await file.read(
+                      buffer,
+                      offset,
+                      buffer.length - offset,
+                      offset,
+                    );
+                    if (!read.bytesRead)
+                      throw new Error("File changed during read.");
+                    offset += read.bytesRead;
+                  }
+                  const after = await file.stat();
+                  if (
+                    after.size !== stat.size ||
+                    after.mtimeMs !== stat.mtimeMs
+                  )
+                    throw new Error("File changed during read.");
+                  total += buffer.length;
+                  const name = basename(path);
+                  if (!name || Buffer.byteLength(name) > 255)
+                    throw new Error("Invalid filename.");
+                  const types: Record<string, string> = {
+                    ".png": "image/png",
+                    ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg",
+                    ".gif": "image/gif",
+                    ".webp": "image/webp",
+                    ".svg": "image/svg+xml",
+                    ".pdf": "application/pdf",
+                    ".txt": "text/plain",
+                    ".csv": "text/csv",
+                    ".html": "text/html",
+                    ".htm": "text/html",
+                    ".json": "application/json",
+                    ".xml": "application/xml",
+                    ".zip": "application/zip",
+                    ".mp4": "video/mp4",
+                    ".mp3": "audio/mpeg",
+                  };
+                  payloads.push({
+                    name,
+                    mimeType:
+                      args.mimeTypes?.[index]?.toLowerCase() ??
+                      types[extname(name).toLowerCase()] ??
+                      "application/octet-stream",
+                    buffer,
+                  });
+                } catch (error) {
+                  throw new Error(
+                    `Upload file ${index + 1} could not be read as an allowed regular file; MIME overrides require less than 52,428,800 total bytes and configured limits also apply.`,
+                    { cause: error },
+                  );
+                } finally {
+                  await file?.close().catch(() => {});
+                }
+              }
+              files = payloads;
+            }
+            if (args.ref) await snapshots!.resolve(args.ref);
+            if (args.mode !== "chooser") await checkInput(element);
+            if (signal?.aborted || Date.now() >= expires)
+              throw new Error(
+                "Upload cancelled or deadline exceeded before dispatch.",
+              );
+            session.operation = operation;
+            try {
+              if (args.mode === "chooser") {
+                let timer: ReturnType<typeof setTimeout> | undefined;
+                let onChooser!: (
+                  chooser: import("playwright").FileChooser,
+                ) => void;
+                let onAbort: (() => void) | undefined;
+                const chooser = new Promise<import("playwright").FileChooser>(
+                  (resolve, reject) => {
+                    onChooser = resolve;
+                    page.on("filechooser", onChooser);
+                    onAbort = () =>
+                      reject(new Error("File chooser operation cancelled."));
+                    uploadSignal.addEventListener("abort", onAbort, {
+                      once: true,
+                    });
+                    timer = setTimeout(
+                      () =>
+                        reject(
+                          new Error(
+                            "File chooser did not appear before the deadline.",
+                          ),
+                        ),
+                      Math.max(1, expires - Date.now()),
+                    );
+                  },
+                );
+                try {
+                  if (signal?.aborted)
+                    throw new Error(
+                      "File chooser operation cancelled before dispatch.",
+                    );
+                  const click = element.click({
                     timeout: Math.max(1, expires - Date.now()),
                   });
-                  await click;
+                  const selected = await Promise.race([
+                    chooser,
+                    click.then(
+                      () => new Promise<never>(() => {}),
+                      (error) => Promise.reject(error),
+                    ),
+                  ]);
+                  const input = selected.element();
+                  try {
+                    await checkInput(input);
+                    if (signal?.aborted || Date.now() >= expires)
+                      throw new Error(
+                        "File chooser operation cancelled or deadline exceeded.",
+                      );
+                    markDispatch();
+                    await selected.setFiles(files, {
+                      timeout: Math.max(1, expires - Date.now()),
+                    });
+                    await click;
+                  } finally {
+                    await input.dispose().catch(() => {});
+                  }
                 } finally {
-                  await input.dispose().catch(() => {});
+                  page.off("filechooser", onChooser);
+                  if (timer) clearTimeout(timer);
+                  if (onAbort)
+                    uploadSignal.removeEventListener("abort", onAbort);
                 }
-              } finally {
-                page.off("filechooser", onChooser);
-                if (timer) clearTimeout(timer);
-                if (onAbort) signal?.removeEventListener("abort", onAbort);
+              } else {
+                markDispatch();
+                await element.setInputFiles(files, {
+                  timeout: Math.max(1, expires - Date.now()),
+                });
               }
-            } else {
-              await element.setInputFiles(files, {
-                timeout: Math.max(1, expires - Date.now()),
-              });
+              return {
+                target: resolved,
+                action: "upload",
+                status: "completed",
+                files: files.length,
+                bytes: total,
+                ...(staged
+                  ? {
+                      staging: {
+                        path: staged.root,
+                        status: "retained_until_browser_close",
+                      },
+                    }
+                  : {}),
+                note: "File input was set; application processing is not independently verified.",
+              };
+            } catch (error) {
+              if (args.mode === "chooser")
+                void this.dispose(session).catch(() => {});
+              return {
+                target: resolved,
+                action: "upload",
+                status: "possibly_dispatched",
+                note: "Upload may have occurred; no automatic retry was made.",
+                failure: String(error).slice(0, 300),
+                failureTruncated: String(error).length > 300,
+                ...(staged && dispatched
+                  ? {
+                      staging: {
+                        path: staged.root,
+                        status: "retained_until_browser_close",
+                      },
+                    }
+                  : {}),
+              };
             }
-            return {
-              target: resolved,
-              action: "upload",
-              status: "completed",
-              files: files.length,
-              bytes: total,
-              note: "File input was set; application processing is not independently verified.",
-            };
-          } catch (error) {
-            if (args.mode === "chooser")
-              void this.dispose(session).catch(() => {});
-            return {
-              target: resolved,
-              action: "upload",
-              status: "possibly_dispatched",
-              note: "Upload may have occurred; no automatic retry was made.",
-              failure: String(error).slice(0, 300),
-            };
+          } finally {
+            try {
+              if (staged && !dispatched) {
+                try {
+                  await staged.cleanup();
+                  this.uploadRecoveryEntries.delete(staged.root);
+                } catch (error) {
+                  this.uploadRecoveryEntries.set(staged.root, {
+                    owner,
+                    sessionId: session.id,
+                    status: "cleanup_failed",
+                  });
+                  throw new Error(
+                    `Upload was not dispatched but staging cleanup failed; retained at ${staged.root}: ${String(error)}`,
+                    { cause: error },
+                  );
+                }
+              }
+            } finally {
+              finishPreparation?.();
+            }
           }
         } finally {
           if (temporary) await element.dispose().catch(() => {});
@@ -3152,6 +3516,7 @@ export class ManagedSessions {
         operation.result = {
           status: "failed",
           error: String(error).slice(0, 300),
+          errorTruncated: String(error).length > 300,
         };
         operation.settled = true;
       },
@@ -3211,7 +3576,9 @@ export class ManagedSessions {
         id: pending.id,
         type: pending.dialog.type(),
         message: pending.dialog.message().slice(0, 1000),
+        messageTruncated: pending.dialog.message().length > 1000,
         defaultValue: pending.dialog.defaultValue().slice(0, 1000),
+        defaultValueTruncated: pending.dialog.defaultValue().length > 1000,
         operationId: pending.operationId ?? null,
         note: "This is the last observed dialog; it may have been dismissed externally. Use refresh for uncertainty and cleanup options.",
       };
@@ -3372,12 +3739,8 @@ export class ManagedSessions {
     if (resolved.session.headless)
       throw new Error("Human picker requires a visible owned session.");
     const maxSelections = options.maxSelections ?? 1;
-    if (
-      !Number.isInteger(maxSelections) ||
-      maxSelections < 1 ||
-      maxSelections > 20
-    )
-      throw new Error("maxSelections must be between 1 and 20.");
+    if (!Number.isSafeInteger(maxSelections) || maxSelections < 1)
+      throw new Error("maxSelections must be a positive safe integer.");
     // Picker teardown owns cancellation. Uncertain failures quarantine synchronously
     // before the session serialization lock is released.
     return this.run(resolved.session, undefined, async () => {
@@ -3523,36 +3886,11 @@ export class ManagedSessions {
                         ]
                       : ["omission details unavailable"],
               };
-            }) as (
-              | { metadataOmitted: true }
-              | {
-                  tag: string;
-                  id: string;
-                  classes: string[];
-                  text: string;
-                  parent: {
-                    tag: string;
-                    id: string;
-                    classes: string[];
-                    relation: "parent" | "shadow-host";
-                  } | null;
-                  summary: string | null;
-                  summaryTruncated: boolean;
-                  summaryOmissions: string[];
-                }
-            )[],
+            }),
             omittedSelectionMetadata: 0,
             actionable: false,
             note: "Selection metadata only; no actionable reference is available. The summary is synthetic, not original HTML or a selector. Form-control values are excluded, but arbitrary page text or attributes may contain secrets despite best-effort redaction.",
           };
-          for (
-            let i = output.selections.length - 1;
-            i >= 0 && Buffer.byteLength(JSON.stringify(output), "utf8") > 15000;
-            i--
-          ) {
-            output.selections[i] = { metadataOmitted: true };
-            output.omittedSelectionMetadata++;
-          }
           return output;
         } catch (error) {
           void this.dispose(resolved.session).catch(() => {});
@@ -3704,6 +4042,7 @@ export class ManagedSessions {
         operation.result = {
           status: "failed",
           error: String(error).slice(0, 500),
+          errorTruncated: String(error).length > 500,
           note: "Evaluation may have run; no replay was attempted.",
         };
         operation.settled = true;
@@ -3719,6 +4058,10 @@ export class ManagedSessions {
   ) {
     this.check(signal);
     const { session, page, target: resolved } = this.getPage(target, owner);
+    if (this.downloads?.closeRisks?.(session.artifactOwner, session.id).length)
+      throw new Error(
+        "Tab close blocked: downloads are active or native recovery bytes are unexported. Wait or export_native first; no close was started.",
+      );
     let notify!: (value: unknown) => void;
     const awaiting = new Promise<unknown>((resolve) => {
       notify = resolve;
@@ -3787,9 +4130,16 @@ export class ManagedSessions {
     timeout = 5_000,
     signal?: AbortSignal,
     owner?: string,
+    abandonDownloads = false,
   ): Promise<void> {
     this.check(signal);
     const session = this.getSession(sessionId, owner);
+    const downloadRisks =
+      this.downloads?.closeRisks?.(session.artifactOwner, session.id) ?? [];
+    if (!abandonDownloads && downloadRisks.length)
+      throw new Error(
+        `Browser stop blocked: ${downloadRisks.length} download(s) are active or have unexported native recovery bytes. Inspect browser_download list, wait or export_native first, or explicitly set abandonDownloads=true to accept possible loss. No close was started.`,
+      );
     const closing = this.track(this.dispose(session));
     let timer: ReturnType<typeof setTimeout> | undefined;
     let onAbort: (() => void) | undefined;
@@ -3800,7 +4150,7 @@ export class ManagedSessions {
           onAbort = () => {
             reject(
               new Error(
-                "Browser close cancelled; owned session cleanup remains pending.",
+                `Browser close cancelled; owned session cleanup remains pending. Upload recovery: ${JSON.stringify(this.uploadRecovery(session.artifactOwner))}`,
               ),
             );
           };
@@ -3812,7 +4162,7 @@ export class ManagedSessions {
             () =>
               reject(
                 new Error(
-                  "Browser close deadline exceeded; cleanup is still pending.",
+                  `Browser close deadline exceeded; cleanup is still pending. Upload recovery: ${JSON.stringify(this.uploadRecovery(session.artifactOwner))}`,
                 ),
               ),
             timeout,
@@ -3826,7 +4176,18 @@ export class ManagedSessions {
   }
 
   /** Invalidates all IDs synchronously. Late startups are also closed when they resolve. */
-  async shutdown(timeout = 5_000): Promise<{ complete: boolean }> {
+  async shutdown(
+    timeout = 5_000,
+    owner?: string,
+  ): Promise<{
+    complete: boolean;
+    uploadRecovery?: ReturnType<ManagedSessions["uploadRecovery"]>;
+    downloadRisk?: ReturnType<DownloadManager["closeRisks"]>;
+  }> {
+    const allDownloadRisks = this.downloads?.closeRisks?.() ?? [];
+    const ownerDownloadRisks = owner
+      ? (this.downloads?.closeRisks?.(owner) ?? [])
+      : [];
     this.closed = true;
     this.attachmentStop.abort();
     const attachments = [...this.attachments.values()];
@@ -3859,6 +4220,12 @@ export class ManagedSessions {
         !this.cleanupFailed &&
         !this.attachmentCleanupUnverified &&
         !this.launchCleanupUnverified &&
+        allDownloadRisks.length === 0 &&
+        ![...this.uploadRecoveryEntries.values()].some(
+          (item) =>
+            item.status === "cleanup_failed" ||
+            item.status === "closure_unknown",
+        ) &&
         results.every((result) => result.status === "fulfilled") &&
         external.every(
           (result) => result.status === "fulfilled" && !result.value.uncertain,
@@ -3870,6 +4237,14 @@ export class ManagedSessions {
     });
     const complete = await Promise.race([all, expired]);
     if (timer) clearTimeout(timer);
-    return { complete };
+    return {
+      complete,
+      ...(owner
+        ? {
+            uploadRecovery: this.uploadRecovery(owner),
+            downloadRisk: ownerDownloadRisks,
+          }
+        : {}),
+    };
   }
 }

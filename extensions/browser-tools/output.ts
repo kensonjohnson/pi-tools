@@ -12,6 +12,7 @@ export async function inspectionOutput(
   text: string,
   metadata: Record<string, unknown>,
   signal?: AbortSignal,
+  options?: { forceArtifact?: boolean },
 ): Promise<string> {
   if (signal?.aborted) throw new Error("Artifact operation cancelled.");
   if (!text.isWellFormed())
@@ -19,7 +20,7 @@ export async function inspectionOutput(
       "Result contains unpaired UTF-16 surrogates and cannot be represented losslessly as UTF-8.",
     );
   const bytes = Buffer.byteLength(text, "utf8");
-  if (bytes <= INLINE_LIMIT) {
+  if (!options?.forceArtifact && bytes <= INLINE_LIMIT) {
     const inline = {
       ...metadata,
       encoding: "utf-8",

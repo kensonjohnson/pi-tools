@@ -40,13 +40,30 @@ export type SemanticSnapshot = {
   records: SemanticRecord[];
   omitted: string[];
 };
-type Entry = { handle: ElementHandle; frame: Frame; fingerprint: string };
+type IdentityBudget = {
+  nameChars: number;
+  textChars: number;
+  nodes: number;
+  ancestors: number;
+  frameDepth: number;
+  metadataChars: number;
+  labels: number;
+};
+type Entry = {
+  handle: ElementHandle;
+  frame: Frame;
+  fingerprint: string;
+  identity: IdentityBudget;
+};
 
-function frameVisible(el: Element): boolean {
-  if (!el.isConnected) return false;
+function frameVisible(
+  el: Element,
+  maxAncestors: number,
+): "visible" | "hidden" | "ancestor_limit" {
+  if (!el.isConnected) return "hidden";
   let current: Element | null = el;
   let depth = 0;
-  while (current && depth++ < 128) {
+  while (current && depth++ < maxAncestors) {
     const style = getComputedStyle(current);
     if (
       current.hasAttribute("hidden") ||
@@ -56,31 +73,32 @@ function frameVisible(el: Element): boolean {
       style.visibility === "hidden" ||
       style.visibility === "collapse"
     )
-      return false;
+      return "hidden";
     const root = current.getRootNode();
     current =
       current.parentElement ?? (root instanceof ShadowRoot ? root.host : null);
   }
-  return current === null;
+  return current === null ? "visible" : "ancestor_limit";
 }
-async function visibleFrameChain(frame: Frame): Promise<boolean> {
+async function visibleFrameChain(
+  frame: Frame,
+  identity: IdentityBudget,
+): Promise<"visible" | "hidden" | "ancestor_limit" | "frame_limit"> {
   let current: Frame | null = frame;
   let depth = 0;
   while (current?.parentFrame()) {
-    if (++depth > 32) return false;
+    if (++depth > identity.frameDepth) return "frame_limit";
     const element = await current.frameElement();
     try {
-      if (
-        !(await element.isVisible()) ||
-        !(await element.evaluate(frameVisible))
-      )
-        return false;
+      if (!(await element.isVisible())) return "hidden";
+      const state = await element.evaluate(frameVisible, identity.ancestors);
+      if (state !== "visible") return state;
     } finally {
       await element.dispose();
     }
     current = current.parentFrame();
   }
-  return true;
+  return "visible";
 }
 
 // This runs as one renderer task: the metadata and node references describe the
@@ -90,6 +108,8 @@ function collect(args: {
   nodes: number;
   records: number;
   chars: number;
+  scopeNodes: number;
+  identity: IdentityBudget;
 }) {
   const native = (f: unknown) =>
     typeof f === "function" &&
@@ -137,7 +157,7 @@ function collect(args: {
       let current: Node | null = document.documentElement;
       let inspected = 0;
       while (current) {
-        if (++inspected > 20000)
+        if (++inspected > args.scopeNodes)
           throw new Error(
             "Scope resolution node limit exceeded; use an exact ID or DOM inspection.",
           );
@@ -159,7 +179,7 @@ function collect(args: {
       parent;
       parent = parent.parentElement
     ) {
-      if (++parentDepth > 128)
+      if (++parentDepth > args.identity.ancestors)
         throw new Error("Scope ancestor limit exceeded.");
       const style = getComputedStyle(parent);
       if (
@@ -173,11 +193,13 @@ function collect(args: {
         throw new Error("Scope is hidden.");
     }
   }
+  // Incomplete names cannot safely bind a reference to semantic identity.
+  let incompleteIdentity = false;
   // Read visible text without collecting form values or script text.
   const visibleText = (element: Element): string => {
     let ancestor: Element | null = element;
     let depth = 0;
-    while (ancestor && depth++ < 128) {
+    while (ancestor && depth++ < args.identity.ancestors) {
       const style = getComputedStyle(ancestor);
       if (
         ancestor.hasAttribute("hidden") ||
@@ -193,14 +215,25 @@ function collect(args: {
         ancestor.parentElement ??
         (root instanceof ShadowRoot ? root.host : null);
     }
-    if (ancestor) return "";
+    if (ancestor) {
+      incompleteIdentity = true;
+      return "";
+    }
     const pending: Node[] = [element];
     let text = "",
       visited = 0;
-    while (pending.length && visited++ < 200 && text.length < 500) {
+    while (
+      pending.length &&
+      visited++ < args.identity.nodes &&
+      text.length < args.identity.textChars
+    ) {
       const node = pending.pop()!;
       if (node.nodeType === Node.TEXT_NODE) {
-        text += ` ${(node.nodeValue || "").slice(0, 501 - text.length)}`;
+        const value = node.nodeValue || "";
+        const part = ` ${value}`;
+        const remaining = args.identity.textChars - text.length;
+        if (part.length > remaining) incompleteIdentity = true;
+        text += part.slice(0, remaining);
         continue;
       }
       if (node.nodeType !== Node.ELEMENT_NODE) continue;
@@ -227,18 +260,20 @@ function collect(args: {
         style.visibility === "collapse"
       )
         continue;
-      for (
-        let child = item.lastChild;
-        child && pending.length < 200;
-        child = child.previousSibling
-      )
+      for (let child = item.lastChild; child; child = child.previousSibling) {
+        if (pending.length >= args.identity.nodes) {
+          incompleteIdentity = true;
+          break;
+        }
         pending.push(child);
+      }
     }
+    if (pending.length) incompleteIdentity = true;
     return text;
   };
   const attr = (el: Element, name: string) => {
     const value = el.getAttribute(name);
-    if (value !== null && value.length > 1024)
+    if (value !== null && value.length > args.identity.metadataChars)
       throw new Error(
         `Snapshot ${name} metadata exceeds limit; narrow or inspect with DOM.`,
       );
@@ -258,6 +293,7 @@ function collect(args: {
     truncated = false,
     clipped = 0,
     oversized = 0,
+    incompleteNames = 0,
     visual = false;
   const stack: { node: Node; suppressText: boolean }[] = root
     ? [{ node: root, suppressText: false }]
@@ -309,7 +345,8 @@ function collect(args: {
     // subtree rather than retaining a reference that cannot be revalidated.
     if (
       ["role", "aria-labelledby", "aria-label", "alt", "title", "href"].some(
-        (name) => (el.getAttribute(name)?.length ?? 0) > 1024,
+        (name) =>
+          (el.getAttribute(name)?.length ?? 0) > args.identity.metadataChars,
       )
     ) {
       oversized++;
@@ -338,9 +375,37 @@ function collect(args: {
                     : "textbox"
                   : "");
     if (role) {
+      incompleteIdentity = false;
+      let identityAncestor: Element | null = el;
+      let identityDepth = 0;
+      while (identityAncestor) {
+        if (++identityDepth > args.identity.ancestors) {
+          incompleteIdentity = true;
+          break;
+        }
+        const ancestorStyle = getComputedStyle(identityAncestor);
+        if (
+          identityAncestor.hasAttribute("hidden") ||
+          identityAncestor.getAttribute("aria-hidden") === "true" ||
+          ancestorStyle.display === "none" ||
+          ancestorStyle.contentVisibility === "hidden" ||
+          ancestorStyle.visibility === "hidden" ||
+          ancestorStyle.visibility === "collapse"
+        ) {
+          incompleteIdentity = true;
+          break;
+        }
+        const ancestorRoot = identityAncestor.getRootNode();
+        identityAncestor =
+          identityAncestor.parentElement ??
+          (ancestorRoot instanceof ShadowRoot ? ancestorRoot.host : null);
+      }
       const labelled = attr(el, "aria-labelledby");
       const ids = labelled ? labelled.trim().split(/\s+/) : [];
-      if (ids.length > 16 || (input?.labels?.length ?? 0) > 16) {
+      if (
+        ids.length > args.identity.labels ||
+        (input?.labels?.length ?? 0) > args.identity.labels
+      ) {
         oversized++;
         continue;
       }
@@ -366,15 +431,23 @@ function collect(args: {
         attr(el, "alt") ||
         attr(el, "title") ||
         (safeValues && input && ["submit", "button", "reset"].includes(type)
-          ? String(valueGetter!.call(input)).slice(0, 1024)
+          ? (() => {
+              const value = String(valueGetter!.call(input));
+              if (value.length > args.identity.metadataChars)
+                incompleteIdentity = true;
+              return value.slice(0, args.identity.metadataChars);
+            })()
           : "") ||
         visibleText(el) ||
         ""
       )
         .replace(/\s+/g, " ")
         .trim();
-      if (rawName.length > 240) clipped++;
-      const name = rawName.slice(0, 240);
+      if (rawName.length > args.identity.nameChars) {
+        clipped++;
+        incompleteIdentity = true;
+      }
+      const name = rawName.slice(0, args.identity.nameChars);
       const fingerprint = JSON.stringify([
         tag,
         type,
@@ -383,11 +456,11 @@ function collect(args: {
         attr(el, "href"),
       ]);
       const record: (typeof records)[number] = {
-        node: el,
+        ...(incompleteIdentity ? {} : { node: el, fingerprint }),
         role,
         name,
-        fingerprint,
       };
+      if (incompleteIdentity) incompleteNames++;
       const boundedValue = (value: string) => {
         if (value.length > 240) clipped++;
         return value.slice(0, 240);
@@ -453,6 +526,7 @@ function collect(args: {
     pending: stack.length,
     clipped,
     oversized,
+    incompleteNames,
     idScope,
     visual,
     safeValues,
@@ -494,34 +568,50 @@ export class SemanticSnapshots {
       maxNodes?: number;
       maxRecords?: number;
       maxChars?: number;
+      maxFrames?: number;
+      maxScopeNodes?: number;
+      identityNameChars?: number;
+      identityTextChars?: number;
+      identityNodes?: number;
+      identityAncestors?: number;
+      identityFrameDepth?: number;
+      identityMetadataChars?: number;
+      identityLabels?: number;
     } = {},
   ): Promise<SemanticSnapshot> {
     await this.clear();
     if (this.closed) throw new Error("Snapshot owner is closed");
-    if (options.selector && options.selector.length > 1024)
-      throw new Error("Scope selector exceeds limit.");
     const generation = this.generation;
     for (const value of [
       options.maxNodes,
       options.maxRecords,
       options.maxChars,
+      options.maxFrames,
+      options.maxScopeNodes,
+      options.identityNameChars,
+      options.identityTextChars,
+      options.identityNodes,
+      options.identityAncestors,
+      options.identityFrameDepth,
+      options.identityMetadataChars,
+      options.identityLabels,
     ])
-      if (value !== undefined && (!Number.isFinite(value) || value < 1))
-        throw new Error("Snapshot limits must be positive finite numbers.");
+      if (value !== undefined && (!Number.isSafeInteger(value) || value < 1))
+        throw new Error("Snapshot limits must be positive safe integers.");
     if (options.maxChars !== undefined && options.maxChars < 512)
       throw new Error("Snapshot output budget must be at least 512 bytes.");
-    const nodes = Math.max(
-      1,
-      Math.min(5000, Math.floor(options.maxNodes ?? 2000)),
-    );
-    const maxRecords = Math.max(
-      1,
-      Math.min(300, Math.floor(options.maxRecords ?? 100)),
-    );
-    const chars = Math.max(
-      512,
-      Math.min(32000, Math.floor(options.maxChars ?? 12000)),
-    );
+    const identity: IdentityBudget = {
+      nameChars: options.identityNameChars ?? 240,
+      textChars: options.identityTextChars ?? 500,
+      nodes: options.identityNodes ?? 200,
+      ancestors: options.identityAncestors ?? 128,
+      frameDepth: options.identityFrameDepth ?? 32,
+      metadataChars: options.identityMetadataChars ?? 1024,
+      labels: options.identityLabels ?? 16,
+    };
+    const nodes = Math.max(1, Math.floor(options.maxNodes ?? 2000));
+    const maxRecords = Math.max(1, Math.floor(options.maxRecords ?? 100));
+    const chars = Math.max(512, Math.floor(options.maxChars ?? 12000));
     const title = await this.page.evaluate(() => ({
       value: document.title.slice(0, 500),
       truncated: document.title.length > 500,
@@ -557,7 +647,8 @@ export class SemanticSnapshots {
         "Scoped capture excludes child frames; inspect a frame explicitly.",
       );
     try {
-      for (const frame of frames.slice(0, 32)) {
+      const maxFrames = options.maxFrames ?? 32;
+      for (const frame of frames.slice(0, maxFrames)) {
         if (result.records.length >= maxRecords) {
           result.omitted.push(
             "Record limit reached; inspect a narrower scope.",
@@ -566,8 +657,15 @@ export class SemanticSnapshots {
         }
         if (frame !== this.page.mainFrame()) {
           try {
-            if (!(await visibleFrameChain(frame))) {
-              result.omitted.push("1 hidden frame omitted.");
+            const state = await visibleFrameChain(frame, identity);
+            if (state !== "visible") {
+              result.omitted.push(
+                state === "hidden"
+                  ? "1 hidden frame omitted."
+                  : state === "frame_limit"
+                    ? "1 frame omitted: frame ancestry budget exceeded."
+                    : "1 frame omitted: visibility ancestor budget exceeded.",
+              );
               continue;
             }
           } catch (error) {
@@ -583,6 +681,8 @@ export class SemanticSnapshots {
             nodes,
             records: maxRecords - result.records.length,
             chars,
+            scopeNodes: options.maxScopeNodes ?? 20000,
+            identity,
           });
         } catch (error) {
           if (options.frame || frame === this.page.mainFrame()) throw error;
@@ -596,6 +696,9 @@ export class SemanticSnapshots {
           const pending = await props.get("pending")!.jsonValue();
           const clipped = await props.get("clipped")!.jsonValue();
           const oversized = await props.get("oversized")!.jsonValue();
+          const incompleteNames = await props
+            .get("incompleteNames")!
+            .jsonValue();
           const idScope = await props.get("idScope")!.jsonValue();
           const visual = await props.get("visual")!.jsonValue();
           const safe = await props.get("safeValues")!.jsonValue();
@@ -607,13 +710,17 @@ export class SemanticSnapshots {
             result.omitted.push(
               `${oversized} subtrees omitted because metadata or label count exceeds limits; use DOM inspection.`,
             );
+          if (incompleteNames)
+            result.omitted.push(
+              `${incompleteNames} semantic names were incomplete or visibility ancestry could not be fully verified; their records have no actionable reference.`,
+            );
           if (idScope)
             result.omitted.push(
               "Exact ID scope uses the first match; duplicate IDs are not checked.",
             );
           if (clipped)
             result.omitted.push(
-              `${clipped} text, name or value fields clipped to 240 characters.`,
+              `${clipped} text, name or value fields clipped to their display or identity limits.`,
             );
           if (visual)
             result.omitted.push(
@@ -655,6 +762,7 @@ export class SemanticSnapshots {
                 handle: node,
                 frame,
                 fingerprint: data.fingerprint,
+                identity,
               });
             }
             delete data.fingerprint;
@@ -672,9 +780,9 @@ export class SemanticSnapshots {
           await root.dispose();
         }
       }
-      if (frames.length > 32)
+      if (frames.length > maxFrames)
         result.omitted.push(
-          `Frame limit reached; ${frames.length - 32} frames omitted.`,
+          `Frame limit reached; ${frames.length - maxFrames} frames omitted.`,
         );
       // Preserve the two coverage caveats and summarize excessive frame/gap notices.
       const idNotice =
@@ -709,19 +817,31 @@ export class SemanticSnapshots {
             `${omittedNotices} additional omission notices suppressed to fit the budget.`;
         }
       }
-      let removedCount = 0;
-      while (
-        result.records.length &&
-        Buffer.byteLength(JSON.stringify(result), "utf8") > chars
+      if (
+        Buffer.byteLength(JSON.stringify(result), "utf8") > chars &&
+        result.records.length
       ) {
-        const removed = result.records.pop()!;
-        const entry = removed.ref ? this.entries.get(removed.ref) : undefined;
-        if (removed.ref) this.entries.delete(removed.ref);
-        await entry?.handle.dispose();
-        removedCount++;
-        const notice = `Output limit reached; ${removedCount} records omitted. Inspect a narrower scope.`;
-        if (removedCount === 1) result.omitted.push(notice);
-        else result.omitted[result.omitted.length - 1] = notice;
+        const all = result.records;
+        let lo = 0,
+          hi = all.length - 1;
+        result.omitted.push("");
+        while (lo < hi) {
+          const mid = Math.ceil((lo + hi) / 2);
+          result.records = all.slice(0, mid);
+          result.omitted[result.omitted.length - 1] =
+            `Output limit reached; ${all.length - mid} records omitted. Inspect a narrower scope.`;
+          if (Buffer.byteLength(JSON.stringify(result), "utf8") <= chars)
+            lo = mid;
+          else hi = mid - 1;
+        }
+        result.records = all.slice(0, lo);
+        result.omitted[result.omitted.length - 1] =
+          `Output limit reached; ${all.length - lo} records omitted. Inspect a narrower scope.`;
+        for (const removed of all.slice(lo)) {
+          const entry = removed.ref ? this.entries.get(removed.ref) : undefined;
+          if (removed.ref) this.entries.delete(removed.ref);
+          await entry?.handle.dispose();
+        }
       }
       if (Buffer.byteLength(JSON.stringify(result), "utf8") > chars)
         throw new Error("Snapshot metadata exceeds output limit.");
@@ -737,166 +857,202 @@ export class SemanticSnapshots {
     const entry = this.entries.get(ref);
     if (!entry || this.closed || entry.frame.isDetached())
       throw new Error("Stale reference; take a new snapshot.");
-    if (!(await visibleFrameChain(entry.frame).catch(() => false)))
+    if (
+      (await visibleFrameChain(entry.frame, entry.identity).catch(
+        () => "hidden",
+      )) !== "visible"
+    )
       throw new Error("Stale reference; take a new snapshot.");
     const valid = await entry.handle
-      .evaluate((el, fingerprint) => {
-        if (!el.isConnected) return false;
-        let depth = 0;
-        for (
-          let current: Element | null = el;
-          current;
-          current =
-            current.parentElement ??
-            (current.getRootNode() instanceof ShadowRoot
-              ? (current.getRootNode() as ShadowRoot).host
-              : null)
-        ) {
-          if (++depth > 128) return false;
-          const style = getComputedStyle(current);
+      .evaluate(
+        (el, { fingerprint, identity }) => {
+          if (!el.isConnected) return false;
+          let depth = 0;
+          for (
+            let current: Element | null = el;
+            current;
+            current =
+              current.parentElement ??
+              (current.getRootNode() instanceof ShadowRoot
+                ? (current.getRootNode() as ShadowRoot).host
+                : null)
+          ) {
+            if (++depth > identity.ancestors) return false;
+            const style = getComputedStyle(current);
+            if (
+              current.hasAttribute("hidden") ||
+              current.getAttribute("aria-hidden") === "true" ||
+              style.contentVisibility === "hidden" ||
+              style.display === "none" ||
+              style.visibility === "hidden" ||
+              style.visibility === "collapse"
+            )
+              return false;
+          }
+          const tag = el.tagName.toLowerCase();
+          const input = tag === "input" ? (el as HTMLInputElement) : null;
+          const type = input?.type.toLowerCase() || "";
+          const attr = (name: string) => {
+            const value = el.getAttribute(name);
+            if (value !== null && value.length > identity.metadataChars)
+              throw new Error("Metadata exceeds limit");
+            return value;
+          };
+          const role =
+            attr("role") ||
+            (tag === "button"
+              ? "button"
+              : tag === "a" && el.hasAttribute("href")
+                ? "link"
+                : /^h[1-6]$/.test(tag)
+                  ? "heading"
+                  : tag === "textarea"
+                    ? "textbox"
+                    : tag === "select"
+                      ? "combobox"
+                      : input
+                        ? [
+                            "checkbox",
+                            "radio",
+                            "button",
+                            "submit",
+                            "reset",
+                          ].includes(type)
+                          ? type === "submit" || type === "reset"
+                            ? "button"
+                            : type
+                          : "textbox"
+                        : "");
+          let incompleteIdentity = false;
+          const visibleText = (element: Element): string => {
+            let ancestor: Element | null = element;
+            let depth = 0;
+            while (ancestor && depth++ < identity.ancestors) {
+              const style = getComputedStyle(ancestor);
+              if (
+                ancestor.hasAttribute("hidden") ||
+                ancestor.getAttribute("aria-hidden") === "true" ||
+                style.display === "none" ||
+                style.contentVisibility === "hidden" ||
+                style.visibility === "hidden" ||
+                style.visibility === "collapse"
+              )
+                return "";
+              const root = ancestor.getRootNode();
+              ancestor =
+                ancestor.parentElement ??
+                (root instanceof ShadowRoot ? root.host : null);
+            }
+            if (ancestor) {
+              incompleteIdentity = true;
+              return "";
+            }
+            const pending: Node[] = [element];
+            let text = "",
+              visited = 0;
+            while (
+              pending.length &&
+              visited++ < identity.nodes &&
+              text.length < identity.textChars
+            ) {
+              const node = pending.pop()!;
+              if (node.nodeType === Node.TEXT_NODE) {
+                const value = node.nodeValue || "";
+                const part = ` ${value}`;
+                const remaining = identity.textChars - text.length;
+                if (part.length > remaining) incompleteIdentity = true;
+                text += part.slice(0, remaining);
+                continue;
+              }
+              if (node.nodeType !== Node.ELEMENT_NODE) continue;
+              const item = node as Element;
+              if (
+                [
+                  "SCRIPT",
+                  "STYLE",
+                  "NOSCRIPT",
+                  "TEMPLATE",
+                  "INPUT",
+                  "TEXTAREA",
+                  "SELECT",
+                ].includes(item.tagName)
+              )
+                continue;
+              const style = getComputedStyle(item);
+              if (
+                item.hasAttribute("hidden") ||
+                item.getAttribute("aria-hidden") === "true" ||
+                style.contentVisibility === "hidden" ||
+                style.display === "none" ||
+                style.visibility === "hidden" ||
+                style.visibility === "collapse"
+              )
+                continue;
+              for (
+                let child = item.lastChild;
+                child;
+                child = child.previousSibling
+              ) {
+                if (pending.length >= identity.nodes) {
+                  incompleteIdentity = true;
+                  break;
+                }
+                pending.push(child);
+              }
+            }
+            if (pending.length) incompleteIdentity = true;
+            return text;
+          };
+          const labelled = attr("aria-labelledby");
+          const ids = labelled ? labelled.trim().split(/\s+/) : [];
           if (
-            current.hasAttribute("hidden") ||
-            current.getAttribute("aria-hidden") === "true" ||
-            style.contentVisibility === "hidden" ||
-            style.display === "none" ||
-            style.visibility === "hidden" ||
-            style.visibility === "collapse"
+            ids.length > identity.labels ||
+            (input?.labels?.length ?? 0) > identity.labels
           )
             return false;
-        }
-        const tag = el.tagName.toLowerCase();
-        const input = tag === "input" ? (el as HTMLInputElement) : null;
-        const type = input?.type.toLowerCase() || "";
-        const attr = (name: string) => {
-          const value = el.getAttribute(name);
-          if (value !== null && value.length > 1024)
-            throw new Error("Metadata exceeds limit");
-          return value;
-        };
-        const role =
-          attr("role") ||
-          (tag === "button"
-            ? "button"
-            : tag === "a" && el.hasAttribute("href")
-              ? "link"
-              : /^h[1-6]$/.test(tag)
-                ? "heading"
-                : tag === "textarea"
-                  ? "textbox"
-                  : tag === "select"
-                    ? "combobox"
-                    : input
-                      ? [
-                          "checkbox",
-                          "radio",
-                          "button",
-                          "submit",
-                          "reset",
-                        ].includes(type)
-                        ? type === "submit" || type === "reset"
-                          ? "button"
-                          : type
-                        : "textbox"
-                      : "");
-        const visibleText = (element: Element): string => {
-          let ancestor: Element | null = element;
-          let depth = 0;
-          while (ancestor && depth++ < 128) {
-            const style = getComputedStyle(ancestor);
-            if (
-              ancestor.hasAttribute("hidden") ||
-              ancestor.getAttribute("aria-hidden") === "true" ||
-              style.display === "none" ||
-              style.contentVisibility === "hidden" ||
-              style.visibility === "hidden" ||
-              style.visibility === "collapse"
-            )
-              return "";
-            const root = ancestor.getRootNode();
-            ancestor =
-              ancestor.parentElement ??
-              (root instanceof ShadowRoot ? root.host : null);
-          }
-          if (ancestor) return "";
-          const pending: Node[] = [element];
-          let text = "",
-            visited = 0;
-          while (pending.length && visited++ < 200 && text.length < 500) {
-            const node = pending.pop()!;
-            if (node.nodeType === Node.TEXT_NODE) {
-              text += ` ${(node.nodeValue || "").slice(0, 501 - text.length)}`;
-              continue;
-            }
-            if (node.nodeType !== Node.ELEMENT_NODE) continue;
-            const item = node as Element;
-            if (
-              [
-                "SCRIPT",
-                "STYLE",
-                "NOSCRIPT",
-                "TEMPLATE",
-                "INPUT",
-                "TEXTAREA",
-                "SELECT",
-              ].includes(item.tagName)
-            )
-              continue;
-            const style = getComputedStyle(item);
-            if (
-              item.hasAttribute("hidden") ||
-              item.getAttribute("aria-hidden") === "true" ||
-              style.contentVisibility === "hidden" ||
-              style.display === "none" ||
-              style.visibility === "hidden" ||
-              style.visibility === "collapse"
-            )
-              continue;
-            for (
-              let child = item.lastChild;
-              child && pending.length < 200;
-              child = child.previousSibling
-            )
-              pending.push(child);
-          }
-          return text;
-        };
-        const labelled = attr("aria-labelledby");
-        const ids = labelled ? labelled.trim().split(/\s+/) : [];
-        if (ids.length > 16 || (input?.labels?.length ?? 0) > 16) return false;
-        const root = el.getRootNode();
-        const labelText = ids
-          .map((id) => {
-            const label =
-              root instanceof Document || root instanceof ShadowRoot
-                ? root.getElementById(id)
-                : null;
-            return label ? visibleText(label) : "";
-          })
-          .join(" ");
-        const labels = input?.labels
-          ? Array.from(input.labels)
-              .map((l) => visibleText(l))
-              .join(" ")
-          : "";
-        const name = (
-          attr("aria-label") ||
-          labelText ||
-          labels ||
-          attr("alt") ||
-          attr("title") ||
-          (input && ["submit", "button", "reset"].includes(type)
-            ? input.value.slice(0, 1024)
-            : "") ||
-          visibleText(el) ||
-          ""
-        )
-          .replace(/\s+/g, " ")
-          .trim()
-          .slice(0, 240);
-        return (
-          JSON.stringify([tag, type, role, name, attr("href")]) === fingerprint
-        );
-      }, entry.fingerprint)
+          const root = el.getRootNode();
+          const labelText = ids
+            .map((id) => {
+              const label =
+                root instanceof Document || root instanceof ShadowRoot
+                  ? root.getElementById(id)
+                  : null;
+              return label ? visibleText(label) : "";
+            })
+            .join(" ");
+          const labels = input?.labels
+            ? Array.from(input.labels)
+                .map((l) => visibleText(l))
+                .join(" ")
+            : "";
+          const rawName = (
+            attr("aria-label") ||
+            labelText ||
+            labels ||
+            attr("alt") ||
+            attr("title") ||
+            (input && ["submit", "button", "reset"].includes(type)
+              ? (() => {
+                  const value = input.value;
+                  if (value.length > identity.metadataChars)
+                    incompleteIdentity = true;
+                  return value.slice(0, identity.metadataChars);
+                })()
+              : "") ||
+            visibleText(el) ||
+            ""
+          )
+            .replace(/\s+/g, " ")
+            .trim();
+          if (incompleteIdentity || rawName.length > identity.nameChars)
+            return false;
+          return (
+            JSON.stringify([tag, type, role, rawName, attr("href")]) ===
+            fingerprint
+          );
+        },
+        { fingerprint: entry.fingerprint, identity: entry.identity },
+      )
       .catch(() => false);
     if (!valid || this.entries.get(ref) !== entry)
       throw new Error("Stale reference; take a new snapshot.");

@@ -203,12 +203,8 @@ export async function pickHumanElement(options: {
 }): Promise<PickerResult> {
   const { page, browser, signal, finishSignal, onUncertainFailure } = options;
   const maxSelections = options.maxSelections ?? 1;
-  if (
-    !Number.isInteger(maxSelections) ||
-    maxSelections < 1 ||
-    maxSelections > 20
-  )
-    throw new RangeError("maxSelections must be an integer from 1 to 20");
+  if (!Number.isSafeInteger(maxSelections) || maxSelections < 1)
+    throw new RangeError("maxSelections must be a positive safe integer");
   const sessions: CDPSession[] = [];
   const subjects = new Map<CDPSession, Page | Frame>();
   const sessionDisconnects = new Map<CDPSession, () => void>();

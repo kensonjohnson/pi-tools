@@ -56,6 +56,55 @@ test("cancellation during artifact publication reports uncertainty and omits lat
   await new Promise((resolve) => setTimeout(resolve, 0));
 });
 
+test("base64 conversion failure returns the saved owner-scoped artifact without leaking details", async () => {
+  const root = await realpath(
+    await mkdtemp(join(tmpdir(), "screenshot-conversion-")),
+  );
+  const png = Buffer.alloc(24);
+  Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(png);
+  png.writeUInt32BE(10, 16);
+  png.writeUInt32BE(10, 20);
+  const expected = png.toString("base64");
+  png.toString = (() => {
+    throw new Error(`private conversion ${root}`);
+  }) as typeof png.toString;
+  const page = {
+    context: () => ({
+      newCDPSession: async () => ({
+        send: async () => ({
+          cssLayoutViewport: { clientWidth: 10, clientHeight: 10 },
+        }),
+        detach: async () => {},
+      }),
+    }),
+    screenshot: async () => png,
+  };
+  const artifacts = new ArtifactStore({ root: join(root, "artifacts") });
+  try {
+    const result = await captureScreenshot({
+      page: page as never,
+      artifacts,
+      owner: "one",
+      scope: "viewport",
+      quarantine: () => {},
+    });
+    assert.equal(result.content.length, 1);
+    const metadata = JSON.parse(result.content[0].text!);
+    assert.equal(metadata.imageOmitted, true);
+    assert.match(metadata.imageOmissionReason, /conversion failed.*artifact/i);
+    assert.ok(metadata.artifact.id);
+    assert.ok(!JSON.stringify(metadata).includes(root));
+    const chunk = await artifacts.readBinary("one", metadata.artifact.id);
+    assert.equal(chunk.data, expected);
+    await assert.rejects(
+      artifacts.readBinary("foreign", metadata.artifact.id),
+      /owned by another/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("real artifact store lock warnings and errors preserve recovery guidance without paths", async () => {
   const root = await realpath(
     await mkdtemp(join(tmpdir(), "screenshot-private-")),
