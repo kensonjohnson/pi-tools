@@ -70,6 +70,14 @@ test("foreground entry points use the current agent and never start the legacy r
     );
     await commands.get("memory-review").handler("", ctx);
     assert.deepEqual(sent, [FOREGROUND_REVIEW_PROMPT]);
+    assert.match(
+      FOREGROUND_REVIEW_PROMPT,
+      /directly verified absent, remove the memory/,
+    );
+    assert.match(
+      FOREGROUND_REVIEW_PROMPT,
+      /rather than retaining a conditional or historical substitute/,
+    );
     const result = await consolidate.execute("", {}, undefined, undefined, ctx);
     assert.equal(result.content[0].text, FOREGROUND_REVIEW_PROMPT);
     assert.equal(result.details.foreground, true);
