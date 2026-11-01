@@ -1,2 +1,4 @@
 node_modules/
 tmp/
+# Preserve ignored indexes from removed code-search installations.
+.pi/code-search/
