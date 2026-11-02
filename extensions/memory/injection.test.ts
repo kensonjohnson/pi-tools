@@ -8,6 +8,7 @@ import extension from "./index.ts";
 
 function session(cwd: string, id: string, trusted = true) {
   const handlers = new Map<string, (event: any, ctx: any) => Promise<any>>();
+  const tools = new Set<string>();
   const pi = {
     events: {
       emit() {},
@@ -18,8 +19,10 @@ function session(cwd: string, id: string, trusted = true) {
     on(name: string, handler: (event: any, ctx: any) => Promise<any>) {
       handlers.set(name, handler);
     },
-    registerTool() {},
-    getActiveTools: () => ["memory_remember", "other"],
+    registerTool(tool: { name: string }) {
+      tools.add(tool.name);
+    },
+    getActiveTools: () => ["memory_remember", "memory_recall", "other"],
     setActiveTools() {},
   };
   extension(pi as unknown as ExtensionAPI);
@@ -29,10 +32,12 @@ function session(cwd: string, id: string, trusted = true) {
     sessionManager: { getSessionId: () => id },
   };
   return {
+    tools,
     async emit(name: string) {
-      const handler = handlers.get(name);
-      assert.ok(handler, `missing ${name} handler`);
-      return handler({}, ctx);
+      return handlers.get(name)?.(
+        { prompt: "test", systemPrompt: "system" },
+        ctx,
+      );
     },
   };
 }
@@ -56,14 +61,7 @@ async function config(dir: string, enabled: boolean) {
   );
 }
 
-function message(result: any): string | undefined {
-  if (!result) return undefined;
-  assert.equal(result.message.customType, "project_memory");
-  assert.equal(result.message.display, false);
-  return result.message.content;
-}
-
-test("knowledge injection follows independent session lifecycles and config precedence", async (t) => {
+test("sessions never inject memory messages, including after compaction", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "pi-memory-injection-"));
   const project = join(root, "project");
   const agent = join(root, "agent");
@@ -78,61 +76,41 @@ test("knowledge injection follows independent session lifecycles and config prec
   await knowledge(project, "Original fact");
   const first = session(project, "same-id");
   const second = session(project, "same-id");
-  assert.match(
-    message(await first.emit("before_agent_start"))!,
-    /Original fact/,
-  );
-  assert.match(
-    message(await second.emit("before_agent_start"))!,
-    /Original fact/,
-  );
+  assert.ok(first.tools.has("memory_recall"));
   assert.equal(await first.emit("before_agent_start"), undefined);
   assert.equal(await second.emit("before_agent_start"), undefined);
-
   await knowledge(project, "Updated fact");
   assert.equal(await first.emit("before_agent_start"), undefined);
-  assert.equal(await second.emit("before_agent_start"), undefined);
   await first.emit("session_compact");
-  const refreshed = message(await first.emit("before_agent_start"))!;
-  assert.match(refreshed, /Updated fact/);
-  assert.doesNotMatch(refreshed, /Original fact/);
+  assert.equal(await first.emit("before_agent_start"), undefined);
   assert.equal(await second.emit("before_agent_start"), undefined);
   await first.emit("session_shutdown");
   await second.emit("session_compact");
-  assert.match(
-    message(await second.emit("before_agent_start"))!,
-    /Updated fact/,
-  );
+  assert.equal(await second.emit("before_agent_start"), undefined);
   await second.emit("session_shutdown");
 
-  // An initially empty briefing stays unchanged until compaction.
   await knowledge(project, "");
   const empty = session(project, "empty");
   assert.equal(await empty.emit("before_agent_start"), undefined);
   await knowledge(project, "New fact");
   assert.equal(await empty.emit("before_agent_start"), undefined);
   await empty.emit("session_compact");
-  assert.match(message(await empty.emit("before_agent_start"))!, /New fact/);
+  assert.equal(await empty.emit("before_agent_start"), undefined);
   await empty.emit("session_shutdown");
 
-  // Trusted project settings override global settings; untrusted settings do not.
-  await config(agent, false);
-  await config(join(project, ".pi"), true);
-  const untrusted = session(project, "untrusted", false);
-  assert.equal(await untrusted.emit("before_agent_start"), undefined);
-  const trusted = session(project, "trusted", true);
-  assert.match(message(await trusted.emit("before_agent_start"))!, /New fact/);
-  await trusted.emit("session_shutdown");
-  await untrusted.emit("session_shutdown");
-  await config(agent, true);
-  await config(join(project, ".pi"), false);
-  const disabled = session(project, "disabled", true);
-  assert.equal(await disabled.emit("before_agent_start"), undefined);
-  const ignoredDisable = session(project, "ignored-disable", false);
-  assert.match(
-    message(await ignoredDisable.emit("before_agent_start"))!,
-    /New fact/,
-  );
-  await disabled.emit("session_shutdown");
-  await ignoredDisable.emit("session_shutdown");
+  // Neither trusted nor ignored settings should enable automatic injection.
+  for (const [globalEnabled, projectEnabled] of [
+    [false, true],
+    [true, false],
+  ]) {
+    await config(agent, globalEnabled);
+    await config(join(project, ".pi"), projectEnabled);
+    for (const trusted of [true, false]) {
+      const current = session(project, `config-${trusted}`, trusted);
+      assert.equal(await current.emit("before_agent_start"), undefined);
+      await current.emit("session_compact");
+      assert.equal(await current.emit("before_agent_start"), undefined);
+      await current.emit("session_shutdown");
+    }
+  }
 });

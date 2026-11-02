@@ -936,16 +936,6 @@ export class NdjsonMemoryStore {
     });
   }
 
-  async buildPromptContext(): Promise<string> {
-    const knowledge = await this.list("knowledge");
-    if (knowledge.length === 0) return "";
-
-    return [
-      `Knowledge:\n${knowledge.map((entry) => `- ${entry.content}`).join("\n")}`,
-      "Use memory_recall to find relevant project practices and decisions when needed.",
-    ].join("\n\n");
-  }
-
   private async readCategory(
     category: MemoryCategory,
   ): Promise<StoredMemoryLine[]> {
@@ -2267,13 +2257,6 @@ export class MemoryManager {
         this.warnings.length === 0 && this.index.isSemanticAvailable(),
       warnings: this.getWarnings(),
     };
-  }
-
-  async buildPromptContext(): Promise<string> {
-    await this.initialize();
-    // Prompt injection can run again after external edits, including compaction.
-    await this.reconcile();
-    return this.store.buildPromptContext();
   }
 
   private async generateSeedMemories(): Promise<

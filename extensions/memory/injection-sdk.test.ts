@@ -12,7 +12,7 @@ import {
 import extension from "./index.ts";
 
 test(
-  "real SDK sessions inject independently across compaction and shutdown",
+  "real SDK sessions never inject memory messages across compaction and shutdown",
   { timeout: 30000 },
   async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-memory-injection-sdk-"));
@@ -72,14 +72,6 @@ test(
           { cwd },
         );
       }
-      function injected(result: Awaited<ReturnType<typeof start>>) {
-        assert.equal(result?.messages?.length, 1);
-        const entry = result!.messages![0];
-        assert.equal(entry.customType, "project_memory");
-        assert.equal(entry.display, false);
-        assert.equal(typeof entry.content, "string");
-        return entry.content as string;
-      }
       async function compact(session: typeof first) {
         await session.extensionRunner.emit({
           type: "session_compact",
@@ -97,15 +89,13 @@ test(
           },
         });
       }
-      assert.match(injected(await start(first)), /Original SDK fact/);
-      assert.match(injected(await start(second)), /Original SDK fact/);
+      assert.equal(await start(first), undefined);
+      assert.equal(await start(second), undefined);
       await writeKnowledge("Updated SDK fact");
       assert.equal(await start(first), undefined);
       assert.equal(await start(second), undefined);
       await compact(first);
-      const refreshed = injected(await start(first));
-      assert.match(refreshed, /Updated SDK fact/);
-      assert.doesNotMatch(refreshed, /Original SDK fact/);
+      assert.equal(await start(first), undefined);
       assert.equal(await start(second), undefined);
       await first.extensionRunner.emit({
         type: "session_shutdown",
@@ -113,7 +103,7 @@ test(
       });
       first.dispose();
       await compact(second);
-      assert.match(injected(await start(second)), /Updated SDK fact/);
+      assert.equal(await start(second), undefined);
       assert.equal(await start(second), undefined);
       await second.extensionRunner.emit({
         type: "session_shutdown",

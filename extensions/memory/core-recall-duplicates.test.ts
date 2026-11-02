@@ -5,7 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { MemoryManager } from "./core.ts";
 
-test("prompt refreshes duplicate warnings as external edits introduce, resolve and reintroduce IDs", async () => {
+test("recall refreshes duplicate warnings as external edits introduce, resolve and reintroduce IDs", async () => {
   const cwd = await mkdtemp(join(tmpdir(), "memory-prompt-duplicates-"));
   const manager = new MemoryManager(cwd, { semanticEnabled: false });
   try {
@@ -17,9 +17,8 @@ test("prompt refreshes duplicate warnings as external edits introduce, resolve a
       `${original}${JSON.stringify({ ...record, content })}\n`;
 
     await writeFile(file, duplicate("first duplicate needle"));
-    assert.match(await manager.buildPromptContext(), /first duplicate needle/);
-    assert.equal(manager.getWarnings()[0].id, record.id);
     let result = await manager.recall({ query: "duplicate needle" });
+    assert.equal(manager.getWarnings()[0].id, record.id);
     assert.equal(result.searchMode, "grep");
     assert.deepEqual(
       result.memories.map((memory) => memory.content),
@@ -28,13 +27,12 @@ test("prompt refreshes duplicate warnings as external edits introduce, resolve a
     assert.equal(result.warnings?.[0].id, record.id);
 
     await writeFile(file, original);
-    await manager.buildPromptContext();
+    await manager.recall({ query: "original text" });
     assert.deepEqual(manager.getWarnings(), []);
 
     await writeFile(file, duplicate("second duplicate needle"));
-    assert.match(await manager.buildPromptContext(), /second duplicate needle/);
-    assert.equal(manager.getWarnings()[0].id, record.id);
     result = await manager.recall({ query: "duplicate needle" });
+    assert.equal(manager.getWarnings()[0].id, record.id);
     assert.equal(result.searchMode, "grep");
     assert.deepEqual(
       result.memories.map((memory) => memory.content),

@@ -62,22 +62,20 @@ for (const hasUI of [true, false]) {
       await handlers.get("session_start")!({}, ctx);
       assert.deepEqual(await readdir(dir), ["knowledge.ndjson"]);
       assert.equal(notices.length + errors.length, 0);
-      const initial = await handlers.get("before_agent_start")!({}, ctx);
-      assert.match(initial.message.content, /first/);
-      assert.match(initial.message.content, /second/);
       assert.equal(
         await handlers.get("before_agent_start")!({}, ctx),
         undefined,
       );
       const warnings = hasUI ? notices : errors;
+      assert.equal(warnings.length, 0);
+      const recall = await tools
+        .get("memory_recall")
+        .execute("", { query: "not-present" }, undefined, undefined, ctx);
       assert.equal(warnings.length, 1);
       assert.match(warnings[0], /Duplicate memory IDs: same-id/);
       assert.match(warnings[0], /knowledge\.ndjson:1/);
       assert.match(warnings[0], /resolve duplicate IDs explicitly/);
       assert.doesNotMatch(warnings[0], /background review/);
-      const recall = await tools
-        .get("memory_recall")
-        .execute("", { query: "not-present" }, undefined, undefined, ctx);
       assert.match(recall.content[0].text, /Duplicate memory id same-id/);
       assert.match(recall.content[0].text, /resolve duplicate IDs explicitly/);
       assert.match(
@@ -104,19 +102,22 @@ for (const hasUI of [true, false]) {
         file,
         `${bytes}${newRecord("third")}\n${newRecord("fourth")}\n`,
       );
-      await handlers.get("session_compact")!({}, ctx);
-      await handlers.get("before_agent_start")!({}, ctx);
+      await tools
+        .get("memory_recall")
+        .execute("", { query: "third" }, undefined, undefined, ctx);
       assert.equal(warnings.length, 2);
       assert.match(warnings[1], /new-id/);
       await writeFile(file, `${record("first")}\n`);
-      await handlers.get("session_compact")!({}, ctx);
-      const result = await handlers.get("before_agent_start")!({}, ctx);
-      assert.match(result.message.content, /first/);
+      const result = await tools
+        .get("memory_recall")
+        .execute("", { query: "first" }, undefined, undefined, ctx);
+      assert.match(result.content[0].text, /first/);
       assert.equal(warnings.length, 2);
       await writeFile(file, `${newRecord("third")}\n${newRecord("fourth")}\n`);
-      await handlers.get("session_compact")!({}, ctx);
-      const next = await handlers.get("before_agent_start")!({}, ctx);
-      assert.match(next.message.content, /third/);
+      const next = await tools
+        .get("memory_recall")
+        .execute("", { query: "third" }, undefined, undefined, ctx);
+      assert.match(next.content[0].text, /third/);
       assert.equal(warnings.length, 3);
       assert.match(warnings[2], /new-id/);
       await handlers.get("session_shutdown")!({}, ctx);

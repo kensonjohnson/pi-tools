@@ -1,6 +1,6 @@
 # Project Memory design
 
-Project Memory keeps durable project context in plaintext and injects a briefing into Pi sessions. [RESEARCH.md](RESEARCH.md) records earlier research; this document describes the current workflow.
+Project Memory keeps durable project context in plaintext for on-demand recall. [RESEARCH.md](RESEARCH.md) records earlier research; this document describes the current workflow.
 
 ## Storage and categories
 
@@ -12,7 +12,7 @@ The source of truth is three NDJSON files under `.pi/memory/`. Each non-empty va
 
 | File               | Purpose                                                       |
 | ------------------ | ------------------------------------------------------------- |
-| `knowledge.ndjson` | What the project is. Its contents form the session briefing.  |
+| `knowledge.ndjson` | What the project is.                                          |
 | `practices.ndjson` | Conventions and ways of working, recalled on demand.          |
 | `decisions.ndjson` | Architecture choices and their rationale, recalled on demand. |
 
@@ -22,9 +22,9 @@ The files can be inspected and edited directly. IDs remain stable through update
 
 Cooperating processes serialize canonical operations with a project-wide SQLite lock. Changes use checked snapshots and atomic file replacement. Category moves use a private transaction journal so interrupted moves can be recovered when snapshots still match; ambiguous changes fail closed. Manual editors do not take the lock, and an edit between the final check and rename can still race a replacement. Private runtime files and derived databases are Git-ignored.
 
-## Briefing and recall
+## Recall
 
-On a new session, the extension injects all knowledge entries and guidance to use `memory_recall` for relevant practices and decisions. After compaction it injects a fresh briefing on the next agent turn. Ordinary turns do not refresh the existing briefing, even if the files change. An empty knowledge category produces no briefing. There is no fixed knowledge token limit; keeping the briefing useful and appropriately sized is a maintenance task.
+The extension does not automatically inject memory records at session start or after compaction. `memory_recall` retrieves relevant knowledge, practices, or decisions on demand. Existing sessions may retain messages injected by earlier versions; start a new session to avoid carrying those messages forward.
 
 `.pi/memory/vector.db` is a derived SQLite index, not the source of truth. The manager reconciles it with current NDJSON snapshots before recall. Semantic search uses `sqlite-vec` and a local embedding model when available; FTS5 and literal matching provide fallbacks. The embedding model may need to be downloaded on first use. A forced rebuild updates the live index rather than deleting its database file.
 

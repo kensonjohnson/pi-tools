@@ -93,37 +93,6 @@ test("memory_init preserves corruption added after manager initialization", asyn
   });
 });
 
-test("prompt context contains all knowledge and only guidance for other categories", async () => {
-  await withStore(async (store) => {
-    const longKnowledge = `Important guidance: ${"x".repeat(180)}`;
-    await store.remember("knowledge", longKnowledge);
-    for (let i = 0; i < 25; i++) {
-      await store.remember("knowledge", `Knowledge entry ${i}.`);
-    }
-    await store.remember("practices", "Private practice detail.");
-    await store.remember("decisions", "Private decision detail.");
-
-    const context = await store.buildPromptContext();
-    assert.match(context, /Knowledge:/);
-    assert.ok(context.includes(longKnowledge));
-    assert.ok(context.includes("Knowledge entry 24."));
-    assert.match(context, /memory_recall.*practices and decisions/);
-    assert.doesNotMatch(
-      context,
-      /Private practice detail|Private decision detail/,
-    );
-    assert.doesNotMatch(context, /Practices index|Decisions index/);
-  });
-});
-
-test("empty knowledge does not inject practice or decision content", async () => {
-  await withStore(async (store) => {
-    await store.remember("practices", "A specialized practice.");
-    await store.remember("decisions", "A specialized decision.");
-    assert.equal(await store.buildPromptContext(), "");
-  });
-});
-
 test("concurrent remembers append complete, independent NDJSON lines", async () => {
   await withStore(async (store, cwd) => {
     const count = 50;

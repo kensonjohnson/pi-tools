@@ -26,11 +26,15 @@ test("duplicate IDs degrade reads without changing records or permitting ambiguo
       { category: "knowledge", line: 2 },
       { category: "practices", line: 1 },
     ]);
-    assert.match(await manager.buildPromptContext(), /needle first/);
-    assert.match(await manager.buildPromptContext(), /needle second/);
     const result = await manager.recall({ query: "needle" });
     assert.equal(result.searchMode, "grep");
     assert.equal(result.memories.length, 4);
+    assert.ok(
+      result.memories.some((memory) => memory.content === "needle first"),
+    );
+    assert.ok(
+      result.memories.some((memory) => memory.content === "needle second"),
+    );
     assert.equal(result.warnings?.[0].id, "same");
     assert.equal(
       (

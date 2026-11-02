@@ -113,7 +113,6 @@ function textResult(text: string, details?: unknown) {
 
 export default function (pi: ExtensionAPI) {
   const managers = new Map<string, Promise<MemoryManager>>();
-  const injectedSessions = new Set<string>();
   const warnedConflicts = new Map<string, string>();
   // Factory state belongs to one extension runtime/session, not the module.
   let foregroundReview = false;
@@ -195,26 +194,10 @@ export default function (pi: ExtensionAPI) {
     return (await ready.isReady()) ? ready : undefined;
   }
 
-  async function injectMemoryMessage(ctx: ExtensionContext) {
-    const manager = await getReadyManager(ctx);
-    if (!manager) return;
-    const promptContext = await manager.buildPromptContext();
-    warnDiagnostics(ctx, manager.getWarnings());
-    if (!promptContext) return null;
-    return {
-      message: {
-        customType: "project_memory",
-        content: `Project memory:\n${promptContext}`,
-        display: false,
-      },
-    };
-  }
-
   publishExtensionSettings(pi.events, {
     id: MEMORY_EXTENSION_ID,
     label: "Project Memory",
-    description:
-      "Enables project memory tools and automatic memory-context injection.",
+    description: "Enables project memory tools for on-demand recall.",
     fields: {
       enabled: {
         type: "boolean",
@@ -276,34 +259,13 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("before_agent_start", async (event, ctx) => {
+  pi.on("before_agent_start", async (event) => {
     // A dispatched command can fail before a run starts. Do not retain its
     // guard when the next accepted prompt is unrelated.
     if (pendingForegroundCommand) {
       foregroundReview = event.prompt === FOREGROUND_REVIEW_PROMPT;
       pendingForegroundCommand = false;
     }
-    const sessionId = ctx.sessionManager.getSessionId();
-    if (injectedSessions.has(sessionId)) {
-      return;
-    }
-
-    let result: Awaited<ReturnType<typeof injectMemoryMessage>>;
-    try {
-      result = await injectMemoryMessage(ctx);
-    } catch (error) {
-      if (!warnConflict(ctx, error)) throw error;
-      return;
-    }
-    if (result !== undefined) {
-      injectedSessions.add(sessionId);
-    }
-    return result ?? undefined;
-  });
-
-  pi.on("session_compact", async (_event, ctx) => {
-    // The message may have been summarized away; reinject for this session.
-    injectedSessions.delete(ctx.sessionManager.getSessionId());
   });
 
   pi.registerTool({
@@ -377,7 +339,7 @@ export default function (pi: ExtensionAPI) {
       "Retrieve relevant project memories using local semantic search with fallbacks.",
     promptSnippet: "Retrieve relevant project memories before acting",
     promptGuidelines: [
-      "Use memory_recall when the user asks about project conventions, history, architecture, or why something is the way it is.",
+      "Use memory_recall to retrieve relevant project knowledge, practices, and decisions before substantive project work or when asked about project history or architecture.",
       "Use memory_recall before changing project patterns, conventions, file organization, or architecture to check for existing guidance.",
       "Use memory_recall's category parameter only when the query is clearly about knowledge, practices, or decisions.",
     ],

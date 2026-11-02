@@ -84,7 +84,7 @@ The quota source is an undocumented ChatGPT endpoint, so the feature is best-eff
 
 Project Memory keeps project-scoped knowledge, practices, and decisions as NDJSON files under `.pi/memory/`. Initialize a project with the `memory_init` tool; the agent can use `memory_remember`, `memory_recall`, `memory_update`, `memory_forget`, and `memory_list` to maintain and search it. `memory_repair` explicitly removes malformed lines; initialization does not silently remove them. The SQLite search index is derived from the NDJSON files and can be rebuilt.
 
-At the start of a session, the extension injects the full knowledge category and guidance to recall practices and decisions when needed. It refreshes that briefing on the first turn after compaction, not on ordinary turns. There is no fixed knowledge token limit, so review the knowledge file if it becomes too large.
+Memory records are not injected automatically at session start or after compaction. Use `memory_recall` to retrieve relevant knowledge, practices, or decisions as needed. Existing sessions may still contain memory messages injected before this change; start a new session for a context without those messages.
 
 Use `/memory-review` to request foreground consolidation in a trusted, initialized project. The agent can also use `memory_consolidate` when the user explicitly requests a review. The review runs visibly in the current agent session with its normal model and tools. It inspects memories and available evidence, applies supported changes, and reports gaps and conflicts. Review the uncommitted NDJSON diff; a completed review does not prove every memory is current.
 
