@@ -30,6 +30,18 @@ Web search (`brave_search`) and content extraction (`web_content`) using the Bra
 
 Requires `BRAVE_API_KEY` environment variable to be set.
 
+### `slack`
+
+The Slack extension connects multiple workspaces and provides read-only search, conversation history, threads, and file access. It does not post, edit, or delete Slack content.
+
+Run `/slack connect` in an interactive session. Pi offers to open a pre-filled Slack app creation page; choose your workspace, review and create the app, then copy its **Client ID** from Basic Information into Pi. Slack may require administrator approval. The manifest requests read-only user scopes and enables PKCE. Pi then opens Slack's authorization page and listens on `http://localhost:34119/slack/callback`; the callback must be accepted by Slack and available locally. This flow has not yet been verified against a live Slack workspace. Each organization may need its own internal app.
+
+Run `/slack list` to see connected workspaces or `/slack disconnect` to remove local credentials. Disconnect does not revoke the Slack app's access; revoke that in Slack. Workspace tokens are stored as plaintext in `~/.pi/agent/slack-workspaces.json` with file permissions `0600` (or under `PI_CODING_AGENT_DIR`). Protect your local account and backups. No Slack credentials belong in project configuration. If credentials expire or are revoked, reconnect; automatic token refresh is not yet implemented.
+
+Use `slack_workspaces` to list workspace IDs, `slack_search` to search, `slack_read_history` and `slack_read_thread` for conversation context, and `slack_file_info` and `slack_download_file` for attachments. Provide a workspace name or ID when more than one is connected; the tools do not guess. For example, ask Pi to search a named workspace for a topic, read a matching thread, and download a file to a specific local path. Tool results include continuation cursors for additional pages. Slack applies per-workspace permissions and rate limits, and may require separate consent for private conversations and DMs. Some search results are shortened; read the thread for full message context.
+
+Downloads require an explicit path and never overwrite an existing file. External files and redirects are not downloaded; follow their links separately if appropriate. Pi's existing file readers determine which downloaded formats it can inspect. Slack content returned to Pi may appear in session transcripts and requests to your model provider; follow your workspace's data policies.
+
 ### `browser-tools`
 
 Browser Tools manages Playwright Chromium sessions on macOS. It uses the Chromium version pinned by the package, not your installed Brave or Chrome. If the matching browser is missing, automatic installation requires a trusted project and `browser-tools.autoInstall` enabled. If automatic installation is disabled, install the matching Chromium with the package's pinned Playwright CLI. `/pi-tools` controls these settings; project overrides apply only to trusted projects.
