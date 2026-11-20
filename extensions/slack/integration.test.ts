@@ -4,7 +4,11 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import extension from "./index.ts";
-import { writeWorkspaces, workspaceFile } from "./workspaces.ts";
+import {
+  readWorkspaces,
+  writeWorkspaces,
+  workspaceFile,
+} from "./workspaces.ts";
 
 test("registered tools search, read thread and download in selected workspace", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-slack-integration-"));
@@ -36,15 +40,25 @@ test("registered tools search, read thread and download in selected workspace", 
           name: "Two",
           userId: "U2",
           clientId: "2.2",
-          accessToken: "token-two",
+          accessToken: "expired-token",
+          refreshToken: "old-refresh",
+          expiresAt: 1,
           scopes: "",
         },
       ],
       workspaceFile(),
     );
     globalThis.fetch = (async (input: any, init?: RequestInit) => {
-      assert.equal((init?.headers as any).Authorization, "Bearer token-two");
       const url = String(input);
+      if (url.endsWith("oauth.v2.access"))
+        return Response.json({
+          ok: true,
+          token_type: "user",
+          access_token: "token-two",
+          refresh_token: "new-refresh",
+          expires_in: 43200,
+        });
+      assert.equal((init?.headers as any).Authorization, "Bearer token-two");
       if (url.endsWith("assistant.search.context"))
         return Response.json({
           ok: true,
@@ -100,6 +114,7 @@ test("registered tools search, read thread and download in selected workspace", 
       query: "find",
     });
     assert.match(search.content[0].text, /"channel_id":"C2"/);
+    assert.equal((await readWorkspaces())[1].refreshToken, "new-refresh");
     const thread = await call("slack_read_thread", {
       workspace: "Two",
       channel: "C2",

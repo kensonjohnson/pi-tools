@@ -159,7 +159,7 @@ export async function searchSlack(
       )
     )
       throw new SlackSearchError(
-        "Slack authorization is invalid or expired. Reconnect the workspace.",
+        "Slack authorization is invalid or expired. Run /slack reconnect.",
         "invalid_auth",
       );
     if (code === "invalid_cursor")

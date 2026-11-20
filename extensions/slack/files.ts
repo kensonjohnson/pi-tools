@@ -24,6 +24,14 @@ function apiError(response: Response, result?: { error?: string }): Error {
     return new Error(
       `Slack rate limit reached; retry after ${response.headers.get("retry-after") || "the specified delay"} seconds.`,
     );
+  if (
+    ["invalid_auth", "not_authed", "token_expired", "token_revoked"].includes(
+      result?.error || "",
+    )
+  )
+    return new Error(
+      "Slack authorization is invalid or expired. Run /slack reconnect.",
+    );
   if (result?.error === "missing_scope")
     return new Error(
       "Slack requires the files:read permission. Reauthorize the app.",
