@@ -116,7 +116,7 @@ async function page(
       error === "account_inactive"
     )
       throw new Error(
-        "Slack authorization is invalid or revoked. Reconnect this workspace with /slack connect.",
+        "Slack authorization is invalid or revoked. Reconnect this workspace with /slack reconnect.",
       );
     if (error === "channel_not_found" || error === "not_in_channel")
       throw new Error(

@@ -14,9 +14,10 @@ import { searchSlack } from "./search.ts";
 import { getConversationHistory, getThreadReplies } from "./conversations.ts";
 import { fileInfo, downloadFile } from "./files.ts";
 import {
+  getAuthorizedWorkspace,
   readWorkspaces,
   resolveWorkspace,
-  writeWorkspaces,
+  updateWorkspaces,
 } from "./workspaces.ts";
 
 const toolNames = [
@@ -41,9 +42,7 @@ async function runRead(
   ) => Promise<unknown>,
 ) {
   try {
-    const result = await action(
-      resolveWorkspace(await readWorkspaces(), workspace),
-    );
+    const result = await action(await getAuthorizedWorkspace(workspace));
     return {
       content: [{ type: "text" as const, text: JSON.stringify(result) }],
       details: {},
@@ -237,7 +236,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
   pi.registerCommand("slack", {
-    description: "Connect, list, or disconnect Slack workspaces",
+    description: "Connect, reconnect, list, or disconnect Slack workspaces",
     handler: async (args, ctx) => {
       if (!(await isExtensionEnabled(ctx, CONFIG_DIR_NAME, "slack"))) {
         ctx.ui.notify("Slack extension is disabled.", "warning");
@@ -249,29 +248,56 @@ export default function (pi: ExtensionAPI) {
       }
       const action = args.trim();
       try {
-        if (action === "connect") {
+        if (action === "connect" || action === "reconnect") {
           const { manifest, url } = createSlackManifest(REDIRECT_URI);
-          const create = await ctx.ui.confirm(
-            "Create a Slack app",
-            "Open Slack's pre-filled app creation page? If you already created an app from this manifest, choose No to continue to sign-in.",
-          );
-          if (create) {
-            const result = await pi.exec(
-              process.platform === "darwin" ? "open" : "xdg-open",
-              [url],
-            );
-            if (result.code !== 0) {
+          let clientId: string | undefined;
+          let reconnecting:
+            Awaited<ReturnType<typeof readWorkspaces>>[number] | undefined;
+          if (action === "reconnect") {
+            const existing = await readWorkspaces();
+            if (!existing.length) {
               ctx.ui.notify(
-                "Could not open the creation page. Run /slack connect again.",
-                "error",
+                "No Slack workspaces connected. Run /slack connect.",
+                "info",
               );
               return;
             }
+            if (existing.length === 1) reconnecting = existing[0];
+            else {
+              const choices = existing.map(
+                (w) => `${w.name} (${w.teamId}) — ${w.userId}`,
+              );
+              const selected = await ctx.ui.select(
+                "Reconnect Slack workspace",
+                choices,
+              );
+              if (!selected) return;
+              reconnecting = existing[choices.indexOf(selected)];
+            }
+            clientId = reconnecting.clientId;
+          } else {
+            const create = await ctx.ui.confirm(
+              "Create a Slack app",
+              "Open Slack's pre-filled app creation page? If you already created an app from this manifest, choose No to continue to sign-in.",
+            );
+            if (create) {
+              const result = await pi.exec(
+                process.platform === "darwin" ? "open" : "xdg-open",
+                [url],
+              );
+              if (result.code !== 0) {
+                ctx.ui.notify(
+                  "Could not open the creation page. Run /slack connect again.",
+                  "error",
+                );
+                return;
+              }
+            }
+            clientId = await ctx.ui.input(
+              "In Slack, select Go to App Settings, then copy the Client ID from Basic Information → App Credentials and paste it here.",
+              "Client ID",
+            );
           }
-          const clientId = await ctx.ui.input(
-            "In Slack, select Go to App Settings, then copy the Client ID from Basic Information → App Credentials and paste it here.",
-            "Client ID",
-          );
           if (!clientId) return;
           if (!/^\d+\.\d+$/.test(clientId.trim())) {
             ctx.ui.notify(
@@ -296,8 +322,18 @@ export default function (pi: ExtensionAPI) {
                 throw new Error("Could not open the authorization page.");
             },
           );
-          const existing = await readWorkspaces();
-          await writeWorkspaces([
+          if (
+            reconnecting &&
+            (workspace.teamId !== reconnecting.teamId ||
+              workspace.userId !== reconnecting.userId)
+          ) {
+            ctx.ui.notify(
+              "Slack signed in to a different workspace or account. No credentials were changed; try /slack reconnect again.",
+              "warning",
+            );
+            return;
+          }
+          await updateWorkspaces((existing) => [
             ...existing.filter(
               (w) =>
                 w.teamId !== workspace.teamId || w.userId !== workspace.userId,
@@ -329,7 +365,12 @@ export default function (pi: ExtensionAPI) {
               `Remove local credentials for ${selected}? This does not revoke Slack's authorization.`,
             )
           ) {
-            await writeWorkspaces(existing.filter((_, i) => i !== index));
+            const chosen = existing[index];
+            await updateWorkspaces((current) =>
+              current.filter(
+                (w) => w.teamId !== chosen.teamId || w.userId !== chosen.userId,
+              ),
+            );
             ctx.ui.notify("Local Slack credentials removed.", "info");
           }
         } else if (action === "list" || !action) {
@@ -344,7 +385,7 @@ export default function (pi: ExtensionAPI) {
           );
         } else
           ctx.ui.notify(
-            "Use /slack connect, /slack list, or /slack disconnect.",
+            "Use /slack connect, /slack reconnect, /slack list, or /slack disconnect.",
             "info",
           );
       } catch {
